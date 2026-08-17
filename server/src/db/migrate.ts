@@ -1789,7 +1789,8 @@ export async function ensureSchemaWithBootRetry(opts: {
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       const code = (e && typeof e === 'object' && 'code' in e) ? String((e as { code?: unknown }).code) : ''
-      const transportShaped = /timeout|terminated|ECONNREFUSED|ECONNRESET|EOF/i.test(msg)
+      const transportShaped = /timeout|terminated|ECONNREFUSED|ECONNRESET|EAI_AGAIN|ENOTFOUND|EOF/i.test(msg)
+        || ['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND'].includes(code)
       const lockContention = code === '40P01' || code === '55P03' || code === '40001'
       if ((!transportShaped && !lockContention) || attempt === maxAttempts) throw e
       const kind = lockContention ? `lock-contention (${code})` : 'transient'

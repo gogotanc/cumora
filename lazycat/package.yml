@@ -1,0 +1,15 @@
+package: cloud.lazycat.app.cumora.byoa.poc
+version: 0.0.4
+name: Cumora BYOA
+description: Cumora Agent collaboration workbench with a LightOS BYOA runtime
+author: tanc
+license: https://github.com/yetone/cumora/blob/main/LICENSE
+homepage: https://github.com/yetone/cumora
+
+locales:
+  zh:
+    name: Cumora BYOA
+    description: 使用 LightOS 运行 BYOA Agent 的 Cumora 协作工作台
+  en:
+    name: Cumora BYOA
+    description: Cumora collaboration workbench using a LightOS BYOA runtime

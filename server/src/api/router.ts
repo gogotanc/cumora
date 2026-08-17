@@ -16,7 +16,7 @@ import {
 import { joinAllHands, onboardStarterAgents, seedMemberDms } from '../onboardCompany.js'
 import {
   type Provider, providerEnabled, createState, consumeState,
-  authorizeUrl, handleCallback, errorUrl, returnUrlAllowed,
+  authorizeUrl, handleCallback, handleLazycatSignIn, errorUrl, returnUrlAllowed,
 } from '../oauth.js'
 import { adminRouter } from './admin-router.js'
 import { isWaitlistEnabled } from '../admin.js'
@@ -638,6 +638,29 @@ api.get('/metrics', async (req, res) => {
 })
 
 /* ============== Auth — OAuth only (Google + GitHub) ============== */
+
+/** Exchange Lazycat's authenticated ingress identity for a normal Cumora
+ * bearer session. This endpoint is intentionally unavailable unless the
+ * deployment opts in; it must never sit behind a public_path bypass. */
+api.post('/auth/lazycat', safe(async (req, res) => {
+  if (!env.LAZYCAT_AUTH_ENABLED) {
+    res.status(404).json({ error: 'not found' }); return
+  }
+  const rawId = req.headers['x-hc-user-id']
+  const lazycatUserId = typeof rawId === 'string' ? rawId.trim() : ''
+  if (!lazycatUserId || lazycatUserId.length > 200) {
+    res.status(401).json({ error: 'lazycat identity header missing' }); return
+  }
+  const rawName = req.headers['x-hc-user-name']
+  const displayName = (typeof rawName === 'string' ? rawName.trim() : '') || lazycatUserId
+  const result = await handleLazycatSignIn({
+    userId: lazycatUserId,
+    displayName: displayName.slice(0, 100),
+    ip: req.socket.remoteAddress ?? null,
+    userAgent: (req.headers['user-agent'] as string | undefined) ?? null,
+  })
+  res.json(result)
+}))
 
 /** 302 to the provider's consent screen. State is opaque to the client —
  *  we mint it server-side, save to Redis (5min TTL), and verify on the

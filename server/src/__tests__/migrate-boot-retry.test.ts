@@ -44,6 +44,38 @@ test('retries on ECONNREFUSED', async () => {
   assert.equal(calls, 2)
 })
 
+test('retries when ECONNREFUSED is exposed only as the error code', async () => {
+  let calls = 0
+  await ensureSchemaWithBootRetry({
+    schemaFn: async () => {
+      calls++
+      if (calls < 2) {
+        const err = new Error('') as Error & { code: string }
+        err.code = 'ECONNREFUSED'
+        throw err
+      }
+    },
+    sleep: noSleep,
+  })
+  assert.equal(calls, 2)
+})
+
+test('retries transient DNS resolution errors', async () => {
+  let calls = 0
+  await ensureSchemaWithBootRetry({
+    schemaFn: async () => {
+      calls++
+      if (calls < 2) {
+        const err = new Error('getaddrinfo EAI_AGAIN postgres') as Error & { code: string }
+        err.code = 'EAI_AGAIN'
+        throw err
+      }
+    },
+    sleep: noSleep,
+  })
+  assert.equal(calls, 2)
+})
+
 test('retries lock-contention errors (40P01 deadlock) and recovers', async () => {
   // Regression: a boot migration that loses a deadlock against live traffic
   // used to fail fast and crashloop the pod; with two replicas down at once the

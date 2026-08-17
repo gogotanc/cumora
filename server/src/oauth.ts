@@ -42,6 +42,7 @@ import { provisionUser as provisionSub2apiUser, sub2apiConfigured } from './sub2
 import { isWaitlistEnabled, enqueueWaitlist, isAllowlistedAdmin } from './admin.js'
 
 export type Provider = 'google' | 'github' | 'apple'
+export type IdentityProvider = Provider | 'lazycat'
 
 interface ProviderConfig {
   authorizeUrl: string
@@ -154,7 +155,7 @@ export function authorizeUrl(p: Provider, state: string): string {
   return `${cfg.authorizeUrl}?${params.toString()}`
 }
 
-interface NormalizedProfile {
+export interface NormalizedProfile {
   providerId: string
   email: string         // lowercased; throws if provider didn't yield a verified email
   displayName: string
@@ -332,7 +333,7 @@ export async function completeFlow(
 const APPLE_SIGNUP_TRIAL_DAYS = 7
 
 export async function findOrCreateUserByProfile(
-  p: Provider,
+  p: IdentityProvider,
   profile: NormalizedProfile,
   inviteToken: string | null = null,
   /** Grant the Apple-signup Pro trial when this is a brand-new user.
@@ -504,6 +505,46 @@ export async function findOrCreateUserByProfile(
     throw e
   } finally {
     client.release()
+  }
+}
+
+/** Create or resume a user whose identity was authenticated by Lazycat's
+ * ingress. The caller must only invoke this after checking that the trusted
+ * X-HC-User-ID header is present and Lazycat auth is explicitly enabled. */
+export async function handleLazycatSignIn(args: {
+  userId: string
+  displayName: string
+  ip: string | null
+  userAgent: string | null
+}): Promise<{
+  token: string
+  user: { id: string; email: string; displayName: string }
+  companyId: string | null
+}> {
+  const emailKey = createHash('sha256').update(args.userId).digest('hex').slice(0, 24)
+  const email = `${emailKey}@lazycat.local`
+  const result = await findOrCreateUserByProfile('lazycat', {
+    providerId: args.userId,
+    email,
+    displayName: args.displayName,
+    avatarUrl: null,
+  })
+  const { token } = await createSession(result.userId, {
+    ip: args.ip ?? undefined,
+    ua: args.userAgent ?? undefined,
+  })
+  await audit({
+    kind: 'login',
+    userId: result.userId,
+    companyId: result.companyId,
+    ip: args.ip,
+    userAgent: args.userAgent,
+    detail: { provider: 'lazycat' },
+  })
+  return {
+    token,
+    user: { id: result.userId, email: result.email, displayName: result.displayName },
+    companyId: result.companyId,
   }
 }
 

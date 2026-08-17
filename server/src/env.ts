@@ -35,6 +35,12 @@ export const env = {
   DATABASE_URL: required('DATABASE_URL', `postgres://${process.env.USER ?? 'postgres'}@localhost:5432/cumora`),
   REDIS_URL: required('REDIS_URL', 'redis://localhost:6379'),
   OPENAI_API_KEY: required('OPENAI_API_KEY'),
+  /** Trust Lazycat's authenticated user header and mint a Cumora session.
+   *  This must only be enabled behind Lazycat's authenticated ingress. */
+  LAZYCAT_AUTH_ENABLED: /^(true|1|yes|on)$/i.test(process.env.LAZYCAT_AUTH_ENABLED ?? ''),
+  /** Never create managed Kubernetes agent Pods. Agents must run on a
+   *  paired BYOA Computer instead. */
+  BYOA_ONLY: /^(true|1|yes|on)$/i.test(process.env.CUMORA_BYOA_ONLY ?? ''),
   /**
    * "Brain" model — the agent's main reasoning loop and convene speech.
    * Default model used when an agent's `participants.model` is NULL.

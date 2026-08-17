@@ -68,7 +68,19 @@ export function AuthGate({ children, unauthFallback }: AuthGateProps) {
 
   useEffect(() => {
     let cancelled = false
-    if (!token) { markReady(); return }
+    if (!token) {
+      void api.authLazycat().then((r) => {
+        if (cancelled) return
+        setSession(
+          r.token,
+          { id: r.user.id, email: r.user.email, name: r.user.displayName },
+          r.companyId,
+        )
+      }).catch(() => {
+        if (!cancelled) markReady()
+      })
+      return () => { cancelled = true }
+    }
     void (async () => {
       try {
         const r = await api.authMe()
@@ -82,7 +94,7 @@ export function AuthGate({ children, unauthFallback }: AuthGateProps) {
       }
     })()
     return () => { cancelled = true }
-  }, [token, setMe, setServerCapabilities, clear, markReady])
+  }, [token, setSession, setMe, setServerCapabilities, clear, markReady])
 
   // Electron-only: listen for OAuth tokens forwarded by the main
   // process. The user clicked "Continue with Google" → we opened the

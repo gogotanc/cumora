@@ -1,0 +1,8 @@
+manifest: ./.local/lzc-manifest.yml
+pkgout: ./dist
+icon: ../public/icon.png
+
+images:
+  cumora-server:
+    context: ../
+    dockerfile: ../server/docker/cumora-server.Dockerfile

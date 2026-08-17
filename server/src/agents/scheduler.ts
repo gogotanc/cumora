@@ -381,6 +381,14 @@ async function wakeOne(
     return
   }
 
+  // Deployment-wide safety boundary for self-hosted BYOA installations.
+  // Even if an operator later changes a company tier or computer assignment,
+  // this server must never reach kubectl and create a managed agent Pod.
+  if (env.BYOA_ONLY) {
+    console.log(`[scheduler] ${agentId} managed wake skipped — CUMORA_BYOA_ONLY is enabled`)
+    return
+  }
+
   // Paid (pro/max) managed agent — spin up a Pod. The Pod will catch up on first
   // connect via its initial drain(); we don't need to deliver the
   // event explicitly afterwards because the inbox IS the source of

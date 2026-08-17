@@ -751,6 +751,12 @@ export const api = {
   },
   authLogout: () =>
     http<{ ok: boolean }>('/auth/logout', { method: 'POST' }),
+  /** Exchange Lazycat's trusted ingress identity for a Cumora session.
+   *  Non-Lazycat deployments return 404 and fall back to normal OAuth. */
+  authLazycat: () =>
+    http<{ token: string; user: { id: string; email: string; displayName: string }; companyId: string | null }>('/auth/lazycat', {
+      method: 'POST',
+    }),
   /** Permanently delete the signed-in user's account. Soft-deletes
    *  the user row + clears PII + invalidates every session + drops
    *  OAuth linkages. After this call returns 200, the local Bearer
