@@ -40,7 +40,11 @@ const API = `${SERVER_ORIGIN}/api`
  *  client are built against. Empty string means "relative URLs, going
  *  through the Vite proxy or same-origin." */
 export function getServerOrigin(): string {
-  return SERVER_ORIGIN
+  if (SERVER_ORIGIN) return SERVER_ORIGIN
+  if (typeof window !== 'undefined' && window.location?.origin) {
+    return window.location.origin
+  }
+  return ''
 }
 
 /** Persist a new server origin override and clear the existing session.
