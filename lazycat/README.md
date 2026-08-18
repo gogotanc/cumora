@@ -28,7 +28,7 @@ daemon does not need a public API bypass. Do not add the whole `/api` tree to
 For this package the internal server URL is:
 
 ```text
-http://cumora.cloud.lazycat.app.cumora.byoa.poc.lzcapp:5181
+http://cumora.cloud.lazycat.app.cumora.lzcapp:5181
 ```
 
 After pairing, install the daemon as a user service so it survives shell and
@@ -36,7 +36,7 @@ LightOS restarts:
 
 ```sh
 npx cumora@latest agent computer --install-service \
-  --server http://cumora.cloud.lazycat.app.cumora.byoa.poc.lzcapp:5181
+  --server http://cumora.cloud.lazycat.app.cumora.lzcapp:5181
 ```
 
 `LAZYCAT_AUTH_ENABLED` trusts `X-HC-User-ID` from Lazycat's authenticated app

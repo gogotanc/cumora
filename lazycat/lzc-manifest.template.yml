@@ -1,5 +1,5 @@
 application:
-  subdomain: cumora1
+  subdomain: cumora
   background_task: true
   routes:
     - /=http://cumora:5181
@@ -21,9 +21,9 @@ services:
       - ENABLE_AGENT_POD_GC=false
       - ENABLE_CHROME_PVC_GC=false
       - ENABLE_CLUSTER_MONITOR=false
-      - CUMORA_PUBLIC_ORIGIN=https://cumora1.${LAZYCAT_BOX_DOMAIN}
-      - CUMORA_AUTH_DONE_URL=https://cumora1.${LAZYCAT_BOX_DOMAIN}/
-      - CUMORA_AUTH_RETURN_ALLOWLIST=https://cumora1.${LAZYCAT_BOX_DOMAIN}/
+      - CUMORA_PUBLIC_ORIGIN=https://cumora.${LAZYCAT_BOX_DOMAIN}
+      - CUMORA_AUTH_DONE_URL=https://cumora.${LAZYCAT_BOX_DOMAIN}/
+      - CUMORA_AUTH_RETURN_ALLOWLIST=https://cumora.${LAZYCAT_BOX_DOMAIN}/
     binds:
       - /lzcapp/var/uploads:/app/server/uploads
     depends_on:
