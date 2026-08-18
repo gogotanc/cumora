@@ -1,15 +1,24 @@
 package: cloud.lazycat.app.cumora
-version: 0.0.5
+version: 0.1.2
 name: Cumora
-description: Cumora Agent collaboration workbench with a LightOS BYOA runtime
-author: Cumora
+description: Self-hosted agent collaboration workbench powered by a LightOS BYOA runtime
+author: tanc
 license: https://github.com/yetone/cumora/blob/main/LICENSE
 homepage: https://github.com/yetone/cumora
+min_os_version: 1.5.0
+usage: Install Codex or Claude Code in LightOS, then copy the pairing command from Cumora to connect your agent computer.
 
 locales:
-  zh:
+  zh-CN:
     name: Cumora
-    description: 使用 LightOS 运行 BYOA Agent 的 Cumora 协作工作台
-  en:
+    description: 使用 LightOS 运行本地智能体的自托管协作工作台
+    usage: 在 LightOS 中安装 Codex 或 Claude Code，然后复制 Cumora 页面生成的配对命令，连接智能体运行节点。
+  en-US:
     name: Cumora
-    description: Cumora collaboration workbench using a LightOS BYOA runtime
+    description: Self-hosted collaboration workbench for agents running on LightOS
+    usage: Install Codex or Claude Code in LightOS, then copy the pairing command from Cumora to connect your agent computer.
+
+permissions:
+  required:
+    - net.internet
+    - document.read

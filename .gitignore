@@ -74,3 +74,4 @@ android/app/google-services.json
 lazycat/.local/
 lazycat/dist/
 lazycat/.lzc-cli-cache/
+lzc-build-image-context.tar

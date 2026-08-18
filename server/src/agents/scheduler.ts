@@ -767,7 +767,8 @@ export function startScheduler(): void {
     }
   })
   startWakeRetryWorker()
-  console.log(`[scheduler] mailbox scheduler listening on ${CH_MESSAGE_NEW}, ${CH_POLLS} · runtime=pod-only`)
+  const runtimeMode = env.BYOA_ONLY ? 'byoa-only' : 'pod-only'
+  console.log(`[scheduler] mailbox scheduler listening on ${CH_MESSAGE_NEW}, ${CH_POLLS} · runtime=${runtimeMode}`)
 }
 
 // ─── poll author wake (real-time vote watching) ──────────────────────

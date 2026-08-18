@@ -1,20 +1,22 @@
-# Cumora BYOA for Lazycat
+# Cumora for Lazycat
 
-This package runs the Cumora web/API server with PostgreSQL and Redis inside
-one Lazycat application. Managed Kubernetes agents are disabled; pair a
-LightOS machine with Cumora's BYOA daemon instead.
+This package runs the Cumora web/API server with PostgreSQL 17 + pgvector and
+Redis inside one Lazycat application. Managed Kubernetes agents are disabled;
+pair a LightOS machine with Cumora's BYOA daemon instead.
 
 ## Build
 
 ```sh
-chmod +x scripts/render-manifest.sh
-./scripts/render-manifest.sh
 lzc-cli project lint .
 lzc-cli project release .
 ```
 
-The renderer creates `.local/secrets.env` and `.local/lzc-manifest.yml` with
-mode 0600. Both paths are ignored by Git.
+The manifest uses Lazycat's deployment-time `stable_secret` function. Each
+installation receives distinct, stable PostgreSQL and agent-runtime secrets;
+no publisher or developer credentials are embedded in the LPK.
+
+The PostgreSQL image is pinned by digest and embedded as `cumora-postgres`.
+This keeps semantic memory available without pulling an image during install.
 
 ## Runtime split
 
@@ -40,5 +42,10 @@ npx cumora@latest agent computer --install-service \
 ```
 
 `LAZYCAT_AUTH_ENABLED` trusts `X-HC-User-ID` from Lazycat's authenticated app
-ingress. Keep the auth exchange behind that ingress; this POC intentionally
-does not expose an unauthenticated API route.
+ingress. Keep the auth exchange behind that ingress; this package intentionally
+does not expose an unauthenticated API route. The pairing UI prints the private
+service URL because a BYOA daemon cannot pass through the browser SSO ingress.
+
+The browser injects Lazycat's official file chooser bridge so Cumora's upload
+inputs can select files from either the local device or Lazycat storage. See
+`content/lazycat-injects/README.md` for its pinned source and checksum.

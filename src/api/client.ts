@@ -8,6 +8,9 @@ import { getAuthToken, getActiveCompanyId, useAuth } from '@/stores/auth'
 
 const DEVTOOLS_KEY = 'cumora.devtools.enabled'
 const SERVER_URL_KEY = 'cumora.serverUrl'
+const COMPUTER_SERVER_ORIGIN = (import.meta.env.VITE_CUMORA_COMPUTER_SERVER as string | undefined)
+  ?.trim()
+  .replace(/\/+$/, '') ?? ''
 
 /** Resolve the API base. Three layers, highest priority first:
  *    1. localStorage['cumora.serverUrl'] — runtime override, settable
@@ -45,6 +48,13 @@ export function getServerOrigin(): string {
     return window.location.origin
   }
   return ''
+}
+
+/** Endpoint printed in BYOA pairing commands. Self-hosted distributions may
+ * expose the browser through SSO while the daemon uses a private service
+ * address, so this can intentionally differ from the page's API origin. */
+export function getComputerServerOrigin(): string {
+  return COMPUTER_SERVER_ORIGIN || getServerOrigin()
 }
 
 /** Persist a new server origin override and clear the existing session.

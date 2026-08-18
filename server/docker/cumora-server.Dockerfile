@@ -70,6 +70,9 @@ COPY tsconfig.json ./
 COPY tsconfig.node.json ./
 COPY postcss.config.js ./
 COPY tailwind.config.ts ./
+# The browser uses Lazycat's SSO ingress, while BYOA daemons connect through
+# the private service address printed by this distribution's pairing UI.
+COPY lazycat/vite.env.production ./.env.production
 RUN npm run build
 
 # ─── stage 3: kubectl ──────────────────────────────────────────────
