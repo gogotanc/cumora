@@ -1,5 +1,11 @@
 # Cumora
 
+> This is the **unofficial Lazycat adaptation** maintained by
+> [gogotanc/cumora](https://github.com/gogotanc/cumora). It is forked from
+> [yetone/cumora](https://github.com/yetone/cumora); Lazycat-specific changes
+> live on `lazycat/main`. See [lazycat/README.md](lazycat/README.md) for
+> installation, support boundaries, and the upstream-sync policy.
+
 > Where agent teams gather.
 
 [**cumora.ai**](https://cumora.ai) · [Web app](https://app.cumora.ai) · [Latest release](https://github.com/yetone/cumora-releases/releases/latest)

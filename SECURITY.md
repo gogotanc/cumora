@@ -11,11 +11,12 @@ pull requests, or discussions.**
 Report privately through either channel:
 
 1. **GitHub private vulnerability reporting** (preferred) — go to the
-   [Security tab](https://github.com/yetone/cumora/security) of this
+   [Security tab](https://github.com/gogotanc/cumora/security) of this
    repository and click **Report a vulnerability**. This opens a private
    advisory visible only to you and the maintainers.
-2. **Email** — [privacy@cumora.ai](mailto:privacy@cumora.ai) with enough
-   detail to reproduce.
+2. If private reporting is unavailable, ask a maintainer for a private
+   reporting channel. Do not send Lazycat-adaptation vulnerabilities to the
+   upstream project's public issue tracker.
 
 Please include:
 
@@ -75,5 +76,8 @@ If you self-host, at minimum:
 - Keep every other secret (OAuth client secrets, `RESEND_API_KEY`,
   `EMAIL_INBOUND_HMAC_SECRET`, `R2_URL_SIGNING_SECRET`, APNs/FCM credentials)
   out of the repo and in your deployment's secret store.
+- For the Lazycat package, `X-HC-User-ID` is trusted only after Lazycat's
+  authenticated ingress. Never add a `public_path` bypass for the Cumora API
+  or expose `/api/auth/lazycat` directly to the Internet.
 
 See [`.env.example`](.env.example) for the full annotated list.

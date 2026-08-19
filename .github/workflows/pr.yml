@@ -8,7 +8,7 @@ name: PR
 
 on:
   pull_request:
-    branches: [main]
+    branches: [lazycat/main]
 
 # Cancel superseded runs on the same PR — saves CI minutes when you
 # push twice in a row.
