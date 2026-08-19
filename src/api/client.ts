@@ -12,6 +12,12 @@ const COMPUTER_SERVER_ORIGIN = (import.meta.env.VITE_CUMORA_COMPUTER_SERVER as s
   ?.trim()
   .replace(/\/+$/, '') ?? ''
 
+// Vite's relative proxy keeps browser requests same-origin, but the pairing
+// command runs outside the browser and must address the API directly.
+const DEV_API_TARGET = import.meta.env.DEV
+  ? (import.meta.env.VITE_CUMORA_DEV_API_TARGET as string | undefined)?.replace(/\/+$/, '')
+  : undefined
+
 /** Resolve the API base. Three layers, highest priority first:
  *    1. localStorage['cumora.serverUrl'] — runtime override, settable
  *       from the dev console: `localStorage.setItem('cumora.serverUrl',
@@ -54,7 +60,14 @@ export function getServerOrigin(): string {
  * expose the browser through SSO while the daemon uses a private service
  * address, so this can intentionally differ from the page's API origin. */
 export function getComputerServerOrigin(): string {
-  return COMPUTER_SERVER_ORIGIN || getServerOrigin()
+  return COMPUTER_SERVER_ORIGIN || getPairingServerOrigin()
+}
+
+/** Origin to embed in a local computer pairing command.
+ * In Vite dev the browser uses a relative proxy, so SERVER_ORIGIN is empty;
+ * the daemon still needs the API target rather than the renderer origin. */
+export function getPairingServerOrigin(): string {
+  return SERVER_ORIGIN || DEV_API_TARGET || ''
 }
 
 /** Persist a new server origin override and clear the existing session.
@@ -94,6 +107,13 @@ export function setDevModeEnabled(enabled: boolean): void {
   else localStorage.removeItem(DEVTOOLS_KEY)
 }
 
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message)
+    this.name = 'ApiError'
+  }
+}
+
 export async function http<T>(path: string, init?: RequestInit): Promise<T> {
   const headers: Record<string, string> = { 'content-type': 'application/json' }
   const token = getAuthToken()
@@ -123,7 +143,7 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
         } catch { detail = text.slice(0, 200) }
       }
     } catch { /* ignore */ }
-    throw new Error(detail ? `${detail} (${res.status})` : `${res.status} ${res.statusText}`)
+    throw new ApiError(detail ? `${detail} (${res.status})` : `${res.status} ${res.statusText}`, res.status)
   }
   return res.json() as Promise<T>
 }
@@ -1029,10 +1049,9 @@ export const api = {
     body: string,
     attachment?: ApiAttachment | null,
     quotedMessageId?: string | null,
-    /** Optional client-supplied dedup key (the optimistic bubble's tempId).
-     *  Server echoes it on CH_MESSAGE_NEW so the renderer can match the WS
-     *  echo to its still-temp local bubble even when the WS event arrives
-     *  before this POST resolves. */
+    /** Optional client-supplied idempotency key (the optimistic bubble's
+     *  tempId). The server persists it and returns the original message when
+     *  the same send is retried. */
     clientId?: string | null,
   ) =>
     http<{ id: string; sequence: number }>(`/conversations/${encodeURIComponent(conversationId)}/messages`, {

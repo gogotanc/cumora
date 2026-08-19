@@ -48,21 +48,39 @@ const CODEX_LOG_RAW = process.env.CUMORA_CODEX_VERBOSE === '1'
  *    code 1". Resolve the real file on PATH and run a `.cmd`/`.bat` via
  *    shell:true. When the shell is needed,
  *    a big multi-line prompt must travel via STDIN, not argv (the shell can't carry
- *    it) → `wantsStdinPrompt`. */
-function resolveSpawn(bin: string): { command: string; shell: boolean; wantsStdinPrompt: boolean } {
+ *    it) → `wantsStdinPrompt`.
+ *
+ *  Windows + nvm-windows gotcha: global npm CLIs are shipped as an extensionless
+ *  POSIX shell-shim (`#!/bin/sh` wrapper) ALONGSIDE the real `.cmd`. The old loop
+ *  iterated `['', ...PATHEXT]`, hit the shim first, classified it as non-batch,
+ *  and returned `shell:false` → every Claude/Codex turn died with ENOENT.
+ *  Fix: prefer a real `.exe`/`.cmd`/`.bat` hit; only fall back to the shim with
+ *  `shell:true` when nothing else is on PATH. */
+// Exported for tests; the nvm-windows extensionless-shim regression (issue #5)
+// needs a stable handle to the resolver without going through spawn().
+export function resolveSpawn(bin: string): { command: string; shell: boolean; wantsStdinPrompt: boolean } {
   if (!IS_WIN) return { command: bin, shell: false, wantsStdinPrompt: false }
   const exts = (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').map((e) => e.trim()).filter(Boolean)
   for (const dir of (process.env.PATH ?? '').split(PATH_DELIMITER)) {
     if (!dir) continue
-    for (const ext of ['', ...exts]) {
+    for (const ext of exts) {
       const candidate = join(dir, bin + ext)
       if (existsSync(candidate)) {
         const isBatch = /\.(cmd|bat)$/i.test(candidate)
-        return { command: candidate, shell: isBatch, wantsStdinPrompt: isBatch }
+        return { command: candidate, shell: true, wantsStdinPrompt: isBatch }
       }
     }
   }
-  // Not found on PATH — let the shell resolve it, and feed the prompt via stdin.
+  // Last resort: only an extensionless shim (nvm-windows) is on PATH. The shim
+  // itself is a `#!/bin/sh` wrapper and cannot be exec'd without a shell → force
+  // shell:true so Node routes the call through cmd.exe, which can find the
+  // .cmd via PATHEXT after the shim.
+  for (const dir of (process.env.PATH ?? '').split(PATH_DELIMITER)) {
+    if (!dir) continue
+    const shim = join(dir, bin)
+    if (existsSync(shim)) return { command: shim, shell: true, wantsStdinPrompt: true }
+  }
+  // Not found on PATH at all — let the shell resolve it, and feed the prompt via stdin.
   return { command: bin, shell: true, wantsStdinPrompt: true }
 }
 
@@ -75,6 +93,7 @@ export interface EnginePersona {
   id: string
   name: string
   role: string | null
+  systemPrompt: string | null
 }
 
 export interface EngineRunArgs {
@@ -511,6 +530,7 @@ function extraArgs(envVar: string): string[] {
 const PERSONA_HEADER = (p: EnginePersona): string =>
   `# ${p.name}${p.role ? ` — ${p.role}` : ''}\n\n` +
   `You are **${p.name}**, a member of a team that collaborates in Cumora (a team chat).\n` +
+  (p.systemPrompt?.trim() ? `\n## Your style\n${p.systemPrompt.trim()}\n\n` : '\n') +
   `This directory is your private home and your working directory — it persists\n` +
   `across wakes and is yours alone. Its layout:\n` +
   `- \`CLAUDE.md\` (this file) — always loaded each wake; keep it short.\n` +
@@ -866,8 +886,11 @@ class ClaudeAdapter implements EngineAdapter {
   async seedHome(home: string, persona: EnginePersona): Promise<void> {
     await ensureCommonHome(home)
     await mkdir(join(home, '.claude', 'skills'), { recursive: true })
-    const claudeMd = join(home, 'CLAUDE.md')
-    if (!(await exists(claudeMd))) await writeFile(claudeMd, PERSONA_HEADER(persona), 'utf8')
+    // Always (re)written from the DB's name/role/systemPrompt — this file is
+    // system-owned, not agent-editable, so it's safe to overwrite on every
+    // start()/restart (including the restart configMatches() triggers when
+    // the operator edits the agent's persona in Cumora).
+    await writeFile(join(home, 'CLAUDE.md'), PERSONA_HEADER(persona), 'utf8')
     // settings.json lets bash (hence the cumora shim) run without prompts in
     // this isolated home. Only written if absent so the user can customize.
     const settings = join(home, '.claude', 'settings.json')
@@ -1351,8 +1374,8 @@ class CodexAdapter implements EngineAdapter {
 
   async seedHome(home: string, persona: EnginePersona): Promise<void> {
     await ensureCommonHome(home)
-    const agentsMd = join(home, 'AGENTS.md')
-    if (!(await exists(agentsMd))) await writeFile(agentsMd, PERSONA_HEADER(persona), 'utf8')
+    // See ClaudeAdapter.seedHome: system-owned, safe to overwrite every start.
+    await writeFile(join(home, 'AGENTS.md'), PERSONA_HEADER(persona), 'utf8')
   }
 
   run(args: EngineRunArgs): Promise<EngineRunResult> {
