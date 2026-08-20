@@ -11,7 +11,7 @@
 !tsconfig.node.json
 !postcss.config.js
 !tailwind.config.ts
-!lazycat/vite.env.production
+!lazycat/vite.env.*
 
 server/**/*.log
 server/**/dist
