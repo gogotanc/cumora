@@ -1,0 +1,86 @@
+application:
+  subdomain: cumora-dev
+  background_task: true
+  routes:
+    - /=http://cumora:5181
+  injects:
+    - id: lazycat-file-chooser
+      on: browser
+      when:
+        - "/*"
+      do:
+        - src: file:///lzcapp/pkg/content/lazycat-injects/lzc-file-chooser-inject.js
+          params:
+            locale: auto
+            hooks:
+              fileSystemAccess: true
+              fileInput: true
+
+services:
+  cumora:
+    image: embed:cumora-server
+    environment:
+      - NODE_ENV=production
+      - PORT=5181
+      - DATABASE_URL=postgres://cumora:{{ stable_secret "cumora-dev-postgres-password" | urlquery }}@postgres:5432/cumora
+      - REDIS_URL=redis://redis:6379
+      - OPENAI_API_KEY=byoa-only-server-llm-disabled
+      - AGENT_RUNTIME_SECRET={{ stable_secret "cumora-dev-agent-runtime-secret" }}
+      - LAZYCAT_AUTH_ENABLED=true
+      - CUMORA_BYOA_ONLY=true
+      - ENABLE_SCANNER=false
+      - ENABLE_IDLE=false
+      - ENABLE_AGENT_POD_GC=false
+      - ENABLE_CHROME_PVC_GC=false
+      - ENABLE_CLUSTER_MONITOR=false
+      - CUMORA_PUBLIC_ORIGIN=https://${LAZYCAT_APP_DOMAIN}
+      - CUMORA_AUTH_DONE_URL=https://${LAZYCAT_APP_DOMAIN}/
+      - CUMORA_AUTH_RETURN_ALLOWLIST=https://${LAZYCAT_APP_DOMAIN}/
+    binds:
+      - /lzcapp/var/uploads:/app/server/uploads
+    depends_on:
+      - postgres
+      - redis
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:5181/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
+
+  postgres:
+    image: embed:cumora-postgres
+    environment:
+      - POSTGRES_USER=cumora
+      - POSTGRES_PASSWORD={{ stable_secret "cumora-dev-postgres-password" }}
+      - POSTGRES_DB=cumora
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    binds:
+      - /lzcapp/var/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U cumora -d cumora
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  redis:
+    image: registry.lazycat.cloud/edward/library/redis:4c6b9d7b7a334a2e
+    command: redis-server --appendonly yes --appendfsync everysec
+    binds:
+      - /lzcapp/var/redis:/data
+    healthcheck:
+      test:
+        - CMD
+        - redis-cli
+        - ping
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s

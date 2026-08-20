@@ -1,0 +1,23 @@
+manifest: ./lzc-manifest.dev.yml
+
+package_override:
+  package: cloud.lazycat.app.cumora.dev
+  name: Cumora Dev
+
+locales:
+  zh-CN:
+    name: Cumora Dev
+    description: 使用 LightOS 运行本地智能体的自托管协作工作台（开发测试版）
+    usage: 在 LightOS 中安装 Codex 或 Claude Code，然后复制 Cumora 页面生成的配对命令，连接智能体运行节点。
+  en-US:
+    name: Cumora Dev
+    description: Self-hosted collaboration workbench for agents running on LightOS (Dev)
+    usage: Install Codex or Claude Code in LightOS, then copy the pairing command from Cumora to connect your agent computer.
+
+images:
+  cumora-server:
+    context: ../
+    dockerfile: ../server/docker/cumora-server.dev.Dockerfile
+  cumora-postgres:
+    context: ./
+    dockerfile: ./postgres.Dockerfile
