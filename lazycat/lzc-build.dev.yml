@@ -1,4 +1,5 @@
 manifest: ./lzc-manifest.dev.yml
+icon: ../public/icon.dev.png
 
 package_override:
   package: cloud.lazycat.app.cumora.dev
