@@ -28,8 +28,8 @@ the bottom of this doc for the narrative.
 
 ## The shape of the problem
 
-Multi-agent collaboration in Cumora is **N independent claude/codex
-engine sessions on one operator's machine**, each woken by a server SSE event,
+Multi-agent collaboration in Cumora is **N independent local-engine
+sessions on one operator's machine**, each woken by a server SSE event,
 each reading the same conversation, each deciding independently what to do.
 Two failure modes:
 
@@ -669,7 +669,9 @@ one and re-test. Don't pile on.
 | Var | Default | Notes |
 |---|---|---|
 | `CUMORA_DEFAULT_CLAUDE_MODEL` | unset | Deploy-level model pin (e.g. `claude-opus-4-7`). Per-agent `participants.model` overrides this. |
-| `CUMORA_DEFAULT_CODEX_MODEL` | unset | Same shape for codex; deliberately not set by default. |
+| `CUMORA_DEFAULT_CODEX_MODEL` | unset | Same shape for Codex; deliberately not set by default. |
+| `CUMORA_DEFAULT_GROK_MODEL` | unset | Same shape for Grok Build. |
+| `CUMORA_DEFAULT_CURSOR_MODEL` | unset | Same shape for Cursor Agent; blank lets Cursor use Auto. |
 | `CUMORA_BYOA_MAX_CONCURRENT_BIG_BRAIN` | 6 | Per-computer big-brain turn cap. Drop to 2-4 for very tight quotas; raise for higher tiers. |
 | `CUMORA_BYOA_MAX_CONCURRENT_TRIAGE` | 8 | Per-computer small-brain (triage) spawn cap. Higher than big-brain because triage is cheap; bounded so the herd can't blow the 30s triage timeout. |
 | `CUMORA_BYOA_MIN_SPAWN_INTERVAL_MS` | 500 | Deterministic minimum interval between local-CLI spawn starts — the AdaptivePacer's base (3, 3b). |
@@ -720,11 +722,21 @@ The recurring methodology that paid off, in priority order:
    minutes. Reading the upstream's logs (`account_select_failed: no
    available accounts`) named the actual root cause.
 4. **Memory files are state too.** Agents persist learnings to
-   `~/.cumora/agents/<id>/memory/<file>.md`. Useful, but they can ENCODE
-   the wrong lesson from a single weird game (e.g. an explicit-cap counting
-   game becomes a universal "never lap" rule). Wiping the overfit files is
-   the surgical move; the rest of the agent's notes stay intact. **Don't
-   delete files you didn't audit first** — read each one's frontmatter.
+   `~/.cumora/agents/<id>/memory/` (global identity, indexed by
+   `MEMORY.md`) and `memory/projects/<projectId>/` (unpinned work facts
+   of that project). Useful, but they can ENCODE the wrong lesson from a
+   single weird game (e.g. an explicit-cap counting game becomes a
+   universal "never lap" rule).
+
+   Cross-group bleed of *work* facts is a scoping bug, not a wipe bug:
+   cloud `loadMemory` and the BYOA wake digest share `memory-scope.ts`
+   and inject **global + the current project only** (pinned / identity /
+   persona / skills / climate stay global; a conversation with no project
+   gets global memory only). Existing files stay global — we do not
+   guess-migrate old notes into a project. Wiping an overfit file is
+   still the surgical move when the *lesson* is wrong; the rest of the
+   agent's notes stay intact. **Don't delete files you didn't audit
+   first** — read each one's frontmatter.
 
 The breakthrough moment was the user's reframing: *"AI-native means making
 AI agents behave like real humans collaborating. Don't be limited in
@@ -766,6 +778,7 @@ fallback) and absent-member coverage (team-adapts principle).
 | File | Role |
 |---|---|
 | `server/src/agents/glance-protocol.ts` | The `GLANCE_YIELD_RULES` const, shared verbatim BYOA ↔ cloud. **Edit minimally.** Holds the three principles (cap-clarification, count-items, team-adapts). |
+| `server/src/agents/memory-scope.ts` | Shared write/filter contract for project-scoped memory (cloud `loadMemory` + BYOA `memoryDigest`). Pure; unit-tested without Postgres. |
 | `server/src/agents/computer/daemon.ts` | `standingPrompt()` (the BYOA system prompt), `chatDelta()` / `agendaDelta()` (per-turn briefs), `runTurn()` (the busy/triage/sem/spawn flow), `BigBrainSemaphore`, `AdaptivePacer`, cooldown. |
 | `server/src/agents/triage-core.ts` | Small-brain triage instructions + parsing. The ▸YOU rule lives here. |
 | `server/src/agents/cli.ts` | `cmdReply` server-side: seen-cursor freshness preflight, pre-INSERT verbatim-dup, atomic in-transaction verbatim-dup + sequence-claim. Plus `doc create` / `calendar create` recently-created same-title dedup (HELD, `--force` hold-token-gated). |
@@ -773,4 +786,4 @@ fallback) and absent-member coverage (team-adapts principle).
 | `server/src/agents/agenda.ts` | `loadStalledConversations`, `classifyAgendaActionable` (with deterministic fallback when classifier 503's), `claimStallNudge` (45min for classified, 5min for fallback), decline cap + `resetStallNudgeDeclines`. |
 | `server/src/agents/runtime/server.ts` | `/runtime/inbox` endpoint with `?probe=1` flag for non-advancing reads. `/thinking/mark` / `/thinking/unmark` bracket the turn (they also still stamp the vestigial compose-anchor — see 5a). `/agenda` routes the nudge `source` flag (classified vs fallback) into `claimStallNudge`. |
 | `server/src/agents/runtime/inproc-client.ts` | `loadInbox()` — must remain a PURE READ. No more recordSeen side-effect (that broke a6e69aa). `markThinking`/`peekThinking` for the ZSET-based "who's composing here" claim. |
-| `server/src/agents/computer/registry.ts` | `listAgentsForComputer` with the `CUMORA_DEFAULT_CLAUDE_MODEL` fallback. |
+| `server/src/agents/computer/registry.ts` | `listAgentsForComputer` with per-engine `CUMORA_DEFAULT_*_MODEL` fallbacks. |

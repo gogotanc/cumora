@@ -9,6 +9,7 @@ import assert from 'node:assert/strict'
 import {
   renderAgendaBrief,
   classifyAgendaActionable,
+  parseAgendaVerdict,
   AGENDA_CLASSIFIER_ERROR,
   __test,
   type AgentAgenda,
@@ -184,6 +185,73 @@ test('renderAgendaForClassifier includes assigned/mentioned tags + ids', () => {
   assert.match(out, /Bring the migration status update/)
 })
 
+test('renderAgendaForClassifier keeps a stable prefix while preserving silence minutes', () => {
+  const stall = {
+    conversationId: 'direct-1',
+    kind: 'direct',
+    title: 'Lumi ↔ boss',
+    lastMessageId: 'm-1',
+    lastAuthorId: 'storyicon',
+    lastAuthorName: 'storyicon',
+    lastAuthorIsSelf: false,
+    lastBody: 'need a build',
+    minutesSilent: 47,
+    recentTail: 'storyicon: need a build\nLumi@Secretary: looking',
+  }
+  const base: AgentAgenda = {
+    cards: [{
+      id: 'c-1', board_id: 'b1', board_title: 'Ops', column_id: 'col1',
+      column_title: 'Doing', title: 'Ship', description: null,
+      assignee_id: 'agent-1', mentions: [], updated_at: '2026-05-20T10:00:00Z',
+    }],
+    events: [{
+      id: 'evt-1', title: 'Standup', description: null,
+      start_at: '2026-05-20T15:00:00Z', agent_prompt: null,
+      target_conversation_id: null,
+    }],
+    stalls: [stall],
+  }
+  const a = renderAgendaForClassifier(base)
+  const b = renderAgendaForClassifier({
+    ...base,
+    stalls: [{ ...stall, minutesSilent: 48 }],
+  })
+  const timingMarker = '\n\nCurrent stall timing:\n'
+  assert.equal(a.slice(0, a.indexOf(timingMarker)), b.slice(0, b.indexOf(timingMarker)))
+  assert.match(a, /direct-1: 47m silent/)
+  assert.match(b, /direct-1: 48m silent/)
+  assert.match(a, /need a build/)
+  assert.ok(a.indexOf('need a build') < a.indexOf('Standup'), 'stall messages precede calendar')
+  assert.ok(a.indexOf('Standup') < a.indexOf('47m silent'), 'dynamic timing follows stable agenda data')
+})
+
+test('renderAgendaForClassifier sorts cards and stalls by id, not recency', () => {
+  const stall = (id: string) => ({
+    conversationId: id,
+    kind: 'direct',
+    title: id,
+    lastMessageId: 'm',
+    lastAuthorId: 'x',
+    lastAuthorName: 'x',
+    lastAuthorIsSelf: false,
+    lastBody: 'hi',
+    minutesSilent: 10,
+    recentTail: 'x: hi',
+  })
+  const card = (id: string) => ({
+    id, board_id: 'b1', board_title: 'Ops', column_id: 'col1',
+    column_title: 'Doing', title: id, description: null,
+    assignee_id: 'agent-1', mentions: [], updated_at: '2026-05-20T10:00:00Z',
+  })
+  const out = renderAgendaForClassifier({
+    cards: [card('c-z'), card('c-a')],
+    events: [],
+    stalls: [stall('direct-z'), stall('direct-a')],
+  })
+  assert.ok(out.indexOf('c-a') < out.indexOf('c-z'), 'cards sorted by id')
+  assert.ok(out.indexOf('direct-a') < out.indexOf('direct-z'), 'stalls sorted by conversationId')
+})
+
 test('renderAgendaBrief opens with the action override + includes ids', () => {
   const agenda: AgentAgenda = {
     cards: [
@@ -240,6 +308,33 @@ test('renderAgendaBrief works with only calendar events', () => {
 })
 
 // ────────────────────────────────────────────────────────────────────────────
+// Agenda verdict parsing — fail closed while recovering provider formatting
+// drift that still carries an explicit decision.
+// ────────────────────────────────────────────────────────────────────────────
+
+test('parseAgendaVerdict accepts fenced strict JSON', () => {
+  const parsed = parseAgendaVerdict('```json\n{"actionable":false,"focus":"","reason":"done"}\n```')
+  assert.deepEqual(parsed, { actionable: false, focus: '', reason: 'done' })
+})
+
+test('parseAgendaVerdict salvages unquoted keys and single-quoted strings', () => {
+  const parsed = parseAgendaVerdict("{ actionable: false, focus: '', reason: 'already concluded' }")
+  assert.deepEqual(parsed, { actionable: false, focus: '', reason: 'already concluded' })
+})
+
+test('parseAgendaVerdict salvages a truncated explicit negative', () => {
+  const parsed = parseAgendaVerdict('{"actionable":false,"focus":"","reason":"already done"')
+  assert.deepEqual(parsed, { actionable: false, focus: '', reason: 'already done' })
+})
+
+test('parseAgendaVerdict never salvages an unfocused malformed positive as actionable', () => {
+  const parsed = parseAgendaVerdict('{ actionable: true, reason: "maybe" }')
+  assert.deepEqual(parsed, {
+    actionable: false, focus: '', reason: 'malformed positive verdict without focus',
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
 // classifyAgendaActionable JSON-robustness — the production classifier is a
 // boundary between us and a non-deterministic LLM. Every branch in the
 // parse path needs explicit coverage so a single malformed reply can't
@@ -261,6 +356,22 @@ test('classifyAgendaActionable: empty agenda short-circuits before the LLM call'
   assert.equal(v.actionable, false)
   assert.equal(v.reason, 'empty agenda')
   assert.equal(called, false, 'must not call the LLM when there is nothing to triage')
+})
+
+test('classifyAgendaActionable leaves output headroom beyond reasoning tokens', async () => {
+  let maxOutputTokens = 0
+  __setLlmClientOverrideForTesting((async () => ({
+    responses: {
+      create: async (request: { max_output_tokens?: number }) => {
+        maxOutputTokens = request.max_output_tokens ?? 0
+        return { output_text: JSON.stringify({ actionable: false, focus: '', reason: 'done' }) }
+      },
+    },
+  })) as unknown as Parameters<typeof __setLlmClientOverrideForTesting>[0])
+  await classifyAgendaActionable({
+    persona: STUB_PERSONA, companyId: 'c1', agenda: SINGLE_CARD_AGENDA,
+  })
+  assert.ok(maxOutputTokens >= 2_000, 'live support-model reasoning exceeded 800 tokens before emitting JSON')
 })
 
 test('classifyAgendaActionable: happy path with strict boolean true', async () => {
@@ -370,4 +481,25 @@ test('classifyAgendaActionable: empty output_text → classifier_error (model ga
   })
   assert.equal(v.actionable, false)
   assert.equal(v.reason, AGENDA_CLASSIFIER_ERROR)
+})
+
+test('classifyAgendaActionable: identical content is re-evaluated on every heartbeat', async () => {
+  let calls = 0
+  __setLlmClientOverrideForTesting((async () => ({
+    responses: {
+      create: async () => {
+        calls += 1
+        return { output_text: JSON.stringify({ actionable: true, focus: `ship-${calls}`, reason: 'card' }) }
+      },
+    },
+  })) as unknown as Parameters<typeof __setLlmClientOverrideForTesting>[0])
+  const args = {
+    persona: STUB_PERSONA, companyId: 'c1', agenda: SINGLE_CARD_AGENDA, agentId: 'agent-1',
+  }
+  const v1 = await classifyAgendaActionable(args)
+  const v2 = await classifyAgendaActionable(args)
+  assert.equal(v1.actionable, true)
+  assert.equal(v1.focus, 'ship-1')
+  assert.equal(v2.focus, 'ship-2')
+  assert.equal(calls, 2, 'time-sensitive agenda decisions must not reuse an old verdict')
 })

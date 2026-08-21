@@ -59,6 +59,10 @@ export interface InboxRow {
   /** The group's topic ("what this group is for"), so every agent — the cloud
    *  turn context AND the BYOA inbox digest — stays on-task. Null if unset. */
   conversation_topic: string | null
+  /** Optional: conversation's project. Direct chats and unscoped groups
+   *  leave these unset so a project-less header stays byte-identical. */
+  project_id?: string | null
+  project_name?: string | null
   author_id: string
   /** Joined from participants.kind. Lets prompt-building code (turn.ts)
    *  identify human vs agent messages without a hardcoded id allow-list. */
@@ -196,9 +200,14 @@ export interface AgentRuntimeClient {
   getConversationCompanyId(conversationId: string): Promise<string | null>
   /** Unread messages across all of the agent's conversations. */
   loadInbox(agentId: string): Promise<InboxRow[]>
-  /** Hybrid memory retrieval: pinned + semantic + recent. */
+  /** Hybrid memory retrieval: pinned + semantic + recent, filtered to
+   *  global + the current project(s). Pass conversationIds (preferred)
+   *  or projectIds; empty/omitted scope = GLOBAL only (no-project wake). */
   loadMemory(agentId: string, queryText: string, limits?: {
     semantic?: number; recent?: number; total?: number;
+  }, scope?: {
+    projectIds?: readonly string[];
+    conversationIds?: readonly string[];
   }): Promise<MemoryRow[]>
   /** Per-conversation recent history for every convo with unread items. */
   loadContext(agentId: string, conversationIds: string[]): Promise<ContextRow[]>

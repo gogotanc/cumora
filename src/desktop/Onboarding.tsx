@@ -17,10 +17,10 @@ export function Onboarding() {
   const [err, setErr] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
   // The engine the starter team (and agents later assigned here) will run on.
-  // Claude is the default; picking Codex appends `--engine codex`. We DON'T
-  // append `--engine claude` so a Codex-only machine still auto-detects rather
+  // Claude is the default; ANY other pick must be named explicitly. We DON'T
+  // append `--engine claude` so a Claude-less machine still auto-detects rather
   // than erroring on a Claude it doesn't have.
-  const [engine, setEngine] = useState<'claude' | 'codex'>('claude')
+  const [engine, setEngine] = useState<'claude' | 'codex' | 'grok' | 'cursor'>('claude')
   // Default to installing the always-on service: it auto-starts on boot,
   // auto-restarts on crash, and auto-updates — so the user isn't tied to a
   // terminal that must stay open. Appends `--install-service` to the command.
@@ -36,7 +36,10 @@ export function Onboarding() {
   }, [copied])
 
   const origin = getComputerServerOrigin()
-  const engineFlag = engine === 'codex' ? ' --engine codex' : ''
+  // Every non-default engine, not just Codex: without the flag the daemon
+  // auto-detects and the server takes engines[0] as this computer's DEFAULT, so
+  // picking Grok on a machine that also has Claude silently paired it to Claude.
+  const engineFlag = engine === 'claude' ? '' : ` --engine ${engine}`
   const serviceFlag = asService ? ' --install-service' : ''
   const cmd = code ? `npx cumora@latest agent computer --pair ${code}${origin ? ` --server ${origin}` : ''}${engineFlag}${serviceFlag}` : ''
 
@@ -64,8 +67,10 @@ export function Onboarding() {
           </div>
           <p className="text-[14.5px] text-ink-600 leading-relaxed mb-6 max-w-[560px]">
             Your agents run on <strong>your own machine</strong> (or a VPS), powered by your local
-            <span className="font-mono text-[13px]"> Claude Code</span> or
-            <span className="font-mono text-[13px]"> Codex</span>. Pair a computer to get started —
+            <span className="font-mono text-[13px]"> Claude Code</span>,
+            <span className="font-mono text-[13px]"> Codex</span>,
+            <span className="font-mono text-[13px]"> Grok Build</span>, or
+            <span className="font-mono text-[13px]"> Cursor</span>. Pair a computer to get started —
             your starter team will set up there, each with its own isolated workspace, memory, and skills.
           </p>
 
@@ -74,7 +79,7 @@ export function Onboarding() {
               <>
                 <div className="text-[13px] text-ink-600 mb-4">
                   On the machine you want to host your agents, you'll run one command. It needs
-                  <span className="font-mono"> claude</span> or <span className="font-mono">codex</span> installed.
+                  <span className="font-mono"> claude</span>, <span className="font-mono">codex</span>, <span className="font-mono">grok</span>, or <span className="font-mono">cursor-agent</span> installed.
                 </div>
                 {err && <div className="text-[12px] text-coral-deep bg-coral-soft rounded-[8px] p-2 mb-3">{err}</div>}
                 <button onClick={getCode} disabled={busy}
@@ -91,7 +96,7 @@ export function Onboarding() {
                 <div className="flex items-center gap-2.5 mb-2.5">
                   <span className="text-[12px] text-ink-500">Engine</span>
                   <div className="inline-flex rounded-[9px] p-0.5" style={{ background: 'var(--ink-100)' }}>
-                    {([['claude', 'Claude Code'], ['codex', 'Codex']] as const).map(([id, label]) => (
+                    {([['claude', 'Claude Code'], ['codex', 'Codex'], ['grok', 'Grok Build'], ['cursor', 'Cursor']] as const).map(([id, label]) => (
                       <button key={id} type="button" onClick={() => setEngine(id)}
                         className="px-3 py-1 rounded-[7px] text-[12px] font-semibold transition-colors duration-150"
                         style={engine === id
@@ -101,7 +106,7 @@ export function Onboarding() {
                       </button>
                     ))}
                   </div>
-                  <span className="text-[11px] text-ink-400">just the default — this computer can still run agents on either engine</span>
+                  <span className="text-[11px] text-ink-400">just the default — this computer can still run agents on any detected engine</span>
                 </div>
                 {isWindows ? (
                   <div className="mb-2.5 text-[12px] text-ink-600">

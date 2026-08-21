@@ -2,8 +2,8 @@
  * `cumora agent computer` — the BYOA daemon.
  *
  * A long-running process on the user's machine (laptop or VPS) that hosts one
- * or more of their Cumora agents, using a local engine (Claude Code / Codex)
- * as each agent's brain. See docs/BYOA.md.
+ * or more of their Cumora agents, using a local engine (Claude Code / Codex /
+ * Grok Build / Cursor Agent) as each agent's brain. See docs/BYOA.md.
  *
  * It talks to the Cumora server only over HTTP — no DB/Redis — so it can run
  * anywhere:
@@ -26,12 +26,20 @@ import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 
 const execFileP = promisify(execFile)
-import { parseSseStream } from '../runtime/sse-parse.js'
+import { parseSseStream, wakeStreamWasStable } from '../runtime/sse-parse.js'
 import { detectEngines, getAdapter, ENGINE_IDS, runEngineDoctor, type EngineId, type EngineSession, type EngineRunResult, type EngineUsage, type EngineHopReport } from './engine.js'
 import { usageFromClaude, type TokenUsage } from '../cost.js'
 import { parseTriage, finalizeTriage, isRateLimited } from '../triage-core.js'
 import { GLANCE_YIELD_RULES } from '../glance-protocol.js'
 import { SKYPE_EMOTICONS_GUIDE } from '../skype-emoticons.js'
+import {
+  composeMemoryDigest,
+  conversationHeader,
+  memoryIndexPathsForScope,
+  uniqueProjectIds,
+} from '../memory-scope.js'
+
+export { conversationHeader }
 
 const CONFIG_DIR = join(homedir(), '.cumora')
 const CONFIG_PATH = join(CONFIG_DIR, 'computer.json')
@@ -107,7 +115,7 @@ const AGENDA_QUIET_MS = 90_000
 const AGENDA_CHECK_MS = 60_000
 const MAX_VISIBLE_ERROR_CHARS = 900
 // Big-brain spawn jitter. When an SSE wake fans out to N agents on this
-// computer at the same instant (e.g. a human @all in a group), N claude/codex
+// computer at the same instant (e.g. a human @all in a group), N local-engine
 // subprocesses would spawn in the same millisecond and slam Anthropic/OpenAI
 // in lockstep — observed today as four byoa_engine_failed notices in a row
 // with "Server is temporarily limiting requests · Rate limited" right after
@@ -263,10 +271,16 @@ class AdaptivePacer {
 const spawnPacer = new AdaptivePacer(MIN_SPAWN_INTERVAL_MS)
 
 // ─── self-update ──────────────────────────────────────────────────────────
-// Injected by esbuild at build time (agent-cli/build.mjs). Undefined when run
-// un-bundled (tsx dev); guarded with typeof so that path is a safe no-op.
+// Injected by esbuild at build time (agent-cli/build.mjs). Source-mode
+// launchers may provide CUMORA_VERSION; otherwise development falls back to
+// 0.0.0. The typeof guard keeps an undefined build constant safe at runtime.
 declare const __CUMORA_VERSION__: string | undefined
-const CURRENT_VERSION = typeof __CUMORA_VERSION__ === 'string' ? __CUMORA_VERSION__ : '0.0.0'
+export function resolveCurrentVersion(bundledVersion: string | undefined, envVersion = process.env.CUMORA_VERSION): string {
+  return bundledVersion ?? (envVersion?.trim() || '0.0.0')
+}
+const CURRENT_VERSION = resolveCurrentVersion(
+  typeof __CUMORA_VERSION__ === 'string' ? __CUMORA_VERSION__ : undefined,
+)
 const UPDATE_CHECK_MS = 6 * 60 * 60 * 1000 // re-check npm every 6h
 // Log rotation: the service supervisor (launchd StandardOutPath / systemd) writes
 // the daemon's stdout to ~/.cumora/daemon.log and NEVER rotates it — left alone it
@@ -313,12 +327,70 @@ interface RuntimeInboxResponse {
     conversation_kind?: string
     conversation_title?: string
     conversation_topic?: string | null
+    project_id?: string | null
+    project_name?: string | null
     author_name?: string
     author_kind?: string
     body?: string
     kind?: string
     sequence?: number
   }>
+}
+
+// How many unread MESSAGE lines the pre-loaded wake digest may carry. It rides
+// in EVERY chat turn's prompt (see chatDelta), so it stays small.
+const DIGEST_MAX_MESSAGE_LINES = 40
+
+/** Render the pre-loaded unread digest for the wake prompt within
+ *  DIGEST_MAX_MESSAGE_LINES.
+ *
+ *  The budget is spent PER CONVERSATION rather than as one global "newest N
+ *  lines" tail, because `ackSeen` marks the WHOLE snapshot read: anything the
+ *  digest leaves out is marked read having never been shown, and since
+ *  mark-read pins each conversation's cursor at its NEWEST message it can never
+ *  resurface in a later wake. A global tail let a burst in one busy room evict —
+ *  and then ack away — every message of a quieter conversation, including a
+ *  human DM the agent could not even name afterwards. The cloud path avoids this
+ *  by giving every conversation with unread its own window (see loadContext).
+ *
+ *  Whatever the budget still cannot fit is announced IN PLACE with its exact
+ *  count and the command that reads it, so the engine can recover the rest
+ *  instead of never learning it existed. Conversations keep first-seen order and
+ *  their messages stay chronological; when everything fits, every unread line is
+ *  shown, exactly as before.
+ *
+ *  Exported for tests — pure, no server and no engine. */
+export function renderInboxDigest(
+  byConvo: Map<string, { head: string; msgs: string[] }>,
+  budget = DIGEST_MAX_MESSAGE_LINES,
+): string {
+  if (byConvo.size === 0) return ''
+  // Water-fill quietest-first: each conversation takes at most an even share of
+  // what is LEFT, so a small conversation keeps all of its messages and the busy
+  // one absorbs the slack. When the total fits, this hands every conversation
+  // its full set (nothing omitted, nothing announced).
+  const keep = new Map<string, number>()
+  let lineBudget = budget
+  let unserved = byConvo.size
+  for (const [id, convo] of [...byConvo].sort((a, b) => a[1].msgs.length - b[1].msgs.length)) {
+    const n = Math.min(convo.msgs.length, Math.max(0, Math.floor(lineBudget / unserved)))
+    keep.set(id, n)
+    lineBudget -= n
+    unserved -= 1
+  }
+  const lines: string[] = []
+  for (const [id, convo] of byConvo) {
+    const shown = keep.get(id) ?? 0
+    lines.push(convo.head)
+    // Never drop unread in SILENCE — this turn is about to mark it read.
+    if (convo.msgs.length > shown) {
+      lines.push(`  … ${convo.msgs.length - shown} older unread message(s) not shown — \`cumora messages ${id} --tail ${convo.msgs.length}\` to read them`)
+    }
+    // slice(length - shown), NOT slice(-shown): slice(-0) is slice(0) and would
+    // print everything for a conversation budgeted to zero.
+    lines.push(...convo.msgs.slice(convo.msgs.length - shown))
+  }
+  return lines.join('\n')
 }
 
 interface RuntimeInboxTriageResponse {
@@ -371,10 +443,27 @@ function parseArgs(argv: string[]): {
 
 // ─── HTTP helpers ───────────────────────────────────────────────────────
 
+/** Wall-clock cap on every SHORT request/response call to the server (status,
+ *  runs, token mint, heartbeat, agent sync).
+ *
+ *  Without this, a request that never answers — a half-open socket surviving a
+ *  laptop sleep/network switch, a hung proxy, a pod that accepted the connection
+ *  and stopped — parks the turn forever: `catch` only sees throws, never a
+ *  promise that simply doesn't settle. The turn's `finally { this.busy = false }`
+ *  never runs, so the agent stays permanently `busy`, every later wake collapses
+ *  to `turn busy — coalescing`, and the heartbeat interval stops going out until
+ *  the server marks the whole computer offline. One stalled socket takes down
+ *  every agent on the machine.
+ *
+ *  Deliberately NOT applied to the wake-stream (an intentionally long-lived SSE
+ *  connection, which has its own idle/backoff handling) or the npm version check. */
+const HTTP_TIMEOUT_MS = Math.max(1_000, Number(process.env.CUMORA_HTTP_TIMEOUT_MS ?? 20_000))
+
 async function api<T>(serverUrl: string, path: string, init: RequestInit): Promise<T> {
   const res = await fetch(`${serverUrl}${path}`, {
     ...init,
     headers: { 'Content-Type': 'application/json', ...(init.headers ?? {}) },
+    signal: init.signal ?? AbortSignal.timeout(HTTP_TIMEOUT_MS),
   })
   if (!res.ok) {
     const body = await res.text().catch(() => '')
@@ -384,7 +473,9 @@ async function api<T>(serverUrl: string, path: string, init: RequestInit): Promi
 }
 
 /** Fire-and-forget runtime call (status / runs). Never throws — observability
- *  must never break the agent loop. */
+ *  must never break the agent loop. The timeout is what makes that promise hold
+ *  for a server that stops answering rather than refusing (see HTTP_TIMEOUT_MS):
+ *  an abort throws, so it lands in the catch and the turn proceeds. */
 async function runtimeBest(
   serverUrl: string, path: string, token: string, body: unknown,
 ): Promise<unknown> {
@@ -393,6 +484,7 @@ async function runtimeBest(
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
     })
     return res.ok ? await res.json().catch(() => null) : null
   } catch { return null }
@@ -405,9 +497,33 @@ async function runtimeGet<T>(
     const res = await fetch(`${serverUrl}/runtime${path}`, {
       method: 'GET',
       headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
     })
     return res.ok ? await res.json().catch(() => null) as T | null : null
   } catch { return null }
+}
+
+/** Which conversation should show "<agent> is typing…" for this turn.
+ *
+ *  The wake's own conversation when it had one. Otherwise derive it from what is
+ *  unread, because a wake frequently carries none: a poll-driven turn never does
+ *  (only an SSE wake sets it, and polling is the only path left when the
+ *  wake-stream is down), and a wake that lands mid-turn is coalesced through
+ *  scheduleWake's busy branch, which re-kicks without a conversation.
+ *
+ *  `seen` is keyed by conversation_id, so the daemon already knows where the work
+ *  came from. With exactly one unread conversation that's unambiguous. With
+ *  several, stay silent rather than light up an arbitrary room — a wrong
+ *  indicator is worse than none, and the reply itself still lands correctly.
+ *
+ *  Exported for tests: this decides whether a working agent looks alive or dead,
+ *  and the "no indicator at all" case is the one users read as a hang. */
+export function typingConversation(
+  wakeConvo: string | null,
+  seen: Map<string, string>,
+): string | null {
+  if (wakeConvo) return wakeConvo
+  return seen.size === 1 ? [...seen.keys()][0] : null
 }
 
 function hashText(text: string): string {
@@ -500,6 +616,12 @@ function authFailureHint(engine: EngineId, detail: string): string {
   if (engine === 'claude') {
     return 'Open Claude Code on that computer and sign in, refresh quota, or add credits, then wake the agent again.'
   }
+  if (engine === 'grok') {
+    return 'Open Grok Build on that computer and run `grok login`, or set XAI_API_KEY, then wake the agent again.'
+  }
+  if (engine === 'cursor') {
+    return 'Open a terminal on that computer and run `cursor-agent login` (or fix its quota / API key), then wake the agent again.'
+  }
   return 'Open Codex on that computer and refresh its login or quota, then wake the agent again.'
 }
 
@@ -510,6 +632,8 @@ function missingEngineMessage(): string {
     'Install and sign in to at least one of:',
     '  - Claude Code: install the `claude` CLI, then run `claude` once to sign in',
     '  - Codex: install the `codex` CLI, then run `codex` once to sign in',
+    '  - Grok Build: install the `grok` CLI, then run `grok login` once',
+    '  - Cursor Agent: install Cursor (the `cursor-agent` CLI ships with it), then run `cursor-agent login`',
     '',
     'After that, rerun:',
     '  npx cumora@latest agent computer --pair <code>',
@@ -521,7 +645,7 @@ function helpText(): string {
     'cumora agent computer — run your Cumora agents on THIS machine (BYOA)',
     '',
     'The daemon talks to a Cumora server over HTTP and drives a local agent',
-    'engine (Claude Code or Codex). Pair once, then it runs in the background.',
+    'engine (Claude Code, Codex, Grok Build, or Cursor Agent). Pair once, then it runs in the background.',
     '',
     'Usage:',
     '  npx cumora@latest agent computer --pair <code> [--server <url>] [--engine <id>]',
@@ -574,7 +698,10 @@ async function saveConfig(cfg: DaemonConfig): Promise<void> {
 // A tiny Node executable named `cumora` that the engine calls via bash. It
 // POSTs argv to the server's /runtime/cli, which runs the full CLI server-
 // side with the agent's identity pinned by the JWT. No curl/jq dependency.
-const CUMORA_SHIM = `#!/usr/bin/env node
+//
+// Exported for tests: the output-truncation regression below is only observable
+// by running the real shim text against a real pipe.
+export const CUMORA_SHIM = `#!/usr/bin/env node
 'use strict'
 ;(async () => {
   const url = process.env.CUMORA_AGENT_RUNTIME_URL
@@ -622,8 +749,18 @@ const CUMORA_SHIM = `#!/usr/bin/env node
     process.exit(70)
   }
   const data = await res.json()
-  if (typeof data.text === 'string' && data.text) process.stdout.write(data.text + '\\n')
-  process.exit(typeof data.exitCode === 'number' ? data.exitCode : 0)
+  const code = typeof data.exitCode === 'number' ? data.exitCode : 0
+  // Exit from the write CALLBACK, not the next statement: stdout on a PIPE is
+  // ASYNC, so process.exit() kills us with the tail still buffered. The engine
+  // always runs this shim with stdout piped, so a big result (cumora messages
+  // --tail 30, cumora inbox --json) silently arrived truncated at the pipe
+  // buffer — 64KB, or 8KB on the socketpair a stdio:'pipe' parent hands us —
+  // with exit 0 and empty stderr, so nothing signalled the loss and --json
+  // output simply failed to parse. Exiting IN the callback also keeps a reader
+  // that closed early (| head) an exit-0 like before, instead of the unhandled
+  // EPIPE crash a bare process.exitCode would produce.
+  if (typeof data.text === 'string' && data.text) process.stdout.write(data.text + '\\n', () => process.exit(code))
+  else process.exit(code)
 })().catch((e) => { console.error('cumora:', (e && e.message) || e); process.exit(70) })
 `
 
@@ -696,8 +833,14 @@ async function doPair(code: string, serverUrl: string, preferredEngine?: string)
  *    - Auto-flush on every WINDOW_MS tick AND when buffer hits FLUSH_AT.
  *    - flush() can be awaited at "natural pauses" (turn end) to push the tail
  *      promptly without waiting for the timer. */
+type ByoaSource = `byoa-${EngineId}`
+
+function byoaSourceOf(id: EngineId): ByoaSource {
+  return `byoa-${id}`
+}
+
 interface PendingHop {
-  source: 'byoa-claude' | 'byoa-codex'
+  source: ByoaSource
   purpose: 'agent-turn' | 'inbox-triage' | 'compaction' | 'completion-verify' | 'steer-summary' | 'agenda' | 'synthetic-wake-gate'
   runId: string | null
   conversationId: string | null
@@ -747,7 +890,7 @@ class HopReporter {
     // Codex + Claude batches might intermix (the same reporter is used across
     // session lifetimes), so split by source — the server endpoint takes one
     // source per call (the row's `source` column is set from it).
-    const byHourceSource = new Map<'byoa-claude' | 'byoa-codex', PendingHop[]>()
+    const byHourceSource = new Map<ByoaSource, PendingHop[]>()
     for (const h of batch) {
       const arr = byHourceSource.get(h.source) ?? []
       arr.push(h); byHourceSource.set(h.source, arr)
@@ -771,7 +914,55 @@ class HopReporter {
   }
 }
 
+/** CUMORA_ENGINE_MODEL value meaning "impose no model at all — use whatever
+ *  the local CLI is already configured for". */
+const ENGINE_MODEL_LOCAL = 'local'
+
+/** The model the LOCAL engine should run this agent's turns on.
+ *
+ *  Cumora pins a model per agent (participants.model, else the deploy-level
+ *  CUMORA_DEFAULT_* default) so a CLI upgrade can't silently change behaviour.
+ *  That pin is an Anthropic/OpenAI model id — which is simply wrong for a BYOA
+ *  operator whose `claude` points at a custom provider (CC Switch and friends):
+ *  the provider has never heard of e.g. `claude-opus-4-7`, so EVERY turn dies
+ *  with "There's an issue with the selected model". The pin is resolved
+ *  server-side, so on hosted Cumora the operator cannot change it, and their
+ *  only escape was CUMORA_CLAUDE_ARGS — which also disables the persistent
+ *  session and makes them hand-write the entire flag set.
+ *
+ *  CUMORA_ENGINE_MODEL overrides the pin daemon-side. The value `local` passes
+ *  NO model at all, so the CLI runs on whatever it is already configured for —
+ *  the same escape CUMORA_TRIAGE_MODEL already gives the small brain.
+ *
+ *  Exported for tests. */
+export function resolveEngineModel(
+  configured: string | null | undefined,
+  override: string | undefined,
+): string | null {
+  const o = override?.trim()
+  if (!o) return configured ?? null
+  return o.toLowerCase() === ENGINE_MODEL_LOCAL ? null : o
+}
+
+/** The same knob governs the small-brain pin. `local` has to impose NOTHING:
+ *  otherwise ANTHROPIC_SMALL_FAST_MODEL would still name a model the custom
+ *  provider lacks, and the CLI's own quick calls would fail instead of the turn.
+ *  A concrete override only replaces the big-brain pin, so fast_model is left
+ *  alone there. */
+export function resolveEngineFastModel(
+  configured: string | null | undefined,
+  override: string | undefined,
+): string | null {
+  return override?.trim().toLowerCase() === ENGINE_MODEL_LOCAL ? null : (configured ?? null)
+}
+
 class AgentRunner {
+  /** Aborted once in stop(). Handed to every one-shot `adapter.run(...)` so the
+   *  engine child dies with its runner, the way the persistent session already
+   *  does. Without it those children were orphaned: they keep a valid runtime
+   *  token and the `cumora` shim on PATH, so they go on posting AS the agent
+   *  while the replacement runner independently answers the same messages. */
+  private readonly teardown = new AbortController()
   private token = ''
   private tokenExpiresAt = 0
   private home: string
@@ -872,7 +1063,7 @@ class AgentRunner {
       if (typeof report.toolUses === 'number') extras.toolUses = report.toolUses
       if (typeof report.textChars === 'number') extras.textChars = report.textChars
       this.reporter.push({
-        source: this.adapter.id === 'claude' ? 'byoa-claude' : 'byoa-codex',
+        source: byoaSourceOf(this.adapter.id),
         purpose,
         runId: this.currentRunId,
         conversationId: this.lastWakeConvo,
@@ -986,6 +1177,11 @@ class AgentRunner {
     this.beginStop()
     this.engineSession?.stop()
     this.engineSession = null
+    // Kill a one-shot engine child too. sync() tears a runner down on any
+    // config change (engine/model/persona) or unassign while the daemon keeps
+    // running, which is exactly where an orphan does damage: it would still be
+    // acting with the OLD persona the operator just replaced.
+    this.teardown.abort()
     // Drain any hops queued at shutdown so the ledger doesn't lose the tail
     // (e.g. the agent was mid-turn when the daemon restarts for an update).
     this.hopReporter?.stop()
@@ -1022,6 +1218,16 @@ class AgentRunner {
 
   /** Env handed to the engine subprocess: the `cumora` shim on PATH, wired to
    *  this agent's runtime URL + token. */
+  /** Big-brain model for the local engine, after the CUMORA_ENGINE_MODEL escape. */
+  private engineModel(): string | null {
+    return resolveEngineModel(this.agent.model, process.env.CUMORA_ENGINE_MODEL)
+  }
+
+  /** Small/fast-brain model for the local engine, after the same escape. */
+  private engineFastModel(): string | null {
+    return resolveEngineFastModel(this.agent.fastModel, process.env.CUMORA_ENGINE_MODEL)
+  }
+
   private engineEnv(): NodeJS.ProcessEnv {
     return {
       ...process.env,
@@ -1037,8 +1243,8 @@ class AgentRunner {
 
   /** The long-lived engine process for this agent (persistent stream-json),
    *  created lazily and reused across wakes so turns 2..N skip the cold start.
-   *  Returns null if the engine has no persistent mode (codex / a custom
-   *  CLAUDE_ARGS override) — the caller then falls back to one-shot run(). If the
+   *  Returns null if the engine has no persistent mode (Cursor, Codex fallback,
+   *  or a custom args override) — the caller then uses one-shot run(). If the
    *  prior process has died it respawns, resuming this.sessionId so context
    *  carries across the restart. */
   private ensureEngineSession(): EngineSession | null {
@@ -1047,8 +1253,8 @@ class AgentRunner {
     this.engineSession = this.adapter.startSession({
       home: this.home,
       env: this.engineEnv(),
-      model: this.agent.model,
-      fastModel: this.agent.fastModel,
+      model: this.engineModel(),
+      fastModel: this.engineFastModel(),
       resumeSessionId: this.sessionId,
       standingPrompt: this.standingPrompt(),
       onLog: (line) => this.logEngineLine(line),
@@ -1127,16 +1333,19 @@ class AgentRunner {
     return [...ids]
   }
 
-  /** Preload the memory index (memory/MEMORY.md) so it's ALWAYS in the wake
-   *  prompt — the lightweight BYOA analog of the cloud agent's RAG memory
-   *  preload. We inject only the small index; the agent opens detail files on
-   *  demand. Capped so a runaway index can't blow up the prompt. */
-  private async memoryDigest(): Promise<string> {
-    try {
-      const txt = (await readFile(join(this.home, 'memory', 'MEMORY.md'), 'utf8')).trim()
-      if (!txt) return ''
-      return txt.length > 4000 ? `${txt.slice(0, 4000)}\n…(truncated — cat the file for the rest)` : txt
-    } catch { return '' }  // no index yet
+  /** Preload global + current-project memory indexes. Existing
+   *  `memory/MEMORY.md` stays GLOBAL; project work lives under
+   *  `memory/projects/<id>/MEMORY.md`. A no-project wake injects global
+   *  only — same contract as cloud `loadMemory`. */
+  private async memoryDigest(projectIds: readonly string[] = []): Promise<string> {
+    const parts: Array<{ label: string; body: string }> = []
+    for (const rel of memoryIndexPathsForScope(projectIds)) {
+      try {
+        const txt = (await readFile(join(this.home, rel), 'utf8')).trim()
+        if (txt) parts.push({ label: rel, body: txt })
+      } catch { /* missing index is fine */ }
+    }
+    return composeMemoryDigest(parts)
   }
 
   /** Triage the inbox on the LOCAL small brain. The whole point of BYOA is that
@@ -1158,15 +1367,14 @@ class AgentRunner {
     await spawnPacer.gate()
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), TRIAGE_TIMEOUT_MS)
-    let res: { text: string; error?: string; usage?: EngineUsage }
+    let res: { text: string; error?: string; usage?: EngineUsage; model?: string | null }
     try {
       await mkdir(TRIAGE_DIR, { recursive: true })
       res = await this.adapter.classify({
         cwd: TRIAGE_DIR,
         prompt: `${payload.instructions}\n\n${payload.input}`,
         env: this.engineEnv(),
-        // Engine picks its own cheap default (claude→haiku, codex→gpt-5.4-mini);
-        // CUMORA_TRIAGE_MODEL overrides for either.
+        // Engine picks its own cheap default; CUMORA_TRIAGE_MODEL overrides it.
         model: process.env.CUMORA_TRIAGE_MODEL,
         signal: controller.signal,
       })
@@ -1227,8 +1435,8 @@ class AgentRunner {
       const verdict = finalizeTriage(parsed, 'support-model-local')
       // Record the gate's cache-aware cost (fire-and-forget). A BYOA triage runs
       // LOCAL + cold-session — its input is uncached, the cost this ledger exists
-      // to weigh. usage is present for claude (json output), absent for codex.
-      void this.recordTriageUsage(token, verdict.actionable, verdict.reason, res.usage)
+      // to weigh. usage is present for Claude and Cursor; absent for Codex/Grok.
+      void this.recordTriageUsage(token, verdict.actionable, verdict.reason, res.usage, res.model)
       return verdict
     }
     if (payload.failClosed) {
@@ -1249,18 +1457,22 @@ class AgentRunner {
     }
   }
 
-  /** Triage model id for pricing (the local cerebellum: claude→haiku,
-   *  codex→gpt-5.4-mini), honoring a CUMORA_TRIAGE_MODEL override. */
+  /** Triage model id for pricing, honoring CUMORA_TRIAGE_MODEL. Cursor has
+   *  no fixed cheap alias, so its reported stream model wins; the agent model
+   *  is only a fallback when the stream does not name one. */
   private triageModel(): string {
-    return process.env.CUMORA_TRIAGE_MODEL || (this.adapter.id === 'claude' ? 'haiku' : 'gpt-5.4-mini')
+    if (process.env.CUMORA_TRIAGE_MODEL) return process.env.CUMORA_TRIAGE_MODEL
+    if (this.adapter.id === 'claude') return 'haiku'
+    if (this.adapter.id === 'grok') return 'grok-4.5'
+    if (this.adapter.id === 'codex') return 'gpt-5.4-mini'
+    return this.agent.model ?? '<cursor-default>'
   }
 
-  /** Post one local-triage record to the cost ledger. Best-effort. `usage` is the
-   *  engine's raw breakdown (claude); undefined → recorded as unmeasured (codex). */
-  private async recordTriageUsage(token: string, actionable: boolean, reason: string, usage?: EngineUsage): Promise<void> {
+  /** Post one local-triage record to the cost ledger. Best-effort. */
+  private async recordTriageUsage(token: string, actionable: boolean, reason: string, usage?: EngineUsage, model?: string | null): Promise<void> {
     await runtimeBest(this.cfg.serverUrl, '/triage', token, {
       source: `byoa-${this.adapter.id}`,
-      model: this.triageModel(),
+      model: model || this.triageModel(),
       actionable,
       reason,
       usage: usage ? usageFromClaude(usage) : null,
@@ -1295,19 +1507,20 @@ class AgentRunner {
     } catch { return null }
   }
 
-  private async snapshotUnread(token: string): Promise<{ seen: Map<string, string>; digest: string; hasReal: boolean }> {
+  private async snapshotUnread(token: string): Promise<{ seen: Map<string, string>; digest: string; hasReal: boolean; projectIds: string[] }> {
     const inbox = await runtimeGet<RuntimeInboxResponse>(this.cfg.serverUrl, '/inbox', token)
     const seen = new Map<string, string>()
-    const lines: string[] = []
+    // Unread grouped BY CONVERSATION (first-seen order), each with the header
+    // (title + topic) the cloud agent's context also carries — so a BYOA agent
+    // always sees what the group is FOR (its topic), not just the messages.
+    // Grouped rather than one flat line list because the digest has a LINE
+    // BUDGET, and spending it per conversation is what stops a busy room from
+    // evicting — and `ackSeen` then burying — a quiet one. See renderInboxDigest.
+    const byConvo = new Map<string, { head: string; msgs: string[] }>()
     // `hasReal` = is ANY unread a genuine human/agent message (not a system
     // relay/status/membership notice)? The cost gate in runTurn uses this to
     // refuse to spend ANY model on a system-only (or empty) inbox.
     let hasReal = false
-    // Emit a per-conversation header (title + topic) the first time each convo
-    // appears, mirroring the cloud agent's context header — so a BYOA agent
-    // always sees what the group is FOR (its topic) while chatting, not just the
-    // messages.
-    const headered = new Set<string>()
     // rows are ordered created_at ASC, so the last row per conversation is its
     // newest unread message — exactly the cursor we want to advance to.
     for (const row of inbox?.rows ?? []) {
@@ -1318,13 +1531,17 @@ class AgentRunner {
       // engine (the cloud path special-cases these system rows the same way).
       const alarm = row.kind === 'system' && typeof row.body === 'string' ? this.parseAlarmPayload(row.body) : null
       if (row.kind !== 'system' || (alarm && (!alarm.assigneeId || alarm.assigneeId === this.agent.id))) hasReal = true
-      if (!headered.has(row.conversation_id)) {
-        headered.add(row.conversation_id)
-        const kind = row.conversation_kind ? ` [${row.conversation_kind}]` : ''
-        const title = row.conversation_title ? ` "${row.conversation_title}"` : ''
-        let head = `# ${row.conversation_id}${kind}${title}`
-        if (row.conversation_topic) head += `\n  Topic: ${row.conversation_topic}`
-        lines.push(head)
+      let convo = byConvo.get(row.conversation_id)
+      if (!convo) {
+        const head = conversationHeader({
+          conversation_id: row.conversation_id,
+          conversation_kind: row.conversation_kind,
+          conversation_title: row.conversation_title,
+          conversation_topic: row.conversation_topic,
+          project_name: row.project_name,
+        })
+        convo = { head, msgs: [] }
+        byConvo.set(row.conversation_id, convo)
       }
       const author = row.author_name ?? 'someone'
       const who = row.author_kind ? `${author} (${row.author_kind})` : author
@@ -1336,10 +1553,12 @@ class AgentRunner {
       // Keep the message id + convo id on each line (like the cloud agent's
       // context) so the engine can QUOTE the exact message: `cumora reply
       // <convo> '<body>' --quote <message_id>`.
-      lines.push(`  [${row.id}] ${row.conversation_id}  ${who}: ${body}`)
+      convo.msgs.push(`  [${row.id}] ${row.conversation_id}  ${who}: ${body}`)
     }
-    const digest = lines.length ? lines.slice(-40).join('\n') : ''
-    return { seen, digest, hasReal }
+    const projectIds = uniqueProjectIds(
+      (inbox?.rows ?? []).map((r) => (typeof r.project_id === 'string' ? r.project_id : null)),
+    )
+    return { seen, digest: renderInboxDigest(byConvo), hasReal, projectIds }
   }
 
   /** Advance this agent's read cursor over the conversations it just saw, so a
@@ -1412,11 +1631,12 @@ class AgentRunner {
       // Skype emoticons — shared with the cloud agent so a BYOA agent is as
       // expressive, not stuck on native emoji only.
       `${SKYPE_EMOTICONS_GUIDE}\n\n` +
-      `Memory: your only durable store lives under \`memory/\`, indexed by \`memory/MEMORY.md\`. ` +
-      `Consult it before acting. When the operator asks you to remember something (or you learn a ` +
-      `durable fact), WRITE it to a file under \`memory/\` and add a one-line pointer in MEMORY.md — ` +
-      `saying "got it" does NOT persist. Your in-context chat history can be wiped by compaction; ` +
-      `memory files remain. Keep MEMORY.md self-sufficient as a recovery point.\n\n` +
+      `Memory: durable store under \`memory/\` (global identity, indexed by \`memory/MEMORY.md\`) ` +
+      `and \`memory/projects/<projectId>/\` for unpinned work facts of the current project. ` +
+      `This wake injects only global + this project's index — other projects are out of scope. ` +
+      `Write project decisions/materials under \`memory/projects/<id>/\` (and a pointer in that folder's MEMORY.md); ` +
+      `write identity-level facts under \`memory/\`. Pinning a memory makes it global. ` +
+      `Saying "got it" does NOT persist. Chat history can be wiped by compaction; memory files remain.\n\n` +
       `Drive what you own forward — see a task through. Multi-step turns are fine; you do NOT have to ` +
       `fragment. If someone DMs you mid-task, answer briefly then keep going. The only thing to avoid ` +
       `is a pointless loop. If progress is waiting on a quiet teammate, follow up (short @<their-id> ` +
@@ -1450,7 +1670,7 @@ class AgentRunner {
         ? `Your unread messages (ALREADY FETCHED — no need to re-run \`cumora inbox\` / \`cumora messages\` to re-read ` +
           `these; but DO \`cumora glance\` before posting in a group, to catch anything posted while you compose):\n${inboxDigest}\n\n`
         : `Run \`cumora inbox\`, then \`cumora messages <conversationId> --tail 30\`, to catch up.\n\n`) +
-      (memoryDigest ? `Your memory index (\`memory/MEMORY.md\`):\n${memoryDigest}\n\n` : ``) +
+      (memoryDigest ? `Your memory index (global \`memory/MEMORY.md\` + current project, if any):\n${memoryDigest}\n\n` : ``) +
       (roster ? `Your team right now (trust over memory — current roster; use these ids for @mentions and \`cumora dm\`):\n${roster}\n` : ``)
     ).trimEnd()
   }
@@ -1469,7 +1689,7 @@ class AgentRunner {
       `never nag, never revive a finished thread. Coordinate before you commit (claim before shared work, trust card status); ` +
       `follow your standing instructions for mechanics.\n\n` +
       `${brief}\n\n` +
-      (memoryDigest ? `Your memory index (\`memory/MEMORY.md\`):\n${memoryDigest}\n\n` : ``) +
+      (memoryDigest ? `Your memory index (global \`memory/MEMORY.md\` + current project, if any):\n${memoryDigest}\n\n` : ``) +
       (roster ? `Your team (use these ids for @mentions):\n${roster}\n` : ``)
     ).trimEnd()
   }
@@ -1544,13 +1764,13 @@ class AgentRunner {
         ? await session.send(prompt)
         : await this.adapter.run({
           home: this.home, prompt, env: this.engineEnv(),
-          model: this.agent.model, fastModel: this.agent.fastModel,
+          model: this.engineModel(), fastModel: this.engineFastModel(),
           resumeSessionId: this.sessionId, onLog: (line) => this.logEngineLine(line),
           // Same trajectory hook as the persistent-session path so the
           // one-shot fallback (or codex `exec` path) also lands hops in the
           // universal ledger.
           onHopUsage: (r) => this.onEngineHop(r, 'agent-turn'),
-          signal: new AbortController().signal,
+          signal: this.teardown.signal,
         })
       if (session?.sessionId) this.setSessionId(session.sessionId)
       if (session && !session.alive) this.engineSession = null
@@ -1739,17 +1959,31 @@ class AgentRunner {
         const turnStart = Date.now()
         await this.ensureToken()
         const token = this.token
-        // Consume the wake's conversation: only a turn driven by a fresh wake
-        // FOR a conversation shows a "typing…" indicator there. Clearing it
-        // means a reconnect/cold-start catch-up turn (which reuses no wake)
-        // won't flash phantom "typing" in whatever conversation last woke us.
-        const convo = this.lastWakeConvo
+        // Consume the wake's conversation, so a later turn that reuses no wake
+        // can't flash phantom "typing" in whatever conversation last woke us.
+        // (The fallback below is derived from CURRENTLY unread messages, so it
+        // can't go stale the way a leftover wake value could.)
+        const wakeConvo = this.lastWakeConvo
         this.lastWakeConvo = null
         // Snapshot what's unread BEFORE triaging, so triage provably sees a
         // superset of what we may ack — a real task that lands during/after
         // triage keeps a higher id, stays out of `seen`, and so survives to
         // drive the coalesced rerun rather than being silently acked away.
-        const { seen, digest, hasReal } = await this.snapshotUnread(token)
+        const { seen, digest, hasReal, projectIds } = await this.snapshotUnread(token)
+        // Which conversation should show "<agent> is typing…"? Prefer the one the
+        // wake named, but fall back to the unread we just snapshotted, because a
+        // wake often carries no conversation at all:
+        //
+        //   - a POLL-driven turn never has one (only an SSE wake sets
+        //     lastWakeConvo), and polling is the ONLY path left whenever the
+        //     wake-stream is down;
+        //   - a wake that arrives while this agent is mid-turn is coalesced, and
+        //     scheduleWake's busy branch re-kicks without a conversation.
+        //
+        // Both cases are exactly when a human IS waiting, and with no indicator
+        // the agent reads as dead: it can work for minutes — engine spawned, turn
+        // running — while the room shows nothing at all.
+        const convo = typingConversation(wakeConvo, seen)
         // HARD COST GATE (content-blind, fail-closed): if nothing unread is a
         // real human/agent message — empty, or system-only relays/status/
         // membership notices — NEVER run triage and NEVER spawn the big engine.
@@ -1832,7 +2066,12 @@ class AgentRunner {
         let typingTimer: ReturnType<typeof setInterval> | undefined
         if (convo) {
           const ping = (): void => { void runtimeBest(this.cfg.serverUrl, '/typing', token, { conversationId: convo, done: false }) }
-          const thinkingPing = (): void => { void runtimeBest(this.cfg.serverUrl, '/thinking/mark', token, { conversationIds: [convo], ttlSec: 60 }) }
+          // Stamp every conversation in this wake, not just the trigger.
+          // Mixed-project wakes then fall back to GLOBAL on memory writes
+          // instead of guessing the trigger group's project.
+          const wakeConvos = [...seen.keys()]
+          const thinkingIds = wakeConvos.length > 0 ? wakeConvos : [convo]
+          const thinkingPing = (): void => { void runtimeBest(this.cfg.serverUrl, '/thinking/mark', token, { conversationIds: thinkingIds, ttlSec: 60 }) }
           ping()
           thinkingPing()
           typingTimer = setInterval(() => {
@@ -1855,7 +2094,6 @@ class AgentRunner {
         // maybeAgendaTurn for the same hook).
         this.currentRunId = run?.runId ?? null
         const stopRunBeat = this.beatRun(token, run?.runId)
-        const controller = new AbortController()
         let exitCode = 0
         let engineError: string | null = null
         let turnUsage: EngineUsage | undefined
@@ -1876,7 +2114,7 @@ class AgentRunner {
         }
         try {
           const [memoryDigest, triageNote, roster] = await Promise.all([
-            this.memoryDigest(),
+            this.memoryDigest(projectIds),
             Promise.resolve(this.formatTriageNote(triage)),
             // Live team roster (names + roles + ids), fetched fresh from the
             // server so a locally-run agent knows WHO its teammates are and what
@@ -1909,17 +2147,17 @@ class AgentRunner {
             // (with --resume this.sessionId to carry context across the restart).
             if (!session.alive) this.engineSession = null
           } else {
-            // One-shot path: codex, or a user CLAUDE_ARGS override — spawn per turn.
+            // One-shot path: Cursor, Codex fallback, or a custom args override.
             result = await this.adapter.run({
               home: this.home,
               prompt,
               env: this.engineEnv(),
-              model: this.agent.model,
-              fastModel: this.agent.fastModel,
+              model: this.engineModel(),
+              fastModel: this.engineFastModel(),
               resumeSessionId,
               onLog: (line) => this.logEngineLine(line),
               onHopUsage: (r) => this.onEngineHop(r, 'agent-turn'),
-              signal: controller.signal,
+              signal: this.teardown.signal,
             })
             if (result.sessionId) this.setSessionId(result.sessionId)
           }
@@ -2029,6 +2267,7 @@ class AgentRunner {
   private async streamLoop(): Promise<void> {
     let backoff = 1000
     while (!this.stopped) {
+      let connectedAt: number | null = null
       try {
         const token = await this.ensureToken()
         const res = await fetch(`${this.cfg.serverUrl}/runtime/wake-stream`, {
@@ -2036,7 +2275,7 @@ class AgentRunner {
         })
         if (!res.ok || !res.body) throw new Error(`wake-stream HTTP ${res.status}`)
         console.log(`[computer] ${this.agent.id} wake-stream connected (engine: ${this.adapter.id})`)
-        backoff = 1000
+        connectedAt = Date.now()
         this.kickTurn('reconnect-catchup') // cold-start / reconnect catch-up
         for await (const evt of parseSseStream(res.body as unknown as AsyncIterable<unknown>)) {
           if (this.stopped) break
@@ -2065,13 +2304,25 @@ class AgentRunner {
           }
           // 'ready' is a no-op keepalive.
         }
+        // The stream ended WITHOUT throwing — a clean server-side close. This
+        // used to fall straight back to the loop head and re-fetch with ZERO
+        // delay, re-firing reconnect-catchup every pass: measured at ~15k
+        // requests/second against the API from the operator's own machine.
+        if (!this.stopped) {
+          console.warn(`[computer] ${this.agent.id} wake-stream closed by server · retry in ${backoff}ms`)
+        }
       } catch (err) {
         if (this.stopped) break
         const _cause = (err as { cause?: { code?: string; message?: string } } | null)?.cause
         console.warn(`[computer] ${this.agent.id} stream error: ${err instanceof Error ? err.message : err}${_cause ? ` cause=${_cause.code ?? _cause.message ?? JSON.stringify(_cause)}` : ''} · retry in ${backoff}ms`)
-        await new Promise((r) => setTimeout(r, backoff))
-        backoff = Math.min(backoff * 2, 30_000)
       }
+      if (this.stopped) break
+      // BOTH exits back off. Reset the ladder only after a connection that
+      // actually stayed up — a 200 that closes immediately must not reset it, or
+      // the delay can never grow away from a pathological endpoint.
+      if (wakeStreamWasStable(connectedAt === null ? null : Date.now() - connectedAt)) backoff = 1000
+      await new Promise((r) => setTimeout(r, backoff))
+      backoff = Math.min(backoff * 2, 30_000)
     }
   }
 }
@@ -2187,6 +2438,9 @@ async function doRun(serverOverride?: string): Promise<void> {
       await fetch(`${cfg.serverUrl}/api/computers/heartbeat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.deviceToken}` },
+        // A heartbeat that never answers must not outlive its own interval, or
+        // the beats queue up behind a dead socket and the computer reads offline.
+        signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
         // `supervised` tells the server HOW this daemon runs (service vs. a
         // foreground command), so the app's upgrade banner can show the right
         // update instructions for this machine.
@@ -2427,12 +2681,32 @@ async function restartService(): Promise<void> {
  *  removed from the supervisor so KeepAlive/Restart won't relaunch it; the
  *  plist/unit stays on disk, so `--restart` brings it back. (To remove it
  *  entirely, use `--uninstall-service`.) */
+
+/** One-shot CLI invocations: these do a thing and exit, so they are never the
+ *  long-running daemon we mean to stop. Anchored to the `--` so the words can't
+ *  match incidentally elsewhere in the command line. */
+const ONE_SHOT_FLAG_RE =
+  /--(stop|status|restart|logs|version|install-service|uninstall-service|pair)\b/
+
+/** Is this `ps`-reported command line a long-running BYOA daemon that `--stop`
+ *  should kill? True only for `agent computer` with no one-shot flag.
+ *
+ *  The npx *wrapper* used to be excluded here too, but that exclusion was both
+ *  wrong and unnecessary: `npx -y cumora@latest agent computer --server …` is
+ *  exactly how the LaunchAgent (and the docs) start a real daemon, and self/parent
+ *  protection is already handled by dropping process.pid / process.ppid from the
+ *  candidate set. Killing the wrapper's child is what actually stops the daemon,
+ *  and the wrapper exits with it. */
+export function isStoppableDaemonCommand(cmd: string): boolean {
+  return /agent computer/.test(cmd) && !ONE_SHOT_FLAG_RE.test(cmd)
+}
+
 /** Kill any RUNNING daemon process — the supervised one (after the service is
  *  uninstalled), a foreground one, or a stray/orphaned one. Sources: the pid the
  *  daemon records in running.json, plus a `pgrep` sweep for "agent computer". We
  *  verify each candidate's command line really is a long-running daemon (and is
- *  NOT this --stop command, its npx wrapper, or another one-shot CLI) before
- *  killing — SIGTERM, then SIGKILL anything that ignores it. Best-effort. */
+ *  NOT this --stop command or another one-shot CLI) before killing — SIGTERM,
+ *  then SIGKILL anything that ignores it. Best-effort. */
 async function killRunningDaemons(): Promise<void> {
   const candidates = new Set<number>()
   try {
@@ -2452,9 +2726,10 @@ async function killRunningDaemons(): Promise<void> {
     try {
       const { stdout } = await execFileP('ps', ['-p', String(pid), '-o', 'command='])
       const cmd = stdout.trim()
-      // A genuine long-running daemon: "agent computer" with NO one-shot flag,
-      // and not the npx wrapper — so we never kill ourselves or a sibling CLI.
-      if (/agent computer/.test(cmd) && !/--(stop|status|restart|logs|version|install-service|uninstall-service|pair)\b|\bnpx\b/.test(cmd)) {
+      // A genuine long-running daemon: "agent computer" with NO one-shot flag —
+      // so we never kill a sibling one-shot CLI. (Ourselves and our parent are
+      // already out of `candidates`.)
+      if (isStoppableDaemonCommand(cmd)) {
         victims.push(pid)
       }
     } catch { /* gone */ }

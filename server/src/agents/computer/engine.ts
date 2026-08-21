@@ -2,7 +2,7 @@
  * EngineAdapter — the pluggable "brain" for a BYOA agent.
  *
  * A BYOA agent's reasoning loop is delegated to a local CLI engine running
- * on the user's machine: Claude Code or Codex. The daemon (daemon.ts) hands
+ * on the user's machine: Claude Code, Codex, Grok Build, or Cursor Agent. The daemon (daemon.ts) hands
  * each wake to an adapter, which spawns the engine headlessly in the agent's
  * isolated home directory. The engine reads its persona + memory + skills
  * from that home natively (CLAUDE.md / AGENTS.md, .claude/skills, …) and acts
@@ -14,15 +14,17 @@
  * NOTE on engine flags: the exact non-interactive / permission flags differ
  * across engine versions. We pick sensible defaults for an isolated,
  * user-owned runner and let the user override via env
- * (CUMORA_CLAUDE_ARGS / CUMORA_CODEX_ARGS, space-split). Correctness of the
+ * (CUMORA_CLAUDE_ARGS / CUMORA_CODEX_ARGS / CUMORA_GROK_ARGS /
+ *  CUMORA_CURSOR_ARGS, space-split). Correctness of the
  * loop does not depend on the structured output — the agent acts via the
  * `cumora` tool regardless of how we parse stdout.
  */
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
 import { mkdir, writeFile, access, mkdtemp } from 'node:fs/promises'
 import { existsSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join, delimiter as PATH_DELIMITER } from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 import { stripLoneSurrogates } from '../text-safety.js'
 
 const IS_WIN = process.platform === 'win32'
@@ -43,7 +45,7 @@ const CODEX_LOG_RAW = process.env.CUMORA_CODEX_VERBOSE === '1'
 
 /** How to spawn a CLI bin cross-platform.
  *  - POSIX: spawn the bare bin with shell:false — unchanged, zero-risk.
- *  - Windows: `claude`/`codex` are usually `.cmd` shims that Node CANNOT run with
+ *  - Windows: engine CLIs are usually `.cmd` shims that Node CANNOT run with
  *    shell:false (CreateProcess can't execute a batch file) → "process exited with
  *    code 1". Resolve the real file on PATH and run a `.cmd`/`.bat` via
  *    shell:true. When the shell is needed,
@@ -53,7 +55,7 @@ const CODEX_LOG_RAW = process.env.CUMORA_CODEX_VERBOSE === '1'
  *  Windows + nvm-windows gotcha: global npm CLIs are shipped as an extensionless
  *  POSIX shell-shim (`#!/bin/sh` wrapper) ALONGSIDE the real `.cmd`. The old loop
  *  iterated `['', ...PATHEXT]`, hit the shim first, classified it as non-batch,
- *  and returned `shell:false` → every Claude/Codex turn died with ENOENT.
+ *  and returned `shell:false` → every engine turn died with ENOENT.
  *  Fix: prefer a real `.exe`/`.cmd`/`.bat` hit; only fall back to the shim with
  *  `shell:true` when nothing else is on PATH. */
 // Exported for tests; the nvm-windows extensionless-shim regression (issue #5)
@@ -84,10 +86,10 @@ export function resolveSpawn(bin: string): { command: string; shell: boolean; wa
   return { command: bin, shell: true, wantsStdinPrompt: true }
 }
 
-export type EngineId = 'claude' | 'codex'
+export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor'
 
 /** The pairable engine ids, in the daemon's default detection order. */
-export const ENGINE_IDS: EngineId[] = ['claude', 'codex']
+export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor']
 
 export interface EnginePersona {
   id: string
@@ -173,6 +175,8 @@ export interface EngineClassifyResult {
   /** Token usage for this triage call (Claude json output). Undefined when the
    *  engine emits none (e.g. codex / text-only output). */
   usage?: EngineUsage
+  /** The model id the engine actually ran, when its output reports one. */
+  model?: string | null
 }
 
 /** A `doctor` liveness probe for ONE brain tier of an engine: spawn it on the
@@ -420,6 +424,11 @@ function spawnEngine(
     }
     const onAbort = (): void => { child.kill('SIGTERM') }
     signal.addEventListener('abort', onAbort, { once: true })
+    // A listener registered AFTER the abort event never fires. A turn that was
+    // still queued behind the concurrency gate when its runner was stopped would
+    // otherwise spawn a child nothing owns — with a live runtime token and the
+    // `cumora` shim on PATH.
+    if (signal.aborted) onAbort()
 
     const stderrTail: string[] = []
     const stdoutTail: string[] = []
@@ -431,8 +440,26 @@ function spawnEngine(
     // emitted the hop, so latency_ms reflects actual time-on-the-wire.
     let hopStartedAt: number | null = null
     let hopIndex = 0
-    const pump = (stream: 'stdout' | 'stderr', buf: Buffer): void => {
-      for (const line of buf.toString('utf8').split('\n')) {
+    // A pipe read chops stdout at an arbitrary byte offset (~8KB on macOS, up to
+    // 64KB on Linux), so a long stream-json event — a Write/Edit tool_use carrying
+    // file content, or a big final `result` — arrives split across two 'data'
+    // events. Splitting each chunk on its own handed JSON.parse two halves, both
+    // of which throw and are swallowed by the catch below: the hop never reached
+    // the ledger and the turn's authoritative usage/model/session id were lost,
+    // silently. Carry the trailing partial line into the next chunk, exactly like
+    // ClaudeSession.onStdout already does for the persistent path. StringDecoder
+    // does the same job one level down, holding back a multi-byte character split
+    // across the boundary instead of emitting U+FFFD into the JSON.
+    const decoder: Record<'stdout' | 'stderr', StringDecoder> =
+      { stdout: new StringDecoder('utf8'), stderr: new StringDecoder('utf8') }
+    const carry: Record<'stdout' | 'stderr', string> = { stdout: '', stderr: '' }
+    // `buf === null` means end-of-stream: flush whatever is held back, since the
+    // engine's last line often has no trailing newline.
+    const pump = (stream: 'stdout' | 'stderr', buf: Buffer | null): void => {
+      const text = buf === null ? decoder[stream].end() : decoder[stream].write(buf)
+      const lines = (carry[stream] + text).split('\n')
+      carry[stream] = buf === null ? '' : (lines.pop() ?? '')
+      for (const line of lines) {
         const cleaned = cleanLine(line)
         if (!cleaned) continue
         pushTail(stream === 'stderr' ? stderrTail : stdoutTail, cleaned)
@@ -471,7 +498,10 @@ function spawnEngine(
     child.stdout?.on('data', (buf: Buffer) => pump('stdout', buf))
     child.stderr?.on('data', (buf: Buffer) => pump('stderr', buf))
     child.on('error', (err) => { signal.removeEventListener('abort', onAbort); reject(err) })
-    child.on('close', (code, signalName) => {
+    let settled = false
+    const settle = (code: number | null, signalName: NodeJS.Signals | null): void => {
+      if (settled) return
+      settled = true
       signal.removeEventListener('abort', onAbort)
       const exitCode = code ?? (signalName ? 128 : 1)
       resolve({
@@ -481,7 +511,22 @@ function spawnEngine(
         usage,
         model,
       })
+    }
+    // Normal end: wait for 'close', so the last of stdout is parsed. Flush the
+    // held-back tail BEFORE resolving: the terminating `result` event is
+    // usually the last line, and it carries the turn's usage.
+    child.on('close', (code, signalName) => {
+      if (!settled) { pump('stdout', null); pump('stderr', null) }
+      settle(code, signalName)
     })
+    // Torn-down end: 'close' waits for every inherited stdio pipe to reach EOF,
+    // and the engine's OWN children (Bash tool commands) hold those pipes — a
+    // grandchild that outlives the kill keeps them open, so 'close' may never
+    // fire at all. Once we've aborted, the turn is being discarded and its
+    // remaining output is moot, so settle on 'exit' instead. Without this the
+    // daemon's shutdown drain waits forever on a turn it already killed, and
+    // `busy` plus the big-brain slot are never released.
+    child.on('exit', (code, signalName) => { if (signal.aborted) settle(code, signalName) })
   })
 }
 
@@ -522,25 +567,37 @@ function spawnCapture(
   })
 }
 
+/** The small/fast model the triage path actually runs on. `probe` must use the
+ *  SAME one or `doctor` reports a red small-brain for an operator whose custom
+ *  provider has no `haiku` — even though their triage is configured correctly. */
+function triageModel(fallback: string): string {
+  return process.env.CUMORA_TRIAGE_MODEL?.trim() || fallback
+}
+
 function extraArgs(envVar: string): string[] {
   const raw = process.env[envVar]
   return raw ? raw.split(/\s+/).filter(Boolean) : []
 }
 
-const PERSONA_HEADER = (p: EnginePersona): string =>
-  `# ${p.name}${p.role ? ` — ${p.role}` : ''}\n\n` +
+const PERSONA_HEADER = (
+  p: EnginePersona,
+  opts: { personaFile?: string; skillsDir?: string } = {},
+): string => {
+  const personaFile = opts.personaFile ?? 'CLAUDE.md'
+  const skillsDir = opts.skillsDir ?? '.claude/skills/'
+  return `# ${p.name}${p.role ? ` — ${p.role}` : ''}\n\n` +
   `You are **${p.name}**, a member of a team that collaborates in Cumora (a team chat).\n` +
   (p.systemPrompt?.trim() ? `\n## Your style\n${p.systemPrompt.trim()}\n\n` : '\n') +
   `This directory is your private home and your working directory — it persists\n` +
   `across wakes and is yours alone. Its layout:\n` +
-  `- \`CLAUDE.md\` (this file) — always loaded each wake; keep it short.\n` +
+  `- \`${personaFile}\` (this file) — always loaded each wake; keep it short.\n` +
   `- \`memory/\` — your durable memory. There is NO hidden memory store: to remember\n` +
   `  something across wakes you MUST write it to a file here (e.g. \`memory/<topic>.md\`)\n` +
   `  and add a one-line pointer in \`memory/MEMORY.md\`. Saying "I'll remember" without\n` +
   `  writing a file means you will NOT remember. At the start of each wake, read\n` +
   `  \`memory/MEMORY.md\` (and the files it points to) to recall what you know.\n` +
   `- \`notes/\` — scratch notes and drafts.\n` +
-  `- \`.claude/skills/\` — your skills.\n` +
+  `- \`${skillsDir}\` — your skills.\n` +
   `- \`workspace/\` — **put all project files and scratch here**: git clones, builds,\n` +
   `  downloads, temp files. Always \`cd workspace\` (or use \`workspace/…\` paths) for\n` +
   `  that work — do NOT clutter your home root with project files.\n\n` +
@@ -567,6 +624,7 @@ const PERSONA_HEADER = (p: EnginePersona): string =>
   `  about a person or role you don't already know.\n` +
   `- \`cumora whoami\` — your identity\n\n` +
   `Be a real teammate with your own voice — not a generic assistant.\n`
+}
 
 /** A persistent Claude Code process for ONE agent (see EngineSession). Spawned in
  *  stream-json I/O mode (`-p --input-format stream-json --output-format stream-json`):
@@ -834,7 +892,7 @@ class ClaudeAdapter implements EngineAdapter {
     // → haiku (the cerebellum); 'big' → omit --model so Claude uses its DEFAULT
     // (the main reasoning brain). One token in, "OK" out — proves the binary runs
     // and that tier is authed/has quota, with NO tools/MCP/persona.
-    const model = args.tier === 'small' ? ['--model', 'haiku'] : []
+    const model = args.tier === 'small' ? ['--model', triageModel('haiku')] : []
     const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
     const base = ['-p', ...model, '--output-format', 'text', '--dangerously-skip-permissions', '--strict-mcp-config']
     const argv = wantsStdinPrompt ? base : ['-p', DOCTOR_PROMPT, ...base.slice(1)]
@@ -1005,6 +1063,9 @@ class CodexSession implements EngineSession {
   // thread params WITHOUT threadId — reused to start a FRESH thread if a resume fails.
   private readonly baseThreadParams: Record<string, unknown>
   private ready = false
+  // Why the handshake died, when it did — so a send() landing after the teardown
+  // reports the real cause instead of a generic "process gone".
+  private handshakeError: string | null = null
   private pending: { resolve: (r: EngineRunResult) => void } | null = null
   private queuedPrompt: string | null = null
   private activeTurnId: string | null = null
@@ -1045,7 +1106,7 @@ class CodexSession implements EngineSession {
 
   send(prompt: string): Promise<EngineRunResult> {
     if (this.pending) return Promise.resolve({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.threadId })
-    if (!this.alive) return Promise.resolve({ exitCode: this.exitCode || 1, error: 'engine session is not alive (process gone)', sessionId: this.threadId })
+    if (!this.alive) return Promise.resolve({ exitCode: this.exitCode || 1, error: this.handshakeError ?? 'engine session is not alive (process gone)', sessionId: this.threadId })
     return new Promise<EngineRunResult>((resolve) => {
       this.pending = { resolve }
       this.turnStart = { ...this.cum }
@@ -1227,6 +1288,18 @@ class CodexSession implements EngineSession {
   private failPending(error: string): void {
     if (this.pending) this.settle(error)
     else this.onLog(`[codex] ${error}`)
+    // A failure BEFORE the thread ever opened kills the SESSION, not just this
+    // turn. The handshake is one-shot — threadReq is consumed at the initialize
+    // ack, and only a failed thread/resume re-issues a thread/start — so `ready`
+    // can never flip afterwards, and every later send() would park its prompt in
+    // queuedPrompt with nothing left able to drain it (the daemon awaits that
+    // promise forever, so the agent goes silently and permanently dead and its
+    // big-brain slot never comes back). The app-server SURVIVES rejecting the
+    // handshake (a malformed ~/.codex/config.toml, a model this account can't
+    // use, protocol drift), so `alive` would keep advertising a usable session
+    // and the daemon would reuse the zombie on every wake. Tear it down instead:
+    // a !alive session is dropped and the next wake spawns a clean one.
+    if (!this.ready) { this.handshakeError = error; this.stop() }
   }
   private die(code: number, why: string): void {
     const alreadyDown = this.exited
@@ -1268,7 +1341,7 @@ class CodexAdapter implements EngineAdapter {
     // 'small' → gpt-5.4-mini (the cerebellum); 'big' → omit --model so Codex uses
     // its default model. `exec` non-interactive, no bypass/sandbox flags needed
     // for a tool-free one-token reply.
-    const model = args.tier === 'small' ? ['--model', 'gpt-5.4-mini'] : []
+    const model = args.tier === 'small' ? ['--model', triageModel('gpt-5.4-mini')] : []
     const { command, shell } = resolveSpawn(this.bin)
     const argv = ['exec', ...model, '--skip-git-repo-check', DOCTOR_PROMPT]
     return spawnCapture(command, argv, {
@@ -1409,9 +1482,791 @@ class CodexAdapter implements EngineAdapter {
   }
 }
 
+/** Official Grok Build install lives at ~/.grok/bin even when that dir is
+ *  not on the daemon's PATH (launchd / login-shell mismatch). PATH wins. */
+function resolveGrokBin(env: NodeJS.ProcessEnv = process.env): string | null {
+  for (const dir of (env.PATH ?? '').split(PATH_DELIMITER)) {
+    if (!dir) continue
+    const candidate = join(dir, IS_WIN ? 'grok.exe' : 'grok')
+    if (existsSync(candidate)) return candidate
+    if (IS_WIN && existsSync(join(dir, 'grok'))) return join(dir, 'grok')
+  }
+  const homeBin = join(homedir(), '.grok', 'bin', IS_WIN ? 'grok.exe' : 'grok')
+  return existsSync(homeBin) ? homeBin : null
+}
+
+type AcpMsg = {
+  jsonrpc?: string
+  id?: number
+  method?: string
+  result?: { sessionId?: unknown }
+  error?: { message?: unknown }
+  params?: Record<string, unknown>
+}
+
+/** Persistent Grok Build session over ACP stdio (`grok agent --always-approve stdio`).
+ *  Handshake: initialize → session/new|load → session/prompt per wake.
+ *  Mid-turn steer is not in the ACP surface Grok exposes — steer() is a no-op
+ *  and the daemon's next-wake coalescing carries the ping instead. */
+class GrokSession implements EngineSession {
+  private readonly child: ChildProcess
+  private readonly onLog: (line: string) => void
+  private readonly onHopUsage?: (r: EngineHopReport) => void
+  private outBuf = ''
+  private sid: string | null
+  private exited = false
+  private exitCode = 0
+  private reqId = 0
+  private initializeId: number | null = null
+  private sessionReqId: number | null = null
+  private sessionWasLoad = false
+  private readonly sessionNewParams: Record<string, unknown>
+  private ready = false
+  private pending: { resolve: (r: EngineRunResult) => void; id: number; startedAt: number } | null = null
+  private queuedPrompt: string | null = null
+  private steerWarned = false
+  private readonly model: string | null
+  /** The model the agent is ACTUALLY running on, as reported by the ACP stream
+   *  (`_x.ai/models/update` → `currentModelId`). `this.model` is only the pin
+   *  Cumora asked for, and is null whenever the operator left the model
+   *  unpinned — which is the default. Mirrors ClaudeSession sniffing
+   *  `message.model` off its own stream. */
+  private curModel: string | null = null
+  readonly carriesStandingPrompt: boolean
+
+  constructor(bin: string, spawnArgs: string[], home: string, env: NodeJS.ProcessEnv, opts: EngineSessionArgs) {
+    this.onLog = opts.onLog
+    this.onHopUsage = opts.onHopUsage
+    this.sid = opts.resumeSessionId ?? null
+    this.model = opts.model ?? null
+    this.carriesStandingPrompt = !!opts.standingPrompt
+    const meta: Record<string, unknown> = { yoloMode: true }
+    if (opts.standingPrompt) meta.rules = opts.standingPrompt
+    this.sessionNewParams = { cwd: home, mcpServers: [], _meta: meta }
+    this.sessionWasLoad = !!opts.resumeSessionId
+    const grokEnv: NodeJS.ProcessEnv = { ...env, GROK_DISABLE_AUTOUPDATER: env.GROK_DISABLE_AUTOUPDATER ?? '1' }
+    this.child = spawn(bin, spawnArgs, { cwd: home, env: grokEnv, stdio: ['pipe', 'pipe', 'pipe'], shell: false })
+    this.child.stdout?.on('data', (b: Buffer) => this.onStdout(b))
+    this.child.stderr?.on('data', (b: Buffer) => {
+      for (const raw of b.toString('utf8').split('\n')) {
+        const l = cleanLine(raw)
+        if (l) this.onLog(l)
+      }
+    })
+    this.child.on('error', (err) => this.die(1, err.message))
+    this.child.on('close', (code, sig) => this.die(code ?? (sig ? 128 : 1), sig ? `terminated by ${sig}` : `exited with code ${code}`))
+    queueMicrotask(() => {
+      this.initializeId = this.req('initialize', {
+        protocolVersion: 1,
+        clientInfo: { name: 'cumora-daemon', version: '1.0.0' },
+        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
+      })
+    })
+  }
+
+  get alive(): boolean { return !this.exited && this.child.stdin?.writable === true }
+  get sessionId(): string | null { return this.sid }
+
+  send(prompt: string): Promise<EngineRunResult> {
+    if (this.pending) return Promise.resolve({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.sid })
+    if (!this.alive) return Promise.resolve({ exitCode: this.exitCode || 1, error: 'engine session is not alive (process gone)', sessionId: this.sid })
+    return new Promise<EngineRunResult>((resolve) => {
+      this.pending = { resolve, id: 0, startedAt: Date.now() }
+      if (this.ready && this.sid) this.startPrompt(prompt)
+      else this.queuedPrompt = prompt
+    })
+  }
+
+  steer(_text: string): void {
+    // ACP session/prompt is one-in-flight. A mid-turn inject would cancel the
+    // running turn. The daemon coalesces the ping onto the next wake instead.
+    if (!this.steerWarned) {
+      this.steerWarned = true
+      this.onLog('[grok] same-turn steer is not supported on ACP stdio — the ping rides the next wake')
+    }
+  }
+
+  stop(): void {
+    this.exited = true
+    try { this.child.stdin?.end() } catch { /* ignore */ }
+    try { this.child.kill('SIGTERM') } catch { /* ignore */ }
+  }
+
+  private nextId(): number { this.reqId += 1; return this.reqId }
+  private req(method: string, params: Record<string, unknown>): number {
+    const id = this.nextId()
+    try { this.child.stdin?.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n') } catch { /* die() */ }
+    return id
+  }
+
+  private startPrompt(prompt: string): void {
+    if (!this.sid || !this.pending) return
+    const id = this.req('session/prompt', {
+      sessionId: this.sid,
+      prompt: [{ type: 'text', text: stripLoneSurrogates(prompt) }],
+    })
+    this.pending.id = id
+  }
+
+  private onStdout(buf: Buffer): void {
+    this.outBuf += buf.toString('utf8')
+    let nl: number
+    while ((nl = this.outBuf.indexOf('\n')) >= 0) {
+      const line = this.outBuf.slice(0, nl)
+      this.outBuf = this.outBuf.slice(nl + 1)
+      const t = line.trim()
+      if (!t.startsWith('{')) { const c = cleanLine(line); if (c) this.onLog(c); continue }
+      let msg: AcpMsg | null = null
+      try { msg = JSON.parse(t) as AcpMsg } catch { msg = null }
+      if (!msg) { const c = cleanLine(line); if (c) this.onLog(c); continue }
+      this.handle(msg)
+    }
+  }
+
+  private handle(msg: AcpMsg): void {
+    if (msg.id !== undefined && msg.id === this.initializeId) {
+      this.initializeId = null
+      if (msg.error) { this.failPending(String(msg.error.message || 'grok initialize failed')); return }
+      if (this.sessionWasLoad && this.sid) {
+        this.sessionReqId = this.req('session/load', { sessionId: this.sid, ...this.sessionNewParams })
+      } else {
+        this.sessionReqId = this.req('session/new', this.sessionNewParams)
+      }
+      return
+    }
+    if (msg.error && msg.id !== undefined && msg.id === this.sessionReqId) {
+      if (this.sessionWasLoad) {
+        this.onLog(`[grok] session/load failed (${String(msg.error.message || '')}) — starting a fresh session`)
+        this.sessionWasLoad = false
+        this.sid = null
+        this.sessionReqId = this.req('session/new', this.sessionNewParams)
+        return
+      }
+      this.failPending(String(msg.error.message || 'grok session start failed'))
+      return
+    }
+    if (msg.id !== undefined && msg.id === this.sessionReqId && msg.result) {
+      const sid = typeof msg.result.sessionId === 'string' ? msg.result.sessionId : this.sid
+      this.sessionReqId = null
+      if (typeof sid === 'string' && sid) this.sid = sid
+      this.ready = true
+      if (this.queuedPrompt && this.pending) {
+        const p = this.queuedPrompt
+        this.queuedPrompt = null
+        this.startPrompt(p)
+      }
+      return
+    }
+    // Grok announces the live model here, and again whenever it changes mid
+    // session. Without it the ledger prices every ACP turn on a pin that is
+    // usually absent (see curModel).
+    if (msg.method === '_x.ai/models/update') {
+      const id = (msg.params as { currentModelId?: unknown } | undefined)?.currentModelId
+      if (typeof id === 'string' && id) this.curModel = id
+      return
+    }
+    if (msg.method === 'session/update') {
+      const update = (msg.params?.update ?? msg.params?.sessionUpdate) as Record<string, unknown> | undefined
+      const kind = typeof update?.sessionUpdate === 'string' ? update.sessionUpdate
+        : typeof update?.sessionUpdate === 'undefined' && typeof (msg.params as { sessionUpdate?: unknown } | undefined)?.sessionUpdate === 'string'
+          ? String((msg.params as { sessionUpdate?: unknown }).sessionUpdate)
+          : null
+      const u = (update ?? msg.params ?? {}) as Record<string, unknown>
+      const k = kind ?? (typeof u.sessionUpdate === 'string' ? u.sessionUpdate : null)
+      if (k === 'tool_call' && typeof u.title === 'string') this.onLog(`[grok] tool ${u.title}`)
+      else if (k === 'agent_message_chunk') {
+        const content = u.content as { text?: unknown } | undefined
+        if (typeof content?.text === 'string' && content.text.trim()) {
+          this.onLog(`[grok] » ${content.text.replace(/\s+/g, ' ').slice(0, 200)}`)
+        }
+      }
+      return
+    }
+    if (this.pending && msg.id !== undefined && msg.id === this.pending.id) {
+      if (msg.error) { this.failPending(String(msg.error.message || 'grok prompt failed')); return }
+      const usage = extractAcpUsage(msg.result)
+      if (this.onHopUsage) {
+        try {
+          this.onHopUsage({
+            model: this.curModel || this.model || 'grok',
+            usage: usage ?? {},
+            latencyMs: Date.now() - this.pending.startedAt,
+            hopIndex: 1,
+          })
+        } catch { /* never break the stream */ }
+      }
+      const p = this.pending
+      this.pending = null
+      p.resolve({ exitCode: 0, sessionId: this.sid, usage, model: this.curModel || this.model })
+      return
+    }
+    if (msg.error && msg.id !== undefined) {
+      this.failPending(String(msg.error.message || 'grok acp request failed'))
+    }
+  }
+
+  private failPending(error: string): void {
+    if (this.pending) {
+      const p = this.pending
+      this.pending = null
+      p.resolve({ exitCode: 1, error, sessionId: this.sid })
+    } else {
+      this.onLog(`[grok] ${error}`)
+    }
+  }
+
+  private die(code: number, why: string): void {
+    const alreadyDown = this.exited
+    this.exited = true
+    this.exitCode = code
+    if (!alreadyDown) {
+      this.onLog(`[session] engine process died ${this.pending ? 'MID-TURN' : 'while idle'}: ${why} (exit ${code})`)
+    }
+    if (this.pending) {
+      const p = this.pending
+      this.pending = null
+      p.resolve({ exitCode: code, error: why, sessionId: this.sid })
+    }
+  }
+}
+
+function extractAcpUsage(result: unknown): EngineUsage | undefined {
+  if (!result || typeof result !== 'object') return undefined
+  const r = result as Record<string, unknown>
+  const raw = (r.usage ?? (r._meta as Record<string, unknown> | undefined)?.usage) as Record<string, unknown> | undefined
+  if (!raw || typeof raw !== 'object') return undefined
+  const num = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined)
+  const usage: EngineUsage = {
+    input_tokens: num(raw.input_tokens) ?? num(raw.inputTokens),
+    output_tokens: num(raw.output_tokens) ?? num(raw.outputTokens),
+    cache_read_input_tokens: num(raw.cache_read_input_tokens) ?? num(raw.cacheReadInputTokens),
+    cache_creation_input_tokens: num(raw.cache_creation_input_tokens) ?? num(raw.cacheCreationInputTokens),
+  }
+  if (usage.input_tokens == null && usage.output_tokens == null) return undefined
+  return usage
+}
+
+class GrokAdapter implements EngineAdapter {
+  readonly id = 'grok' as const
+  readonly bin = 'grok'
+
+  private command(env?: NodeJS.ProcessEnv): string {
+    return resolveGrokBin(env) ?? this.bin
+  }
+
+  async classify(args: EngineClassifyArgs): Promise<EngineClassifyResult> {
+    const flags = extraArgs('CUMORA_TRIAGE_ARGS')
+    const model = ['--model', args.model || 'grok-4.5']
+    const command = this.command(args.env)
+    const { shell, wantsStdinPrompt } = resolveSpawn(this.bin)
+    const usingJson = flags.length === 0
+    const base = flags.length
+      ? [...flags, '-p']
+      : ['-p', ...model, '--output-format', 'json', '--always-approve', '--no-auto-update']
+    const argv = wantsStdinPrompt ? base : (flags.length ? [...base, args.prompt] : ['-p', args.prompt, ...base.slice(1)])
+    const res = await spawnCapture(command, argv, {
+      cwd: args.cwd,
+      env: { ...args.env, GROK_DISABLE_AUTOUPDATER: args.env.GROK_DISABLE_AUTOUPDATER ?? '1' },
+      signal: args.signal,
+      onLog: args.onLog,
+      shell,
+      stdinText: wantsStdinPrompt ? args.prompt : undefined,
+    })
+    if (res.error || !usingJson) return res
+    try {
+      const obj = JSON.parse(res.text) as { text?: unknown; usage?: EngineUsage }
+      return {
+        text: typeof obj.text === 'string' ? obj.text : res.text,
+        usage: obj.usage && typeof obj.usage === 'object' ? obj.usage : undefined,
+      }
+    } catch {
+      return res
+    }
+  }
+
+  probe(args: EngineProbeArgs): Promise<EngineClassifyResult> {
+    const model = args.tier === 'small' ? ['--model', 'grok-4.5'] : []
+    const command = this.command(args.env)
+    const { shell, wantsStdinPrompt } = resolveSpawn(this.bin)
+    const base = ['-p', ...model, '--output-format', 'json', '--always-approve', '--no-auto-update']
+    const argv = wantsStdinPrompt ? base : ['-p', DOCTOR_PROMPT, ...base.slice(1)]
+    return spawnCapture(command, argv, {
+      cwd: args.cwd,
+      env: { ...args.env, GROK_DISABLE_AUTOUPDATER: args.env.GROK_DISABLE_AUTOUPDATER ?? '1' },
+      signal: args.signal,
+      shell,
+      stdinText: wantsStdinPrompt ? DOCTOR_PROMPT : undefined,
+    })
+  }
+
+  async probeWake(args: EngineWakeProbeArgs): Promise<EngineWakeProbeResult> {
+    // Same gates as startSession: custom args / opt-out / Windows collapse to
+    // one-shot `grok -p`, which probe() already covers.
+    if (extraArgs('CUMORA_GROK_ARGS').length || process.env.CUMORA_GROK_NO_ACP === '1' || IS_WIN) {
+      return { ok: true, detail: '', skipped: true }
+    }
+    const command = this.command(args.env)
+    return new Promise<EngineWakeProbeResult>((resolve) => {
+      let settled = false
+      const finish = (r: EngineWakeProbeResult) => {
+        if (settled) return
+        settled = true
+        try { child.stdin?.end() } catch { /* ignore */ }
+        try { child.kill('SIGTERM') } catch { /* ignore */ }
+        resolve(r)
+      }
+      const child = spawn(command, ['agent', '--always-approve', '--no-leader', 'stdio'], {
+        cwd: args.cwd,
+        env: { ...args.env, GROK_DISABLE_AUTOUPDATER: args.env.GROK_DISABLE_AUTOUPDATER ?? '1' },
+        stdio: ['pipe', 'pipe', 'pipe'],
+        shell: false,
+      })
+      const onAbort = () => finish({ ok: false, detail: 'aborted (timeout)' })
+      if (args.signal.aborted) { onAbort(); return }
+      args.signal.addEventListener('abort', onAbort, { once: true })
+      let buf = ''
+      let stderrTail = ''
+      const initId = 1
+      const sessionId = 2
+      let initialized = false
+      const writeRpc = (msg: object) => {
+        try { child.stdin?.write(JSON.stringify(msg) + '\n') } catch { /* die */ }
+      }
+      writeRpc({
+        jsonrpc: '2.0', id: initId, method: 'initialize',
+        params: { protocolVersion: 1, clientInfo: { name: 'cumora-doctor', version: '1.0.0' }, clientCapabilities: {} },
+      })
+      child.stdout?.on('data', (b: Buffer) => {
+        buf += b.toString('utf8')
+        for (;;) {
+          const nl = buf.indexOf('\n')
+          if (nl < 0) break
+          const line = buf.slice(0, nl).trim()
+          buf = buf.slice(nl + 1)
+          if (!line.startsWith('{')) continue
+          let msg: AcpMsg
+          try { msg = JSON.parse(line) as AcpMsg } catch { continue }
+          if (msg.error?.message) {
+            finish({ ok: false, detail: `acp rejected handshake: ${String(msg.error.message).slice(0, 240)}` })
+            return
+          }
+          if (!initialized && msg.id === initId && msg.result) {
+            initialized = true
+            writeRpc({
+              jsonrpc: '2.0', id: sessionId, method: 'session/new',
+              params: { cwd: args.cwd, mcpServers: [], _meta: { yoloMode: true } },
+            })
+            continue
+          }
+          if (initialized && msg.id === sessionId && msg.result) {
+            finish({ ok: true, detail: '' })
+            return
+          }
+        }
+      })
+      child.stderr?.on('data', (b: Buffer) => {
+        const tail = stderrTail + b.toString('utf8')
+        stderrTail = tail.length > 2000 ? tail.slice(-2000) : tail
+      })
+      child.on('error', (err) => finish({ ok: false, detail: `spawn error: ${err.message}` }))
+      child.on('close', (code, sig) => {
+        if (settled) return
+        const stage = !initialized ? 'before initialize ack' : 'before session/new ack'
+        const exit = sig ? `terminated by ${sig}` : `exit ${code}`
+        finish({ ok: false, detail: `grok agent stdio died ${stage} (${exit}): ${salientError(stderrTail) || 'no stderr'}` })
+      })
+    })
+  }
+
+  async seedHome(home: string, persona: EnginePersona): Promise<void> {
+    await ensureCommonHome(home)
+    const agentsMd = join(home, 'AGENTS.md')
+    if (!(await exists(agentsMd))) await writeFile(agentsMd, PERSONA_HEADER(persona), 'utf8')
+  }
+
+  run(args: EngineRunArgs): Promise<EngineRunResult> {
+    const flags = extraArgs('CUMORA_GROK_ARGS')
+    const model = args.model ? ['--model', args.model] : []
+    const resume = args.resumeSessionId ? ['--resume', args.resumeSessionId] : []
+    const command = this.command(args.env)
+    const { shell, wantsStdinPrompt } = resolveSpawn(this.bin)
+    const base = flags.length
+      ? [...flags, ...resume, '-p']
+      : ['-p', ...resume, ...model, '--output-format', 'streaming-messages-json', '--always-approve', '--no-auto-update']
+    const argv = wantsStdinPrompt ? base : (flags.length ? [...base, args.prompt] : ['-p', args.prompt, ...base.slice(1)])
+    const env: NodeJS.ProcessEnv = { ...args.env, GROK_DISABLE_AUTOUPDATER: args.env.GROK_DISABLE_AUTOUPDATER ?? '1' }
+    return spawnEngine(command, argv, { ...args, env }, { shell, stdinText: wantsStdinPrompt ? args.prompt : undefined })
+  }
+
+  startSession(args: EngineSessionArgs): EngineSession | null {
+    if (extraArgs('CUMORA_GROK_ARGS').length) return null
+    if (process.env.CUMORA_GROK_NO_ACP === '1') return null
+    // JSON-RPC over a Windows .cmd shim is the same trap Codex hits — exec
+    // (`grok -p`) is the safe path there.
+    if (IS_WIN) return null
+    const model = args.model ? ['--model', args.model] : []
+    return new GrokSession(this.command(args.env), ['agent', '--always-approve', '--no-leader', ...model, 'stdio'], args.home, args.env, args)
+  }
+}
+
+// ─── cursor ───────────────────────────────────────────────────────────────
+//
+// Cursor Agent (the `cursor-agent` CLI bundled with Cursor, 2026.08.11-e8db854)
+// is a ONE-SHOT engine: this version exposes no persistent stdio protocol, so
+// there is no startSession — every wake spawns a fresh process and continuity
+// comes from `--resume <session_id>`, which re-opens the SAME session id in the
+// next one-shot process. The daemon's generic one-shot run() path IS the wake
+// path; probeWake() therefore always reports `skipped` (probe() already
+// exercises the exact spawn a wake uses).
+//
+//   cursor-agent -p --output-format stream-json --force --trust \
+//     [--model X] [--resume <id>] <prompt>
+//
+// The stream: a `system/init` event (session id + model), user/assistant/
+// thinking events, and a terminal `result` event carrying the turn's usage.
+// Two contract quirks that shape this adapter:
+//   - A stream may report `is_error:true` with process exit 0 — that is a
+//     FAILED turn (model unavailable, …), so the stream decides, not the exit
+//     code, so the stream result is authoritative.
+//   - usage reports uncached input and cache reads as separate fields, matching
+//     Cursor's bundled `TokenUsage` schema; map them directly without folding.
+// Triage/probe use the READ-ONLY `--mode ask` variant and never `--force`.
+
+/** Cursor's result-event usage (OpenAI-ish camelCase). Its bundled TokenUsage
+ *  schema carries uncached input and cache reads as separate counters. */
+interface CursorUsage { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number }
+
+/** The subset of Cursor's stream-json we act on. Everything else is logged and
+ *  ignored, so a new event type in a future Cursor never breaks a turn. */
+interface CursorEvent {
+  type?: unknown
+  subtype?: unknown
+  session_id?: unknown
+  model?: unknown
+  is_error?: unknown
+  result?: unknown
+  usage?: CursorUsage
+  message?: { role?: unknown; content?: unknown }
+}
+
+/** Normalize Cursor's disjoint usage counters into EngineUsage;
+ *  cacheWrite maps to cache_creation. */
+function cursorUsageToEngineUsage(u: CursorUsage | undefined): EngineUsage | undefined {
+  if (!u || typeof u !== 'object') return undefined
+  const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
+  return {
+    input_tokens: num(u.inputTokens),
+    output_tokens: num(u.outputTokens),
+    cache_read_input_tokens: num(u.cacheReadTokens),
+    cache_creation_input_tokens: num(u.cacheWriteTokens),
+  }
+}
+
+/** Concatenate the text items of a Cursor message content array (same
+ *  `{type:'text', text}` item shape Claude uses). */
+function cursorTextOf(content: unknown): string {
+  if (!Array.isArray(content)) return ''
+  let out = ''
+  for (const item of content) {
+    if (!item || typeof item !== 'object') continue
+    const it = item as { type?: unknown; text?: unknown }
+    if (it.type === 'text' && typeof it.text === 'string') out += it.text
+  }
+  return out
+}
+
+/** Folds Cursor's stream-json into what the daemon wants from a turn: the
+ *  session id (every event repeats it — resume keeps continuity across the
+ *  per-wake processes), the model from `system/init` (or the pin when the
+ *  stream never names one), the normalized turn usage, the concatenated
+ *  assistant text (triage reads it), and the result event's error. ONE
+ *  turn-level EngineHopReport fires at the `result` event — Cursor reports
+ *  usage once per turn, so emitting per assistant message would double-count. */
+class CursorTurnTracker {
+  sessionId: string | null = null
+  model: string | null
+  usage: EngineUsage | undefined
+  text = ''
+  error: string | null = null
+  sawResult = false
+  private startedAt: number | null = null
+
+  constructor(
+    pin: string | null,
+    private readonly onHopUsage?: (r: EngineHopReport) => void,
+  ) {
+    this.model = pin
+  }
+
+  /** Feed one event. Returns true when the event terminates the turn. */
+  observe(ev: CursorEvent): boolean {
+    if (typeof ev.session_id === 'string' && ev.session_id) this.sessionId = ev.session_id
+    if (ev.type === 'system' && ev.subtype === 'init') {
+      // init's model is what Cursor actually opened the session on — it wins
+      // over the pin (which is only what we asked for).
+      if (typeof ev.model === 'string' && ev.model) this.model = ev.model
+      if (this.startedAt == null) this.startedAt = Date.now()
+      return false
+    }
+    if (ev.type === 'assistant') {
+      this.text += cursorTextOf(ev.message?.content)
+      return false
+    }
+    if (ev.type === 'result') {
+      this.sawResult = true
+      this.usage = cursorUsageToEngineUsage(ev.usage)
+      if (ev.is_error === true) {
+        this.error = typeof ev.result === 'string' && ev.result
+          ? ev.result
+          : `cursor turn error${typeof ev.subtype === 'string' ? ` (${ev.subtype})` : ''}`
+      }
+      // The single turn-level hop — Cursor has no per-message usage, so this
+      // is the honest granularity (same contract as Codex's turn-completed).
+      if (ev.is_error !== true && this.usage && this.model && this.onHopUsage) {
+        const startedAt = this.startedAt
+        try {
+          this.onHopUsage({
+            model: this.model,
+            usage: this.usage,
+            latencyMs: startedAt != null ? Date.now() - startedAt : undefined,
+            hopIndex: 1,
+            textChars: this.text.length,
+          })
+        } catch { /* ledger best-effort — never break the stream */ }
+      }
+      return true
+    }
+    return false
+  }
+}
+
+/** Parse one stdout line of Cursor's stream-json. Non-JSON lines (banners,
+ * warnings that land on stdout) come back null and are logged verbatim. */
+function parseCursorLine(line: string): CursorEvent | null {
+  if (!line.startsWith('{')) return null
+  try { return JSON.parse(line) as CursorEvent } catch { return null }
+}
+
+/** One-shot `cursor-agent -p --output-format stream-json …`: spawn, fold the
+ *  stream through a CursorTurnTracker, resolve on exit. The tracker's error is
+ *  folded into the result because a Cursor stream reports failure via
+ *  `is_error:true` regardless of the process exit code. Text is the
+ *  concatenated assistant text — what classify()/probe() want. */
+function spawnCursorStream(
+  command: string,
+  args: string[],
+  opts: {
+    cwd: string
+    env: NodeJS.ProcessEnv
+    signal: AbortSignal
+    onLog?: (line: string) => void
+    shell: boolean
+    stdinText?: string
+    onHopUsage?: (r: EngineHopReport) => void
+    /** Model pin, used as the tracker's model until system/init names one. */
+    pin?: string | null
+    /** Fail a clean-exiting stream that never emitted its terminal `result`
+     *  event (run(): a turn that never finished is not a success). classify()
+     *  and probe() settle for whatever text arrived. */
+    requireResult?: boolean
+  },
+): Promise<EngineRunResult & { text: string }> {
+  return new Promise((resolve) => {
+    const tracker = new CursorTurnTracker(opts.pin ?? null, opts.onHopUsage)
+    const child = spawn(command, args, {
+      cwd: opts.cwd, env: opts.env,
+      stdio: [opts.stdinText != null ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+      shell: opts.shell,
+    })
+    if (opts.stdinText != null) {
+      try { child.stdin?.write(opts.stdinText); child.stdin?.end() } catch { /* the 'error' handler resolves */ }
+    }
+    const onAbort = (): void => { child.kill('SIGTERM') }
+    opts.signal.addEventListener('abort', onAbort, { once: true })
+    if (opts.signal.aborted) onAbort()
+    const stderrTail: string[] = []
+    const stdoutTail: string[] = []
+    const decoder: Record<'stdout' | 'stderr', StringDecoder> = {
+      stdout: new StringDecoder('utf8'),
+      stderr: new StringDecoder('utf8'),
+    }
+    const carry: Record<'stdout' | 'stderr', string> = { stdout: '', stderr: '' }
+    const takeLine = (stream: 'stdout' | 'stderr', raw: string): void => {
+      const line = cleanLine(raw)
+      if (!line) return
+      pushTail(stream === 'stderr' ? stderrTail : stdoutTail, line)
+      opts.onLog?.(line)
+      if (stream === 'stdout') {
+        const ev = parseCursorLine(line)
+        if (ev) tracker.observe(ev)
+      }
+    }
+    const pump = (stream: 'stdout' | 'stderr', buf: Buffer | null): void => {
+      const text = buf === null ? decoder[stream].end() : decoder[stream].write(buf)
+      const lines = (carry[stream] + text).split('\n')
+      carry[stream] = buf === null ? '' : (lines.pop() ?? '')
+      for (const line of lines) takeLine(stream, line)
+    }
+    child.stdout?.on('data', (buf: Buffer) => pump('stdout', buf))
+    child.stderr?.on('data', (buf: Buffer) => pump('stderr', buf))
+    let settled = false
+    child.on('error', (err) => {
+      if (settled) return
+      settled = true
+      opts.signal.removeEventListener('abort', onAbort)
+      resolve({ exitCode: 1, error: err instanceof Error ? err.message : String(err), sessionId: null, text: '' })
+    })
+    child.on('close', (code, signalName) => {
+      if (settled) return
+      settled = true
+      opts.signal.removeEventListener('abort', onAbort)
+      pump('stdout', null)
+      pump('stderr', null)
+      const procExit = code ?? (signalName ? 128 : 1)
+      // The stream is the truth: is_error:true fails the turn even on exit 0.
+      const streamError = tracker.error
+        ? `engine turn error: ${tracker.error.slice(0, MAX_FAILURE_CHARS)}`
+        : (opts.requireResult && !tracker.sawResult
+          ? 'engine stream ended without a result event (cursor-agent exited early)'
+          : null)
+      const exitCode = procExit !== 0 ? procExit : (streamError ? 1 : 0)
+      const error = procExit !== 0
+        ? failurePreview({ exitCode: procExit, signalName, stderr: stderrTail, stdout: stdoutTail })
+        : streamError ?? undefined
+      resolve({ exitCode, error, sessionId: tracker.sessionId, usage: tracker.usage, model: tracker.model, text: tracker.text })
+    })
+  })
+}
+
+class CursorAdapter implements EngineAdapter {
+  readonly id = 'cursor' as const
+  readonly bin = 'cursor-agent'
+
+  /** A turn: full-tools one-shot (`--force` auto-approves the agent's tool use
+   *  inside its isolated, user-owned home — the Cursor analogue of Claude's
+   *  --dangerously-skip-permissions), `--trust` skips the workspace-trust
+   *  prompt a headless spawn can't answer. The prompt is the LAST argv element
+   *  (Cursor takes it positionally); on Windows it travels via stdin instead. */
+  private turn(prompt: string, args: {
+    cwd: string
+    env: NodeJS.ProcessEnv
+    signal: AbortSignal
+    onLog?: (line: string) => void
+    model?: string | null
+    resumeSessionId?: string | null
+    onHopUsage?: (r: EngineHopReport) => void
+  }): Promise<EngineRunResult & { text: string }> {
+    const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
+    const model = args.model ? ['--model', args.model] : []
+    // Continuous context across wakes: --resume re-opens the prior session in
+    // this fresh one-shot process (Cursor has no persistent protocol to keep
+    // warm instead).
+    const resume = args.resumeSessionId ? ['--resume', args.resumeSessionId] : []
+    const base = ['-p', ...resume, ...model, '--output-format', 'stream-json', '--force', '--trust']
+    return spawnCursorStream(command, wantsStdinPrompt ? base : [...base, prompt], {
+      cwd: args.cwd, env: args.env, signal: args.signal, onLog: args.onLog, shell,
+      stdinText: wantsStdinPrompt ? prompt : undefined,
+      onHopUsage: args.onHopUsage,
+      pin: args.model ?? null,
+      requireResult: true,
+    })
+  }
+
+  /** The READ-ONE triage/probe shape: `--mode ask` keeps the agent Q&A-only
+   *  (no edits, no shell), so classification can never mutate anything. Never
+   *  `--force` here. */
+  private ask(prompt: string, args: {
+    cwd: string
+    env: NodeJS.ProcessEnv
+    signal: AbortSignal
+    onLog?: (line: string) => void
+    model?: string | null
+  }): Promise<EngineRunResult & { text: string }> {
+    const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
+    const model = args.model ? ['--model', args.model] : []
+    const base = ['--mode', 'ask', '-p', '--output-format', 'stream-json', ...model, '--trust']
+    return spawnCursorStream(command, wantsStdinPrompt ? base : [...base, prompt], {
+      cwd: args.cwd, env: args.env, signal: args.signal, onLog: args.onLog, shell,
+      stdinText: wantsStdinPrompt ? prompt : undefined,
+      pin: args.model ?? null,
+    })
+  }
+
+  async classify(args: EngineClassifyArgs): Promise<EngineClassifyResult> {
+    const flags = extraArgs('CUMORA_TRIAGE_ARGS')
+    if (flags.length) {
+      // User-owned triage flag set → plain print mode, raw text back (the same
+      // override discipline the other engines share; no stream to fold).
+      const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
+      const base = [...flags, '-p']
+      return spawnCapture(command, wantsStdinPrompt ? base : [...base, args.prompt], {
+        cwd: args.cwd, env: args.env, signal: args.signal, onLog: args.onLog, shell,
+        stdinText: wantsStdinPrompt ? args.prompt : undefined,
+      })
+    }
+    // Cursor has no fixed cheap cerebellum id (its models are account-gated
+    // aliases); unset CUMORA_TRIAGE_MODEL → Cursor's default ('Auto'), honestly
+    // reported back by the stream's system/init for the ledger.
+    const r = await this.ask(args.prompt, { cwd: args.cwd, env: args.env, signal: args.signal, onLog: args.onLog, model: args.model })
+    return { text: r.text, error: r.error, usage: r.usage, model: r.model }
+  }
+
+  async probe(args: EngineProbeArgs): Promise<EngineClassifyResult> {
+    // 'small' → whatever triage runs on (CUMORA_TRIAGE_MODEL, else Cursor's
+    // default — the same model as 'big', honestly reported as such); 'big' →
+    // Cursor's default. Read-only ask mode either way.
+    const model = args.tier === 'small' ? (process.env.CUMORA_TRIAGE_MODEL || null) : null
+    const r = await this.ask(DOCTOR_PROMPT, { cwd: args.cwd, env: args.env, signal: args.signal, model })
+    return { text: r.text, error: r.error, usage: r.usage, model: r.model }
+  }
+
+  probeWake(_args: EngineWakeProbeArgs): Promise<EngineWakeProbeResult> {
+    // There is no distinct wake path to probe: no persistent protocol in this
+    // cursor-agent version, so the wake is the SAME one-shot spawn probe()
+    // already exercises. Mark skipped so doctor hides the redundant line.
+    return Promise.resolve({ ok: true, detail: '', skipped: true })
+  }
+
+  async seedHome(home: string, persona: EnginePersona): Promise<void> {
+    await ensureCommonHome(home)
+    await mkdir(join(home, '.cursor', 'skills'), { recursive: true })
+    // Always rewrite AGENTS.md so persona edits land without requiring a fresh
+    // home (matches Claude and Codex). Cursor discovers AGENTS.md from its cwd.
+    await writeFile(
+      join(home, 'AGENTS.md'),
+      PERSONA_HEADER(persona, { personaFile: 'AGENTS.md', skillsDir: '.cursor/skills/' }),
+      'utf8',
+    )
+  }
+
+  async run(args: EngineRunArgs): Promise<EngineRunResult> {
+    const flags = extraArgs('CUMORA_CURSOR_ARGS')
+    if (flags.length) {
+      // Whole user-owned flag override → opaque print mode (same escape hatch
+      // as CUMORA_CLAUDE_ARGS / CUMORA_CODEX_ARGS / CUMORA_GROK_ARGS): we can't
+      // assume the stream-json shape, so no usage/hop ledger — but keep
+      // --resume + -p + prompt so session continuity survives the override.
+      const resume = args.resumeSessionId ? ['--resume', args.resumeSessionId] : []
+      const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
+      const base = [...flags, ...resume, '-p']
+      return spawnEngine(command, wantsStdinPrompt ? base : [...base, args.prompt], args, { shell, stdinText: wantsStdinPrompt ? args.prompt : undefined })
+    }
+    return this.turn(args.prompt, {
+      cwd: args.home, env: args.env, signal: args.signal, onLog: args.onLog,
+      model: args.model, resumeSessionId: args.resumeSessionId, onHopUsage: args.onHopUsage,
+    })
+  }
+
+  // No startSession: Cursor exposes no persistent stdio protocol in this
+  // version — the daemon runs the one-shot path above per wake and resumes
+  // the session id it reports (see the section note).
+}
+
 const ADAPTERS: Record<EngineId, EngineAdapter> = {
   claude: new ClaudeAdapter(),
   codex: new CodexAdapter(),
+  grok: new GrokAdapter(),
+  cursor: new CursorAdapter(),
 }
 
 export function getAdapter(id: EngineId): EngineAdapter {
@@ -1421,7 +2276,11 @@ export function getAdapter(id: EngineId): EngineAdapter {
 /** Probe which engines are installed on this machine. */
 export async function detectEngines(): Promise<EngineId[]> {
   const ids = Object.keys(ADAPTERS) as EngineId[]
-  const present = await Promise.all(ids.map(async (id) => ((await binOnPath(ADAPTERS[id].bin)) ? id : null)))
+  const present = await Promise.all(ids.map(async (id) => {
+    if (await binOnPath(ADAPTERS[id].bin)) return id
+    if (id === 'grok' && resolveGrokBin()) return id
+    return null
+  }))
   return present.filter((x): x is EngineId => x !== null)
 }
 
@@ -1465,7 +2324,7 @@ export interface EngineHealth {
   big: BrainHealth | null
   small: BrainHealth | null
   /** Wake-path protocol health (codex app-server JSON-RPC handshake; claude
-   *  persistent-session flag set). Separate signal from big/small because the
+   *  persistent-session flag set; grok ACP stdio handshake). Separate signal from big/small because the
    *  failure modes are different — those are auth/quota; this is protocol/CLI
    *  version compatibility. */
   wake: WakeHealth | null
@@ -1499,7 +2358,7 @@ export async function runEngineDoctor(opts?: {
   const ids = Object.keys(ADAPTERS) as EngineId[]
   return Promise.all(ids.map(async (id): Promise<EngineHealth> => {
     const adapter = ADAPTERS[id]
-    const path = await resolveBinPath(adapter.bin)
+    const path = (await resolveBinPath(adapter.bin)) ?? (id === 'grok' ? resolveGrokBin(env) : null)
     if (!path) return { id, installed: false, path: null, big: null, small: null, wake: null }
     const probeTier = async (tier: 'big' | 'small'): Promise<BrainHealth> => {
       const controller = new AbortController()
