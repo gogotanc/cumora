@@ -1,22 +1,23 @@
 /**
- * Integration test: the external-device (BYOA daemon) access surface added for
- * Cumora 0.1.4 — a dedicated daemon runtime-token endpoint that lets us keep
- * the public_path whitelist narrow (no wide `/api/agents/` prefix).
+ * Integration test: the external-device (BYOA daemon) access surface for
+ * Cumora 0.1.4. The daemon shipped on user machines is the upstream npm
+ * client, which calls the NATIVE route `POST /api/agents/:id/runtime-token`
+ * — we must NOT modify server/src/agents/computer/daemon.ts. Instead the
+ * `public_path` whitelist allows the `/api/agents/` prefix so that native
+ * route can reach the app; every other route under that prefix is still
+ * gated by a user session / role.
  *
- * Security-critical behaviours covered:
- *  - No device Bearer token → 401 for `/api/computers/me/agents` and
- *    `/api/computers/runtime-token`.
- *  - No agent JWT → 401 for `/runtime/wake-stream`.
- *  - `POST /api/computers/runtime-token` accepts the target agent in the body,
- *    requires `agentId`, returns 403 for an agent not assigned to the calling
- *    computer, and mints a runtime token only for an assigned agent.
+ * Security-critical behaviours covered (all at the app layer, since the
+ * Ingress-level `/api/agents/` prefix only forwards to this router):
+ *  - No device Bearer token → 401 for `/api/computers/me/agents`, the native
+ *    `/api/agents/:id/runtime-token`, and `/runtime/wake-stream`.
+ *  - `POST /api/agents/:id/runtime-token` mints a runtime token only for an
+ *    agent actually assigned to the calling computer (403 otherwise).
  *  - Management endpoints (`/api/computers`, `/api/agents/:id/computer`) remain
- *    user-session-gated (401 without a session) — the public_path whitelist
- *    must NOT reach them at the app layer.
+ *    user-session-gated (401 without a session).
  *
- * The Ingress-level interception (Case 2 in the acceptance checklist) is a
- * manifest `public_path` concern and is verified separately against the live
- * Dev domain.
+ * The Ingress-level interception / public_path reachability is verified
+ * separately against the live Dev domain (the 14-route anonymous 401 audit).
  *
  * Requires a real Postgres + Redis (INTEGRATION_DATABASE_URL); see
  * server/run-integration-tests.mjs.
@@ -117,8 +118,8 @@ test('[integration] external-access: no device token → 401 on me/agents', asyn
   assert.equal(r.status, 401)
 })
 
-test('[integration] external-access: no device token → 401 on runtime-token', async () => {
-  const r = await call('/api/computers/runtime-token', { body: { agentId: 'a-x' } })
+test('[integration] external-access: no device token → 401 on native runtime-token', async () => {
+  const r = await call('/api/agents/a-x/runtime-token')
   assert.equal(r.status, 401)
 })
 
@@ -139,25 +140,18 @@ test('[integration] external-access: /api/agents/:id/computer stays user-session
   assert.equal(r.status, 401)
 })
 
-// ── runtime-token endpoint contract ────────────────────────────────────
+// ── native runtime-token endpoint contract ─────────────────────────────
 
-test('[integration] external-access: runtime-token 400 when agentId missing', async () => {
-  const { deviceToken } = await seedPairedComputer()
-  const r = await call('/api/computers/runtime-token', { token: deviceToken, body: {} })
-  assert.equal(r.status, 400)
-  assert.match(String(r.body?.error ?? ''), /agentId/i)
-})
-
-test('[integration] external-access: runtime-token 403 for an agent not assigned to this computer', async () => {
+test('[integration] external-access: native runtime-token 403 for an agent not assigned to this computer', async () => {
   const { deviceToken } = await seedPairedComputer(true)
-  const r = await call('/api/computers/runtime-token', { token: deviceToken, body: { agentId: 'a-not-assigned' } })
+  const r = await call('/api/agents/a-not-assigned/runtime-token', { token: deviceToken })
   assert.equal(r.status, 403)
   assert.match(String(r.body?.error ?? ''), /not assigned/i)
 })
 
-test('[integration] external-access: runtime-token mints a token for an assigned agent', async () => {
+test('[integration] external-access: native runtime-token mints a token for an assigned agent', async () => {
   const { deviceToken, agentId } = await seedPairedComputer(true)
-  const r = await call('/api/computers/runtime-token', { token: deviceToken, body: { agentId } })
+  const r = await call(`/api/agents/${agentId}/runtime-token`, { token: deviceToken })
   assert.equal(r.status, 200)
   assert.ok(typeof r.body?.token === 'string' && r.body.token.length > 0, 'token returned')
   assert.ok(r.body?.expiresInSeconds > 0, 'expiresInSeconds returned')

@@ -6,7 +6,7 @@ application:
     - /api/computers/pair
     - /api/computers/me/agents
     - /api/computers/heartbeat
-    - /api/computers/runtime-token
+    - /api/agents/
     - /runtime/
   routes:
     - /=http://cumora:5181

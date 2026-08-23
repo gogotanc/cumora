@@ -1205,8 +1205,8 @@ class AgentRunner {
   private async ensureToken(): Promise<string> {
     if (this.token && Date.now() < this.tokenExpiresAt - TOKEN_REFRESH_SKEW_MS) return this.token
     const minted = await api<{ token: string; expiresInSeconds: number }>(
-      this.cfg.serverUrl, '/api/computers/runtime-token',
-      { method: 'POST', headers: { Authorization: `Bearer ${this.cfg.deviceToken}` }, body: JSON.stringify({ agentId: this.agent.id }) },
+      this.cfg.serverUrl, `/api/agents/${this.agent.id}/runtime-token`,
+      { method: 'POST', headers: { Authorization: `Bearer ${this.cfg.deviceToken}` }, body: '{}' },
     )
     this.token = minted.token
     this.tokenExpiresAt = Date.now() + minted.expiresInSeconds * 1000
