@@ -7,6 +7,3 @@ images:
   cumora-server:
     context: ../
     dockerfile: ../server/docker/cumora-server.Dockerfile
-  cumora-postgres:
-    context: ./
-    dockerfile: ./postgres.Dockerfile

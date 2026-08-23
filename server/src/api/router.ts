@@ -1178,6 +1178,20 @@ api.post('/agents/:id/runtime-token', safe(async (req, res) => {
   res.json(minted)
 }))
 
+// Mint a per-agent runtime JWT for the calling computer (daemon refresh loop).
+// Dedicated daemon path that takes the target agent in the body instead of the
+// URL, so the public_path whitelist never has to expose the wide `/api/agents/`
+// management prefix. Still requires the pairing-issued device Bearer token and
+// internally verifies the agent is actually assigned to this computer.
+api.post('/computers/runtime-token', safe(async (req, res) => {
+  const { computerId } = await requireDevice(req)
+  const agentId = String(req.body?.agentId ?? '').trim()
+  if (!agentId) throw new HttpError(400, 'agentId required')
+  const minted = await mintAgentRuntimeToken({ computerId, agentId })
+  if (!minted) throw new HttpError(403, 'agent not assigned to this computer')
+  res.json(minted)
+}))
+
 /* ============== Company invitations ============== */
 
 const INVITE_TTL_MS = 1000 * 60 * 60 * 24 * 7    // 7 days
