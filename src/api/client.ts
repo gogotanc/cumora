@@ -12,6 +12,28 @@ const COMPUTER_SERVER_ORIGIN = (import.meta.env.VITE_CUMORA_COMPUTER_SERVER as s
   ?.trim()
   .replace(/\/+$/, '') ?? ''
 
+/** The Lazycat runtime injects the app's publicly reachable origin into the
+ *  served HTML (see server/src/index.ts). This is the authoritative origin an
+ *  external BYOA daemon must use — the internal `.lzcapp` service address is
+ *  app-to-app only and never resolves on a device logged into the Lazycat
+ *  client. */
+function injectedPublicOrigin(): string {
+  if (typeof window === 'undefined') return ''
+  const v = (window as unknown as { __CUMORA_PUBLIC_ORIGIN?: string }).__CUMORA_PUBLIC_ORIGIN
+  return v?.trim().replace(/\/+$/, '') ?? ''
+}
+
+/** True for the Lazycat-only internal service domain (`.lzcapp`), which a
+ *  daemon running outside the microserver container network cannot reach. */
+function isInternalLzcappOrigin(value: string): boolean {
+  try {
+    const host = new URL(value).hostname
+    return host === 'lzcapp' || host.endsWith('.lzcapp')
+  } catch {
+    return value.includes('.lzcapp')
+  }
+}
+
 // Vite's relative proxy keeps browser requests same-origin, but the pairing
 // command runs outside the browser and must address the API directly.
 const DEV_API_TARGET = import.meta.env.DEV
@@ -60,14 +82,38 @@ export function getServerOrigin(): string {
  * expose the browser through SSO while the daemon uses a private service
  * address, so this can intentionally differ from the page's API origin. */
 export function getComputerServerOrigin(): string {
-  return COMPUTER_SERVER_ORIGIN || getPairingServerOrigin()
+  // 1. Server-declared public origin (Lazycat injects this). The external BYOA
+  //    daemon must reach the app over the public HTTPS domain, so this always
+  //    wins when the runtime provides it.
+  const injected = injectedPublicOrigin()
+  if (injected) return injected
+  // 2. Baked build-time override. Keep it only when it points at a reachable
+  //    public origin; never surface an internal-only `.lzcapp` address to a
+  //    daemon that runs on a device logged into the Lazycat client.
+  if (COMPUTER_SERVER_ORIGIN && !isInternalLzcappOrigin(COMPUTER_SERVER_ORIGIN)) {
+    return COMPUTER_SERVER_ORIGIN
+  }
+  // 3. Fallback: the same-origin public URL the browser is served from.
+  return getPairingServerOrigin()
+}
+
+/** Internal app-to-app `.lzcapp` service origin, present only in a Lazycat
+ *  distribution. The pairing UI surfaces this as the on-box (same LightOS
+ *  device) alternative; it is never the default because an external BYOA
+ *  daemon cannot resolve it. Returns '' when the distribution has no such
+ *  address (e.g. the original Cumora cloud). */
+export function getInternalComputerOrigin(): string {
+  return COMPUTER_SERVER_ORIGIN && isInternalLzcappOrigin(COMPUTER_SERVER_ORIGIN)
+    ? COMPUTER_SERVER_ORIGIN
+    : ''
 }
 
 /** Origin to embed in a local computer pairing command.
  * In Vite dev the browser uses a relative proxy, so SERVER_ORIGIN is empty;
  * the daemon still needs the API target rather than the renderer origin. */
 export function getPairingServerOrigin(): string {
-  return SERVER_ORIGIN || DEV_API_TARGET || ''
+  return SERVER_ORIGIN || DEV_API_TARGET ||
+    (typeof window !== 'undefined' && window.location?.origin ? window.location.origin : '')
 }
 
 /** Persist a new server origin override and clear the existing session.

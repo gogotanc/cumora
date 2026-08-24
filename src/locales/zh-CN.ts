@@ -1044,6 +1044,7 @@ export const zhCN: Partial<Record<keyof typeof en, string>> = {
   'onboard.addComputer': '添加一台计算机',
   'onboard.runThis': '在那台机器上跑这条命令：',
   'onboard.tokenHint': '配对码长期有效。计算机连上后会在这里出现，连接成功会自动继续。',
+  'computer.onBoxHint': '如果就在这台 LightOS 设备本机上运行，改用内部地址：',
   'onboard.engine': '引擎',
   'onboard.engineHint': '只是默认值 —— 这台机器仍然可以在任何检测到的引擎上跑智能体',
   'onboard.windowsKeep': '智能体运行期间，请保持这个终端窗口打开。',

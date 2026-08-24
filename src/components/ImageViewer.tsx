@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, type CSSProperties } from 're
 import { createPortal } from 'react-dom'
 import { isElectron, isMac, trafficLightInset } from '@/lib/runtime'
 import { useT } from '@/lib/i18n'
+import { downloadFile } from '@/lib/download'
 
 // Electron's hidden titlebar (mac) is 44px tall and marked as a drag region.
 // The portal renders on top of it, but the OS still treats those pixels as
@@ -94,21 +95,8 @@ export function ImageViewer({ src, name, onClose }: ImageViewerProps) {
   const onPointerUp = () => setDragging(false)
 
   const download = async () => {
-    try {
-      const res = await fetch(src)
-      const blob = await res.blob()
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = name || t('imageView.fileFallback')
-      document.body.appendChild(a)
-      a.click()
-      a.remove()
-      URL.revokeObjectURL(url)
-      flashToast(t('imageView.downloaded'))
-    } catch {
-      window.open(src, '_blank', 'noopener,noreferrer')
-    }
+    await downloadFile(src, name || t('imageView.fileFallback'))
+    flashToast(t('imageView.downloaded'))
   }
 
   // Clipboard image-write requires PNG on Chromium; convert via <canvas> if

@@ -23,11 +23,16 @@ This keeps semantic memory available without pulling an image during install.
 - Lazycat LPK: SPA, API, WebSocket, PostgreSQL, Redis, local uploads.
 - LightOS: `npx cumora@latest agent computer` using local Codex or Claude.
 
-Use the service-direct Lazycat address from LightOS when pairing so the BYOA
-daemon does not need a public API bypass. Do not add the whole `/api` tree to
-`public_path`.
+The pairing/reconnect command the UI prints uses the app's **public HTTPS
+domain** (the `CUMORA_PUBLIC_ORIGIN` injected into the served HTML, i.e.
+`https://${LAZYCAT_APP_DOMAIN}`). That is the only origin a BYOA daemon running
+on a device logged into the Lazycat client can reach — it goes through the
+Ingress and the `public_path` whitelist, so it does not expose the whole `/api`
+tree. The internal `.lzcapp` address is app-to-app only and never resolves
+outside the microserver's container network.
 
-For this package the internal server URL is:
+Only when the daemon runs **on the same LightOS box** can you optionally use
+the app's internal service address (bypassing the public gateway):
 
 ```text
 http://cumora.cloud.lazycat.app.cumora.lzcapp:5181
@@ -38,13 +43,14 @@ LightOS restarts:
 
 ```sh
 npx cumora@latest agent computer --install-service \
-  --server http://cumora.cloud.lazycat.app.cumora.lzcapp:5181
+  --server https://cumora.hitanc.heiyu.space
 ```
 
 `LAZYCAT_AUTH_ENABLED` trusts `X-HC-User-ID` from Lazycat's authenticated app
 ingress. Keep the auth exchange behind that ingress; this package intentionally
-does not expose an unauthenticated API route. The pairing UI prints the private
-service URL because a BYOA daemon cannot pass through the browser SSO ingress.
+does not expose an unauthenticated API route. The pairing UI prints the public
+HTTPS origin; the daemon authenticates with its device-token / runtime-token
+through the `public_path` whitelist, so it never needs the browser SSO session.
 
 The browser injects Lazycat's official file chooser bridge so Cumora's upload
 inputs can select files from either the local device or Lazycat storage. See

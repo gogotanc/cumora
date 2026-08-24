@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { api, getComputerServerOrigin } from '@/api/client'
+import { api, getComputerServerOrigin, getInternalComputerOrigin } from '@/api/client'
 import { useComputers } from '@/stores/computers'
 import { isWindows } from '@/lib/runtime'
 import { TitleBar } from '@/desktop/TitleBar'
@@ -38,12 +38,16 @@ export function Onboarding() {
   }, [copied])
 
   const origin = getComputerServerOrigin()
+  const internalOrigin = getInternalComputerOrigin()
   // Every non-default engine, not just Codex: without the flag the daemon
   // auto-detects and the server takes engines[0] as this computer's DEFAULT, so
   // picking Grok on a machine that also has Claude silently paired it to Claude.
   const engineFlag = engine === 'claude' ? '' : ` --engine ${engine}`
   const serviceFlag = asService ? ' --install-service' : ''
   const cmd = code ? `npx cumora@latest agent computer --pair ${code}${origin ? ` --server ${origin}` : ''}${engineFlag}${serviceFlag}` : ''
+  const internalCmd = code && internalOrigin
+    ? `npx cumora@latest agent computer --pair ${code} --server ${internalOrigin}${engineFlag}${serviceFlag}`
+    : ''
 
   async function getCode() {
     setErr(null); setBusy(true)
@@ -116,6 +120,12 @@ export function Onboarding() {
                   </label>
                 )}
                 <pre className="bg-ink-900 text-cloud rounded-[10px] p-3 text-[12px] overflow-x-auto whitespace-pre-wrap break-all font-mono select-all">{cmd}</pre>
+                {internalCmd && (
+                  <div className="mt-2 text-[11px] text-ink-500 leading-relaxed">
+                    {t('computer.onBoxHint')}
+                    <pre className="mt-1 bg-ink-50 border border-ink-100 text-ink-700 rounded-[8px] p-2 text-[11px] overflow-x-auto whitespace-pre-wrap break-all font-mono select-all">{internalCmd}</pre>
+                  </div>
+                )}
                 <div className="flex items-center gap-3 mt-3">
                   <button onClick={() => { void navigator.clipboard?.writeText(cmd); setCopied(true) }}
                     className="inline-flex items-center justify-center min-w-[120px] text-[12px] font-semibold px-3 py-1.5 rounded-[9px] text-white transition-colors duration-200"

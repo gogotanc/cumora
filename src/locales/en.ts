@@ -1043,6 +1043,7 @@ export const en = {
   'onboard.addComputer': 'Add a computer',
   'onboard.runThis': 'Run this on that machine:',
   'onboard.tokenHint': 'This pairing token stays valid. The computer appears here and you’ll continue automatically once it connects.',
+  'computer.onBoxHint': 'On this same Lazycat device, use the internal address instead:',
   'onboard.engine': 'Engine',
   'onboard.engineHint': 'just the default — this computer can still run agents on any detected engine',
   'onboard.windowsKeep': 'Keep this terminal open while the agents run.',

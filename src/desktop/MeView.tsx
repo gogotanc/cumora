@@ -11,7 +11,7 @@ import { LanguagePicker } from '@/components/LanguagePicker'
 import { useT, type MessageKey } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 import { isWindows } from '@/lib/runtime'
-import { api, getComputerServerOrigin, getServerOrigin, type ApiProject, type ApiQuotaSnapshot, type ApiQuotaWindow } from '@/api/client'
+import { api, getComputerServerOrigin, getInternalComputerOrigin, getServerOrigin, type ApiProject, type ApiQuotaSnapshot, type ApiQuotaWindow } from '@/api/client'
 
 // The tab's identity is its `key`; the label is a message key resolved at
 // render. Before this they were the same string, which would have made
@@ -782,9 +782,14 @@ function ComputersTab() {
   }
 
   const origin = getComputerServerOrigin()
+  const internalOrigin = getInternalComputerOrigin()
   const serverFlag = origin ? ` --server ${origin}` : ''
+  const internalServerFlag = internalOrigin ? ` --server ${internalOrigin}` : ''
   const engineFlag = engine === 'claude' ? '' : ` --engine ${engine}`
   const pairCommand = code ? `npx cumora@latest agent computer --pair ${code}${serverFlag}${engineFlag}${asService ? ' --install-service' : ''}` : ''
+  const internalPairCommand = code && internalOrigin
+    ? `npx cumora@latest agent computer --pair ${code}${internalServerFlag}${engineFlag}${asService ? ' --install-service' : ''}`
+    : ''
   const list = Object.values(byId).sort((a, b) =>
     (a.kind === 'cloud' ? 0 : 1) - (b.kind === 'cloud' ? 0 : 1) || a.name.localeCompare(b.name))
 
@@ -830,6 +835,9 @@ function ComputersTab() {
             const repairable = c.kind !== 'cloud'
             const expanded = repairFor === c.id
             const repairCmd = repairCode ? `npx cumora@latest agent computer --pair ${repairCode}${serverFlag}` : ''
+            const internalRepairCmd = repairCode && internalOrigin
+              ? `npx cumora@latest agent computer --pair ${repairCode}${internalServerFlag}`
+              : ''
             return (
               <div key={c.id} className="bg-cloud rounded-[14px]" style={{ border: '1px solid var(--ink-100)' }}>
                 <div
@@ -879,6 +887,12 @@ function ComputersTab() {
                     ) : (
                       <>
                         <pre className="bg-ink-900 text-cloud rounded-[10px] p-3 text-[12px] overflow-x-auto whitespace-pre-wrap break-all font-mono select-all">{repairCmd}</pre>
+                        {internalRepairCmd && (
+                          <div className="mt-2 text-[11px] text-ink-500 leading-relaxed">
+                            {t('computer.onBoxHint')}
+                            <pre className="mt-1 bg-ink-50 border border-ink-100 text-ink-700 rounded-[8px] p-2 text-[11px] overflow-x-auto whitespace-pre-wrap break-all font-mono select-all">{internalRepairCmd}</pre>
+                          </div>
+                        )}
                         <button onClick={(e) => { e.stopPropagation(); void navigator.clipboard?.writeText(repairCmd); setRepairCopied(true) }}
                           className="mt-2 inline-flex items-center justify-center min-w-[120px] text-[12px] font-semibold px-3 py-1.5 rounded-[9px] text-white transition-colors duration-200"
                           style={{ background: repairCopied ? '#3BB273' : 'var(--skype)' }}>
@@ -929,6 +943,12 @@ function ComputersTab() {
               </label>
             )}
             <pre className="bg-ink-900 text-cloud rounded-[10px] p-3 text-[12px] overflow-x-auto whitespace-pre-wrap break-all font-mono select-all">{pairCommand}</pre>
+            {internalPairCommand && (
+              <div className="mt-2 text-[11px] text-ink-500 leading-relaxed">
+                {t('computer.onBoxHint')}
+                <pre className="mt-1 bg-ink-50 border border-ink-100 text-ink-700 rounded-[8px] p-2 text-[11px] overflow-x-auto whitespace-pre-wrap break-all font-mono select-all">{internalPairCommand}</pre>
+              </div>
+            )}
             <div className="flex gap-2 mt-3">
               <button onClick={copyCommand} aria-live="polite"
                 className="inline-flex items-center justify-center gap-1.5 min-w-[128px] text-[12px] font-semibold px-3 py-1.5 rounded-[9px] text-white transition-colors duration-200"

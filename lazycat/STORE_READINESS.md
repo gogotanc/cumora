@@ -5,7 +5,10 @@
 - Package ID: `cloud.lazycat.app.cumora`
 - Display name: `Cumora`
 - Browser domain: assigned from `${LAZYCAT_APP_DOMAIN}` at deployment
-- BYOA service: `http://cumora.cloud.lazycat.app.cumora.lzcapp:5181`
+- BYOA service: the app's public HTTPS origin (`https://${LAZYCAT_APP_DOMAIN}`),
+  reachable from a device logged into the Lazycat client via the `public_path`
+  whitelist. The internal `.lzcapp` address is app-to-app only and never
+  resolves on an external device.
 - Runtime: Cumora Web/API, PostgreSQL, Redis and local uploads in the LPK;
   Codex or Claude Code runs on a user-managed LightOS computer.
 
@@ -20,7 +23,9 @@
 - PostgreSQL, Redis and Cumora have health checks.
 - PostgreSQL 17 with pgvector is pinned by OCI digest and fully embedded in
   the LPK, so semantic memory does not degrade or require a runtime pull.
-- Pairing and reconnect commands use the app-private `.lzcapp` endpoint.
+- Pairing and reconnect commands use the public HTTPS origin so an external
+  BYOA daemon can reach the app through `public_path`; the internal `.lzcapp`
+  endpoint is only used when the daemon runs on the same LightOS box.
 - The official Lazycat file chooser bridge covers browser file inputs.
 
 ## Verified candidate

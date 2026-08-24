@@ -2,7 +2,7 @@ import express from 'express'
 import compression from 'compression'
 import http from 'node:http'
 import { mkdir } from 'node:fs/promises'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { env } from './env.js'
 import { ensureSchemaWithBootRetry } from './db/migrate.js'
@@ -193,12 +193,28 @@ async function main() {
         }
       },
     }))
+    // On Lazycat the server knows the app's public HTTPS origin
+    // (CUMORA_PUBLIC_ORIGIN=https://${LAZYCAT_APP_DOMAIN}). Inject it into the
+    // served HTML so the SPA can build a pairing command the external BYOA
+    // daemon can actually reach — the internal `.lzcapp` service address is
+    // app-to-app only and never resolves on a device logged into the Lazycat
+    // client. We read + rewrite once and cache the injected HTML.
+    let spaHtml: string | null = null
     // SPA fallback — any GET that isn't an API / runtime / uploads / ws path
     // returns index.html so client-side routes like /invite/<token> work on
     // first load + on refresh. POST/PUT/DELETE never fall through to here.
     app.get(/^(?!\/(api|runtime|uploads|ws)(\/|$)).*/, (_req, res) => {
       res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate')
-      res.sendFile(INDEX_HTML)
+      if (spaHtml == null) {
+        const raw = readFileSync(INDEX_HTML, 'utf8')
+        const inject = env.LAZYCAT_AUTH_ENABLED
+          ? `<script>window.__CUMORA_PUBLIC_ORIGIN=${JSON.stringify(env.PUBLIC_ORIGIN)};</script>`
+          : ''
+        spaHtml = inject
+          ? raw.replace(/<\/head>/i, `${inject}</head>`)
+          : raw
+      }
+      res.type('html').send(spaHtml)
     })
     console.log(`[boot] serving SPA from ${DIST_DIR}`)
   } else {

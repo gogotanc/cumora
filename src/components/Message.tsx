@@ -29,6 +29,17 @@ import { useCalendar } from '@/stores/calendar'
 import { PollBubble } from './PollBubble'
 import { LinkPreview, firstUrlInBody } from './LinkPreview'
 import { useT } from '@/lib/i18n'
+import { downloadFile, hasLazycatFileChooser } from '@/lib/download'
+
+/** Handle a download anchor click. In Lazycat the file interceptor only sees
+ *  `blob:` anchors triggered programmatically, so convert the server URL to a
+ *  blob before letting the inject pick it up; everywhere else keep the native
+ *  anchor behaviour (middle-click / open-in-new-tab still works). */
+function onClickDownload(e: React.MouseEvent, url: string, name: string): void {
+  if (!hasLazycatFileChooser()) return
+  e.preventDefault()
+  void downloadFile(url, name)
+}
 
 function MentionChip({ id }: { id: string }) {
   const t = useT()
@@ -1043,6 +1054,7 @@ function AttachmentCard({ msg }: { msg: Message }) {
       download={a.name}
       target="_blank"
       rel="noopener noreferrer"
+      onClick={(e) => onClickDownload(e, a.url!, a.name)}
       className="mt-2 max-w-[min(100%,380px)] grid grid-cols-[56px_1fr] gap-2.5 p-2.5 bg-cloud border border-ink-100 rounded-[11px] items-center cursor-pointer hover:shadow-soft hover:border-sky2-200 transition no-underline"
     >
       {inner}
@@ -1243,6 +1255,7 @@ function EmailAttachmentRow({ att }: { att: NonNullable<NonNullable<Message['ema
           target="_blank"
           rel="noreferrer noopener"
           download={att.filename}
+          onClick={(e) => onClickDownload(e, att.url!, att.filename)}
           className="shrink-0 text-[11.5px] font-semibold text-skype-deep hover:underline"
         >
           download
