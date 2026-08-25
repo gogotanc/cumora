@@ -1,5 +1,5 @@
 package: cloud.lazycat.app.cumora
-version: 0.1.4
+version: 0.1.5
 name: Cumora
 description: Self-hosted agent collaboration workbench powered by a LightOS BYOA runtime
 author: tanc
