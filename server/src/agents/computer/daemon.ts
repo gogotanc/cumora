@@ -2,8 +2,8 @@
  * `cumora agent computer` — the BYOA daemon.
  *
  * A long-running process on the user's machine (laptop or VPS) that hosts one
- * or more of their Cumora agents, using a local engine (Claude Code / Codex /
- * Grok Build / Cursor Agent) as each agent's brain. See docs/BYOA.md.
+ * or more of their Cumora agents, using a local engine (Claude Code / Codex / pi /
+ * Grok Build / Cursor Agent / OpenCode) as each agent's brain. See docs/BYOA.md.
  *
  * It talks to the Cumora server only over HTTP — no DB/Redis — so it can run
  * anywhere:
@@ -21,13 +21,13 @@ import { createHash } from 'node:crypto'
 import { mkdir, writeFile, readFile, chmod, rm, stat, copyFile, truncate } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { homedir, hostname } from 'node:os'
-import { join, dirname } from 'node:path'
+import { delimiter, join, dirname } from 'node:path'
 import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 
 const execFileP = promisify(execFile)
 import { parseSseStream, wakeStreamWasStable } from '../runtime/sse-parse.js'
-import { detectEngines, getAdapter, ENGINE_IDS, runEngineDoctor, type EngineId, type EngineSession, type EngineRunResult, type EngineUsage, type EngineHopReport } from './engine.js'
+import { detectEnginesWithStatus, snapshotDetectedEngines, getAdapter, ENGINE_IDS, runEngineDoctor, type EngineId, type EngineSession, type EngineRunResult, type EngineUsage, type EngineHopReport } from './engine.js'
 import { usageFromClaude, type TokenUsage } from '../cost.js'
 import { parseTriage, finalizeTriage, isRateLimited } from '../triage-core.js'
 import { GLANCE_YIELD_RULES } from '../glance-protocol.js'
@@ -59,6 +59,11 @@ const DEFAULT_SERVER = process.env.CUMORA_SERVER_URL || 'https://api.cumora.ai'
 const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000 // refresh 5min before expiry
 const AGENT_POLL_MS = 60_000
 const HEARTBEAT_MS = 30_000
+// How often the daemon re-scans PATH for installed engines. Deliberately much
+// slower than the heartbeat: detection spawns a `which`/`where` per engine, and
+// nobody installs a CLI twice a minute. The heartbeat carries the CACHED result,
+// so the report costs nothing on the 30s tick.
+const ENGINE_RESCAN_MS = 5 * 60 * 1000
 // While an engine turn is in flight, bump the run's updated_at this often so the
 // server's 10-min stale-run sweeper doesn't false-positive a legitimately long
 // turn (a multi-hour Bash, a deep task) as "orphaned". 60s = 10× margin under the
@@ -292,6 +297,11 @@ const SERVICE_LABEL = 'io.cumora.daemon'
  *  exit will be auto-restarted on `cumora@latest` — only then do we self-exit
  *  to apply an update. A manually-run daemon just logs the available version. */
 const SUPERVISED = process.env.CUMORA_SUPERVISED === '1'
+
+export function windowsTaskName(home = homedir()): string {
+  const userKey = createHash('sha256').update(home.toLowerCase()).digest('hex').slice(0, 12)
+  return `Cumora BYOA Daemon (${userKey})`
+}
 
 /** semver-ish a > b for plain MAJOR.MINOR.PATCH (ignores pre-release tags). */
 function versionGt(a: string, b: string): boolean {
@@ -622,6 +632,12 @@ function authFailureHint(engine: EngineId, detail: string): string {
   if (engine === 'cursor') {
     return 'Open a terminal on that computer and run `cursor-agent login` (or fix its quota / API key), then wake the agent again.'
   }
+  if (engine === 'opencode') {
+    return 'Open a terminal on that computer and run `opencode providers login` (or fix the selected provider/model quota), then wake the agent again.'
+  }
+  if (engine === 'pi') {
+    return 'Open pi on that computer and run `/login` for its provider (or fix the API key / quota), then wake the agent again.'
+  }
   return 'Open Codex on that computer and refresh its login or quota, then wake the agent again.'
 }
 
@@ -634,6 +650,8 @@ function missingEngineMessage(): string {
     '  - Codex: install the `codex` CLI, then run `codex` once to sign in',
     '  - Grok Build: install the `grok` CLI, then run `grok login` once',
     '  - Cursor Agent: install Cursor (the `cursor-agent` CLI ships with it), then run `cursor-agent login`',
+    '  - OpenCode: install the `opencode` CLI, then run `opencode providers login` once',
+    '  - pi: `npm install -g --ignore-scripts @earendil-works/pi-coding-agent`, then run `pi` once and `/login` a provider',
     '',
     'After that, rerun:',
     '  npx cumora@latest agent computer --pair <code>',
@@ -645,7 +663,7 @@ function helpText(): string {
     'cumora agent computer — run your Cumora agents on THIS machine (BYOA)',
     '',
     'The daemon talks to a Cumora server over HTTP and drives a local agent',
-    'engine (Claude Code, Codex, Grok Build, or Cursor Agent). Pair once, then it runs in the background.',
+    'engine (Claude Code, Codex, Grok Build, Cursor Agent, OpenCode, or pi). Pair once, then it runs in the background.',
     '',
     'Usage:',
     '  npx cumora@latest agent computer --pair <code> [--server <url>] [--engine <id>]',
@@ -675,9 +693,32 @@ function helpText(): string {
 }
 
 async function requireLocalEngine(): Promise<EngineId[]> {
-  const engines = await detectEngines()
-  if (engines.length === 0) throw new Error(missingEngineMessage())
-  return engines
+  const detected = await detectEnginesWithStatus()
+  if (!detected.reliable) {
+    throw new Error('could not scan PATH (`which` / `where` failed). Fix that, then retry pairing.')
+  }
+  if (detected.engines.length === 0) throw new Error(missingEngineMessage())
+  return detected.engines
+}
+
+/** Resolve the engine a daemon can actually run from its LIVE PATH inventory. */
+export function resolveAvailableEngine(
+  requested: EngineId | null | undefined,
+  available: readonly EngineId[],
+): EngineId | null {
+  return requested && available.includes(requested) ? requested : (available[0] ?? null)
+}
+
+export interface EngineInventory {
+  current: EngineId[]
+}
+
+/** Replace the shared engine inventory after a trustworthy PATH scan. */
+export function replaceEngineInventory(inventory: EngineInventory, next: readonly EngineId[]): boolean {
+  const current = inventory.current
+  const changed = next.length !== current.length || next.some((engine, i) => engine !== current[i])
+  if (changed) inventory.current = [...next]
+  return changed
 }
 
 // ─── config ─────────────────────────────────────────────────────────────
@@ -764,11 +805,26 @@ export const CUMORA_SHIM = `#!/usr/bin/env node
 })().catch((e) => { console.error('cumora:', (e && e.message) || e); process.exit(70) })
 `
 
-async function writeShim(binDir: string): Promise<void> {
+/** PowerShell only resolves files on PATH through PATHEXT, so the extensionless
+ *  POSIX shim needs a .cmd launcher on Windows. Keep the Node program itself in
+ *  one file so both launchers exercise the exact same argument/HTTP path. */
+export const CUMORA_WINDOWS_SHIM = '@echo off\r\nnode "%~dp0cumora" %*\r\n'
+
+export function prependAgentBinToPath(binDir: string, currentPath = process.env.PATH ?? ''): string {
+  return currentPath ? `${binDir}${delimiter}${currentPath}` : binDir
+}
+
+export async function writeShim(
+  binDir: string,
+  platform: NodeJS.Platform = process.platform,
+): Promise<void> {
   await mkdir(binDir, { recursive: true })
   const shim = join(binDir, 'cumora')
   await writeFile(shim, CUMORA_SHIM, 'utf8')
   await chmod(shim, 0o755)
+  if (platform === 'win32') {
+    await writeFile(join(binDir, 'cumora.cmd'), CUMORA_WINDOWS_SHIM, 'utf8')
+  }
 }
 
 // ─── pairing ────────────────────────────────────────────────────────────
@@ -809,9 +865,13 @@ async function doPair(code: string, serverUrl: string, preferredEngine?: string)
     }
     engines = [preferredEngine as EngineId, ...detected.filter((e) => e !== preferredEngine)]
   }
+  const snapshot = await snapshotDetectedEngines(engines)
   const paired = await api<{ computerId: string; deviceToken: string }>(
     serverUrl, '/api/computers/pair',
-    { method: 'POST', body: JSON.stringify({ code, hostName: await detectHostName(), engines, version: CURRENT_VERSION, supervised: SUPERVISED }) },
+    { method: 'POST', body: JSON.stringify({
+      code, hostName: await detectHostName(), engines, detected: snapshot,
+      version: CURRENT_VERSION, supervised: SUPERVISED,
+    }) },
   )
   await saveConfig({ serverUrl, computerId: paired.computerId, deviceToken: paired.deviceToken })
   console.log(`[computer] paired as ${paired.computerId} (default engine: ${engines[0] ?? 'none'}; available: ${engines.join(', ') || 'none'}) — starting…`)
@@ -920,19 +980,10 @@ const ENGINE_MODEL_LOCAL = 'local'
 
 /** The model the LOCAL engine should run this agent's turns on.
  *
- *  Cumora pins a model per agent (participants.model, else the deploy-level
- *  CUMORA_DEFAULT_* default) so a CLI upgrade can't silently change behaviour.
- *  That pin is an Anthropic/OpenAI model id — which is simply wrong for a BYOA
- *  operator whose `claude` points at a custom provider (CC Switch and friends):
- *  the provider has never heard of e.g. `claude-opus-4-7`, so EVERY turn dies
- *  with "There's an issue with the selected model". The pin is resolved
- *  server-side, so on hosted Cumora the operator cannot change it, and their
- *  only escape was CUMORA_CLAUDE_ARGS — which also disables the persistent
- *  session and makes them hand-write the entire flag set.
- *
- *  CUMORA_ENGINE_MODEL overrides the pin daemon-side. The value `local` passes
- *  NO model at all, so the CLI runs on whatever it is already configured for —
- *  the same escape CUMORA_TRIAGE_MODEL already gives the small brain.
+ *  BYOA wakes omit `--model` by default so the machine's CLI uses its own
+ *  config (Claude `settings.json`, Codex `config.toml`, …). The daemon
+ *  discovery list leaves `agent.model` unset; `CUMORA_ENGINE_MODEL=local`
+ *  is the same no-pin path. A concrete `CUMORA_ENGINE_MODEL` still overrides.
  *
  *  Exported for tests. */
 export function resolveEngineModel(
@@ -1042,16 +1093,15 @@ class AgentRunner {
     return this.hopReporter
   }
 
-  /** Map an engine's raw EngineUsage → universal TokenUsage. Both Claude and
-   *  Codex (which adapters their codex.totals into Claude-shaped fields, see
-   *  CodexSession.turnUsage) report via the EngineUsage interface, so a single
-   *  shape covers both. */
+  /** Map every adapter's raw EngineUsage → universal TokenUsage. Adapters
+   *  normalize their native counters into this Claude-shaped interface, so a
+   *  single ledger path covers every BYOA engine. */
   private hopUsageOf(u: EngineUsage): TokenUsage {
     return usageFromClaude(u as unknown as Record<string, unknown>)
   }
 
-  /** Called by ClaudeSession / CodexSession for every assistant hop (Claude)
-   *  or every turn-completed (Codex). Pushes one PendingHop into the batched
+  /** Called by engine sessions/stream trackers for every provider hop. Pushes
+   *  one PendingHop into the batched
    *  reporter; never throws. The engine's optional enrichment hints
    *  (hopIndex/toolUses/textChars) ride along in `extras` — these are exactly
    *  the columns the operator needs to ANSWER "why was this hop expensive?"
@@ -1231,7 +1281,7 @@ class AgentRunner {
   private engineEnv(): NodeJS.ProcessEnv {
     return {
       ...process.env,
-      PATH: `${this.binDir}:${process.env.PATH ?? ''}`,
+      PATH: prependAgentBinToPath(this.binDir),
       CUMORA_AGENT_RUNTIME_URL: `${this.cfg.serverUrl}/runtime`,
       CUMORA_AGENT_RUNTIME_TOKEN: this.token,
       // A long-lived engine reads the FRESH token from this file (the env token
@@ -1243,8 +1293,8 @@ class AgentRunner {
 
   /** The long-lived engine process for this agent (persistent stream-json),
    *  created lazily and reused across wakes so turns 2..N skip the cold start.
-   *  Returns null if the engine has no persistent mode (Cursor, Codex fallback,
-   *  or a custom args override) — the caller then uses one-shot run(). If the
+   *  Returns null if the engine has no persistent mode (Cursor/OpenCode, Codex
+   *  fallback, or custom args) — the caller then uses one-shot run(). If the
    *  prior process has died it respawns, resuming this.sessionId so context
    *  carries across the restart. */
   private ensureEngineSession(): EngineSession | null {
@@ -1435,7 +1485,8 @@ class AgentRunner {
       const verdict = finalizeTriage(parsed, 'support-model-local')
       // Record the gate's cache-aware cost (fire-and-forget). A BYOA triage runs
       // LOCAL + cold-session — its input is uncached, the cost this ledger exists
-      // to weigh. usage is present for Claude and Cursor; absent for Codex/Grok.
+      // to weigh. usage is present for Claude, Cursor, and OpenCode; absent for
+      // the current Codex/Grok one-shot classifiers.
       void this.recordTriageUsage(token, verdict.actionable, verdict.reason, res.usage, res.model)
       return verdict
     }
@@ -1457,14 +1508,16 @@ class AgentRunner {
     }
   }
 
-  /** Triage model id for pricing, honoring CUMORA_TRIAGE_MODEL. Cursor has
-   *  no fixed cheap alias, so its reported stream model wins; the agent model
-   *  is only a fallback when the stream does not name one. */
+  /** Triage model id for pricing, honoring CUMORA_TRIAGE_MODEL. Cursor,
+   *  OpenCode and pi have no universal cheap alias, so a reported/pinned stream
+   *  model wins and the agent model is only a fallback. */
   private triageModel(): string {
     if (process.env.CUMORA_TRIAGE_MODEL) return process.env.CUMORA_TRIAGE_MODEL
     if (this.adapter.id === 'claude') return 'haiku'
     if (this.adapter.id === 'grok') return 'grok-4.5'
     if (this.adapter.id === 'codex') return 'gpt-5.4-mini'
+    if (this.adapter.id === 'opencode') return this.agent.model ?? '<opencode-default>'
+    if (this.adapter.id === 'pi') return this.agent.model ?? '<pi-default>'
     return this.agent.model ?? '<cursor-default>'
   }
 
@@ -2147,7 +2200,7 @@ class AgentRunner {
             // (with --resume this.sessionId to carry context across the restart).
             if (!session.alive) this.engineSession = null
           } else {
-            // One-shot path: Cursor, Codex fallback, or a custom args override.
+            // One-shot path: Cursor/OpenCode, Codex fallback, or a custom args override.
             result = await this.adapter.run({
               home: this.home,
               prompt,
@@ -2379,21 +2432,26 @@ async function doRun(serverOverride?: string): Promise<void> {
     return
   }
   if (serverOverride) cfg.serverUrl = serverOverride
-  let available: EngineId[]
+  let initialEngines: EngineId[]
   try {
-    available = await requireLocalEngine()
+    initialEngines = await requireLocalEngine()
   } catch (err) {
     console.error(`[computer] ${err instanceof Error ? err.message : String(err)}`)
     process.exitCode = 70
     return
   }
-  console.log(`[computer] cumora ${CURRENT_VERSION} · starting ${cfg.computerId} @ ${cfg.serverUrl} (engines: ${available.join(', ')})`)
+  const engineInventory: EngineInventory = { current: initialEngines }
+  console.log(`[computer] cumora ${CURRENT_VERSION} · starting ${cfg.computerId} @ ${cfg.serverUrl} (engines: ${engineInventory.current.join(', ')})`)
   // Record what THIS process is running, keyed by pid, so `--status` can report
   // the version of the live service instance reliably (cross-checked against the
   // running pid — survives log rotation, no log-scraping).
+  const windowsShutdownRequest = process.platform === 'win32'
+    ? windowsShutdownRequestPath(process.pid)
+    : null
+  if (windowsShutdownRequest) await rm(windowsShutdownRequest, { force: true }).catch(() => {})
   await writeRunningState()
   if (!SUPERVISED) {
-    console.log(`[computer] 💡 tip: run \`npx cumora@latest agent computer --install-service\` to keep this running in the background — auto-start on boot, auto-restart on crash, and auto-update. (This terminal must stay open otherwise.)`)
+    console.log(`[computer] 💡 tip: run \`npx cumora@latest agent computer --install-service\` to keep this running in the background — auto-start when you sign in, auto-restart on crash, and auto-update. (This terminal must stay open otherwise.)`)
   }
 
   const runners = new Map<string, AgentRunner>()
@@ -2408,10 +2466,21 @@ async function doRun(serverOverride?: string): Promise<void> {
       console.warn('[computer] agent sync failed:', err instanceof Error ? err.message : err)
       return
     }
+    const available = engineInventory.current
     for (const agent of agents) {
-      const engine: EngineId | null =
-        agent.engine && available.includes(agent.engine) ? agent.engine : (available[0] ?? null)
-      if (!engine) continue
+      const engine = resolveAvailableEngine(agent.engine, available)
+      if (!engine) {
+        // A successful rescan may legitimately find that the last installed CLI
+        // was removed. Stop an existing runner instead of leaving it alive on an
+        // engine this machine no longer has.
+        const existing = runners.get(agent.id)
+        if (existing) {
+          console.log(`[computer] no installed engine remains for ${agent.name} (${agent.id}) → stopping runner`)
+          existing.stop()
+          runners.delete(agent.id)
+        }
+        continue
+      }
       const existing = runners.get(agent.id)
       if (existing) {
         if (existing.configMatches(agent, engine)) continue
@@ -2433,6 +2502,37 @@ async function doRun(serverOverride?: string): Promise<void> {
     }
   }
 
+  // Engines this machine can currently run, re-scanned on a slow timer. Reported
+  // on every heartbeat so installing another supported CLI takes effect without
+  // re-pairing — the daemon is already online and can see PATH itself, so there
+  // is no reason to make the user mint a new pairing token for it.
+  const rescanEngines = async (): Promise<void> => {
+    try {
+      const detected = await detectEnginesWithStatus()
+      if (!detected.reliable) return  // broken `which` / `where` — keep the last good list
+      const next = detected.engines
+      const previous = engineInventory.current
+      const changed = replaceEngineInventory(engineInventory, next)
+      if (changed) {
+        console.log(`[computer] engines on PATH changed: ${previous.join(', ') || 'none'} → ${next.join(', ') || 'none'}`)
+        // Heartbeat already advertises the live inventory. This snapshot is
+        // only the PATH display the app reads — pairable engines, never the
+        // detect-only bins Electron lists on the Me page.
+        const snapshot = await snapshotDetectedEngines(next)
+        await api(cfg.serverUrl, '/api/computers/me/engines', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${cfg.deviceToken}` },
+          body: JSON.stringify({ engines: next, detected: snapshot }),
+        }).catch((err) => {
+          console.warn('[computer] engine snapshot report failed', err instanceof Error ? err.message : err)
+        })
+      }
+      // This is the same live inventory sync() uses to choose an agent's
+      // adapter. Updating only a heartbeat cache would advertise a newly
+      // installed engine while silently running that agent on the old default.
+    } catch { /* transient — the next tick retries */ }
+  }
+
   const heartbeat = async (): Promise<void> => {
     try {
       await fetch(`${cfg.serverUrl}/api/computers/heartbeat`, {
@@ -2444,7 +2544,7 @@ async function doRun(serverOverride?: string): Promise<void> {
         // `supervised` tells the server HOW this daemon runs (service vs. a
         // foreground command), so the app's upgrade banner can show the right
         // update instructions for this machine.
-        body: JSON.stringify({ version: CURRENT_VERSION, supervised: SUPERVISED }),
+        body: JSON.stringify({ version: CURRENT_VERSION, supervised: SUPERVISED, engines: engineInventory.current }),
       })
     } catch { /* transient — next tick retries */ }
   }
@@ -2456,6 +2556,8 @@ async function doRun(serverOverride?: string): Promise<void> {
   }
   const poll = setInterval(() => { void sync() }, AGENT_POLL_MS)
   const beat = setInterval(() => { void heartbeat() }, HEARTBEAT_MS)
+  const rescan = setInterval(() => { void rescanEngines() }, ENGINE_RESCAN_MS)
+  rescan.unref?.()
   // Keep the service log from filling the disk: rotate at boot, then periodically.
   void rotateLogsIfNeeded()
   const logrot = setInterval(() => { void rotateLogsIfNeeded() }, LOG_ROTATE_MS)
@@ -2463,6 +2565,7 @@ async function doRun(serverOverride?: string): Promise<void> {
 
   let upd: ReturnType<typeof setInterval> | undefined
   let idleWatch: ReturnType<typeof setInterval> | undefined
+  let controlWatch: ReturnType<typeof setInterval> | undefined
   let shuttingDown = false
   const anyBusy = (): boolean => [...runners.values()].some((r) => r.isBusy)
 
@@ -2473,9 +2576,11 @@ async function doRun(serverOverride?: string): Promise<void> {
   const shutdown = async (why: string): Promise<void> => {
     if (shuttingDown) return
     shuttingDown = true
-    clearInterval(poll); clearInterval(beat); clearInterval(logrot)
+    clearInterval(poll); clearInterval(beat); clearInterval(logrot); clearInterval(rescan)
     if (upd) clearInterval(upd)
     if (idleWatch) clearInterval(idleWatch)
+    if (controlWatch) clearInterval(controlWatch)
+    if (windowsShutdownRequest) await rm(windowsShutdownRequest, { force: true }).catch(() => {})
     for (const runner of runners.values()) runner.beginStop() // no new turns; leave in-flight running
     const deadline = Date.now() + SHUTDOWN_GRACE_MS
     if (anyBusy()) console.log(`[computer] ${why}: waiting up to ${Math.round(SHUTDOWN_GRACE_MS / 1000)}s for in-flight turn(s) to finish…`)
@@ -2486,6 +2591,12 @@ async function doRun(serverOverride?: string): Promise<void> {
   }
   process.on('SIGINT', () => { void shutdown('SIGINT') })
   process.on('SIGTERM', () => { void shutdown('SIGTERM') })
+  if (windowsShutdownRequest) {
+    controlWatch = setInterval(() => {
+      if (existsSync(windowsShutdownRequest)) void shutdown('service control')
+    }, 250)
+    controlWatch.unref?.()
+  }
 
   // Self-update: compare to npm's latest periodically. When supervised
   // (--install-service), a clean exit relaunches the service on cumora@latest =
@@ -2534,15 +2645,95 @@ async function checkForUpdate(onSupervisedUpdate: () => void): Promise<void> {
 
 /** Absolute path to npx next to the node that's running us, so the supervisor
  *  doesn't depend on its (minimal) PATH resolving `npx`. Falls back to PATH. */
-function resolveNpx(): string {
-  const sibling = join(dirname(process.execPath), 'npx')
-  return existsSync(sibling) ? sibling : 'npx'
+export function resolveNpx(
+  platform: NodeJS.Platform = process.platform,
+  execPath = process.execPath,
+): string {
+  const executable = platform === 'win32' ? 'npx.cmd' : 'npx'
+  const sibling = join(dirname(execPath), executable)
+  return existsSync(sibling) ? sibling : executable
+}
+
+function windowsSupervisorPath(): string {
+  return join(CONFIG_DIR, 'daemon-supervisor.ps1')
+}
+
+function windowsSupervisorDisabledPath(): string {
+  return join(CONFIG_DIR, 'daemon-supervisor.disabled')
+}
+
+function windowsShutdownRequestPath(pid: number): string {
+  return join(CONFIG_DIR, `shutdown-${pid}.request`)
+}
+
+function quotePowerShell(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`
+}
+
+/** The scheduled task starts this watchdog at login. It deliberately restarts
+ *  after every daemon exit, including the clean exit used to apply an update. */
+export function renderWindowsSupervisor(
+  npx: string,
+  serverUrl: string,
+  logPath: string,
+  disabledPath = windowsSupervisorDisabledPath(),
+  path = process.env.PATH ?? '',
+): string {
+  return [
+    "$ErrorActionPreference = 'Continue'",
+    "$env:CUMORA_SUPERVISED = '1'",
+    `$env:PATH = ${quotePowerShell(path)}`,
+    '$utf8 = New-Object System.Text.UTF8Encoding($false)',
+    `while (-not (Test-Path -LiteralPath ${quotePowerShell(disabledPath)})) {`,
+    `  & ${quotePowerShell(npx)} -y cumora@latest agent computer --server ${quotePowerShell(serverUrl)} 2>&1 | ForEach-Object {`,
+    `    [System.IO.File]::AppendAllText(${quotePowerShell(logPath)}, ([string]$_ + [Environment]::NewLine), $utf8)`,
+    '  }',
+    '  Start-Sleep -Seconds 5',
+    '}',
+    '',
+  ].join('\r\n')
+}
+
+export function windowsScheduledTaskCommand(scriptPath: string): string {
+  return `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "${scriptPath.replaceAll('"', '""')}"`
+}
+
+export function windowsScheduledTaskCreateArgs(
+  scriptPath: string,
+  taskName = windowsTaskName(),
+): string[] {
+  return [
+    '/Create', '/TN', taskName,
+    '/TR', windowsScheduledTaskCommand(scriptPath),
+    '/SC', 'ONLOGON', '/RL', 'LIMITED', '/IT', '/F',
+  ]
+}
+
+export function windowsScheduledTaskSettingsCommand(taskName = windowsTaskName()): string {
+  return `$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable; Set-ScheduledTask -TaskName ${quotePowerShell(taskName)} -Settings $settings | Out-Null`
+}
+
+export function windowsScheduledTaskQueryCommand(taskName = windowsTaskName()): string {
+  return `try { Get-ScheduledTask -TaskName ${quotePowerShell(taskName)} -ErrorAction Stop | Out-Null; exit 0 } catch { if ($_.FullyQualifiedErrorId -like 'CmdletizationQuery_NotFound_TaskName,*') { exit 3 }; Write-Error $_; exit 1 }`
+}
+
+async function isWindowsTaskInstalled(taskName = windowsTaskName()): Promise<boolean> {
+  try {
+    await execFileP('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-Command', windowsScheduledTaskQueryCommand(taskName),
+    ])
+    return true
+  } catch (err) {
+    if (String((err as { code?: number | string }).code) === '3') return false
+    throw err
+  }
 }
 
 /** Install a per-user supervisor (LaunchAgent on macOS, systemd --user on
- *  Linux) that runs `npx -y cumora@latest agent computer --server <url>` with
- *  auto-restart + run-at-boot. `@latest` + restart-on-update is what makes the
- *  daemon self-update (see checkForUpdate). Must be paired first. */
+ *  Linux, Task Scheduler on Windows) that runs
+ *  `npx -y cumora@latest agent computer --server <url>` with auto-restart +
+ *  start-at-login. `@latest` + restart-on-update is what makes the daemon
+ *  self-update (see checkForUpdate). Must be paired first. */
 async function installService(serverUrl: string): Promise<void> {
   if (!(await loadConfig())) {
     throw new Error('pair this computer first: cumora agent computer --pair <code>')
@@ -2604,7 +2795,48 @@ WantedBy=default.target
     return
   }
 
-  throw new Error(`--install-service supports macOS and Linux (not ${process.platform})`)
+  if (process.platform === 'win32') {
+    const scriptPath = windowsSupervisorPath()
+    const disabledPath = windowsSupervisorDisabledPath()
+    const taskName = windowsTaskName()
+    const replacing = await isWindowsTaskInstalled(taskName)
+    await writeFile(scriptPath, renderWindowsSupervisor(npx, serverUrl, logPath, disabledPath), 'utf8')
+    try {
+      if (!replacing) {
+        await execFileP('schtasks.exe', windowsScheduledTaskCreateArgs(scriptPath, taskName))
+      }
+      await execFileP('powershell.exe', [
+        '-NoProfile', '-NonInteractive', '-Command', windowsScheduledTaskSettingsCommand(taskName),
+      ])
+    } catch (err) {
+      if (!replacing) {
+        try {
+          await execFileP('schtasks.exe', ['/Delete', '/TN', taskName, '/F'])
+        } catch (rollbackErr) {
+          throw new Error(`scheduled task setup failed and rollback could not delete '${taskName}'; the watchdog script was kept in place (${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)})`, { cause: err })
+        }
+        await rm(scriptPath, { force: true }).catch(() => {})
+      }
+      throw err
+    }
+    await writeFile(disabledPath, '', 'utf8')
+    await killRunningDaemons()
+    await stopWindowsWatchdog(taskName)
+    // The old watchdog could have spawned a daemon between the first process
+    // sweep and its own exit. Sweep once more only after it cannot relaunch one.
+    await killRunningDaemons()
+    await rm(disabledPath, { force: true })
+    try {
+      await execFileP('schtasks.exe', ['/Run', '/TN', taskName])
+    } catch (err) {
+      throw new Error(`scheduled task installed but could not be started; retry with --restart (${err instanceof Error ? err.message : String(err)})`)
+    }
+    console.log(`[computer] installed scheduled task '${taskName}' — start-at-login, auto-restart, auto-update. Logs: ${logPath}`)
+    console.log(`[computer] you can now close this terminal; the task is running in the background.`)
+    return
+  }
+
+  throw new Error(`--install-service is not supported on ${process.platform}`)
 }
 
 async function uninstallService(): Promise<void> {
@@ -2622,7 +2854,28 @@ async function uninstallService(): Promise<void> {
     console.log(`[computer] removed systemd --user service 'cumora'`)
     return
   }
-  throw new Error(`--uninstall-service supports macOS and Linux (not ${process.platform})`)
+  if (process.platform === 'win32') {
+    const taskName = windowsTaskName()
+    const disabledPath = windowsSupervisorDisabledPath()
+    await mkdir(CONFIG_DIR, { recursive: true })
+    await writeFile(disabledPath, '', 'utf8')
+    if (await isWindowsTaskInstalled(taskName)) {
+      await execFileP('schtasks.exe', ['/Delete', '/TN', taskName, '/F'])
+    }
+    await killRunningDaemons()
+    await stopWindowsWatchdog(taskName)
+    await killRunningDaemons()
+    if (await isWindowsTaskInstalled(taskName)) {
+      throw new Error(`scheduled task '${taskName}' still exists after deletion`)
+    }
+    await rm(windowsSupervisorPath(), { force: true })
+    // Keep this sentinel on every failed stop path so a surviving watchdog
+    // cannot revive a daemon after the command has reported an error.
+    await rm(disabledPath, { force: true })
+    console.log(`[computer] removed scheduled task '${taskName}'`)
+    return
+  }
+  throw new Error(`--uninstall-service is not supported on ${process.platform}`)
 }
 
 function darwinPlistPath(): string {
@@ -2633,9 +2886,10 @@ function linuxUnitPath(): string {
 }
 
 /** Is the background supervisor already installed on this machine? */
-function isServiceInstalled(): boolean {
+async function isServiceInstalled(): Promise<boolean> {
   if (process.platform === 'darwin') return existsSync(darwinPlistPath())
   if (process.platform === 'linux') return existsSync(linuxUnitPath())
+  if (process.platform === 'win32') return isWindowsTaskInstalled()
   return false
 }
 
@@ -2651,6 +2905,18 @@ async function reloadService(): Promise<void> {
   }
   if (process.platform === 'linux') {
     await execFileP('systemctl', ['--user', 'restart', 'cumora'])
+    return
+  }
+  if (process.platform === 'win32') {
+    const taskName = windowsTaskName()
+    const disabledPath = windowsSupervisorDisabledPath()
+    await mkdir(CONFIG_DIR, { recursive: true })
+    await writeFile(disabledPath, '', 'utf8')
+    await killRunningDaemons()
+    await stopWindowsWatchdog(taskName)
+    await killRunningDaemons()
+    await rm(disabledPath, { force: true })
+    await execFileP('schtasks.exe', ['/Run', '/TN', taskName])
   }
 }
 
@@ -2658,7 +2924,7 @@ async function reloadService(): Promise<void> {
  *  `launchctl kickstart …`. Restarts the installed service (which relaunches on
  *  cumora@latest, so it's also the "apply the update now" button). */
 async function restartService(): Promise<void> {
-  if (!isServiceInstalled()) {
+  if (!(await isServiceInstalled())) {
     console.log('[computer] service not installed — run: npx cumora@latest agent computer --install-service')
     return
   }
@@ -2671,8 +2937,10 @@ async function restartService(): Promise<void> {
     }
   } else if (process.platform === 'linux') {
     await execFileP('systemctl', ['--user', 'restart', 'cumora'])
+  } else if (process.platform === 'win32') {
+    await reloadService()
   } else {
-    throw new Error(`--restart supports macOS and Linux (not ${process.platform})`)
+    throw new Error(`--restart is not supported on ${process.platform}`)
   }
   console.log('[computer] service restarted — it relaunches on cumora@latest (also applies any pending update). Check: npx cumora@latest agent computer --status')
 }
@@ -2701,19 +2969,93 @@ export function isStoppableDaemonCommand(cmd: string): boolean {
   return /agent computer/.test(cmd) && !ONE_SHOT_FLAG_RE.test(cmd)
 }
 
-/** Kill any RUNNING daemon process — the supervised one (after the service is
+async function commandLineForPid(pid: number): Promise<string> {
+  if (process.platform === 'win32') {
+    const command = `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}" -ErrorAction SilentlyContinue).CommandLine`
+    return (await execFileP('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command])).stdout.trim()
+  }
+  return (await execFileP('ps', ['-p', String(pid), '-o', 'command='])).stdout.trim()
+}
+
+interface WindowsProcessInfo {
+  ProcessId: number
+  CommandLine: string
+  Name?: string
+}
+
+export function parseWindowsProcessList(output: string): WindowsProcessInfo[] {
+  if (!output.trim()) return []
+  const parsed = JSON.parse(output) as WindowsProcessInfo | WindowsProcessInfo[]
+  return (Array.isArray(parsed) ? parsed : [parsed]).filter((item) =>
+    Number.isInteger(item?.ProcessId) && item.ProcessId > 0 && typeof item.CommandLine === 'string')
+}
+
+async function windowsDaemonProcesses(): Promise<WindowsProcessInfo[]> {
+  const command = [
+    '$OutputEncoding = [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)',
+    `@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.CommandLine -match 'agent\\s+computer' } | Select-Object ProcessId, CommandLine) | ConvertTo-Json -Compress`,
+  ].join('; ')
+  const { stdout } = await execFileP('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command])
+  return parseWindowsProcessList(stdout)
+}
+
+async function windowsSupervisorProcesses(): Promise<WindowsProcessInfo[]> {
+  const command = [
+    '$OutputEncoding = [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)',
+    `@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { ($_.Name -ieq 'powershell.exe' -or $_.Name -ieq 'pwsh.exe') -and $_.CommandLine -match 'daemon-supervisor\\.ps1' } | Select-Object ProcessId, CommandLine, Name) | ConvertTo-Json -Compress`,
+  ].join('; ')
+  const { stdout } = await execFileP('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command])
+  return parseWindowsProcessList(stdout).filter((item) => isWindowsSupervisorProcess(item))
+}
+
+export function isWindowsSupervisorProcess(
+  item: WindowsProcessInfo,
+  scriptPath = windowsSupervisorPath(),
+): boolean {
+  if (!item.Name || !['powershell.exe', 'pwsh.exe'].includes(item.Name.toLowerCase())) return false
+  const match = item.CommandLine.match(/(?:^|\s)-File\s+(?:"([^"]+)"|(\S+))(?:\s|$)/i)
+  const invokedScript = match?.[1] ?? match?.[2]
+  return invokedScript?.toLowerCase() === scriptPath.toLowerCase()
+}
+
+async function stopWindowsWatchdog(taskName: string): Promise<void> {
+  await execFileP('schtasks.exe', ['/End', '/TN', taskName]).catch(() => { /* deleted/already stopped */ })
+  const deadline = Date.now() + 2_000
+  let watchdogs = await windowsSupervisorProcesses()
+  while (watchdogs.length > 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    watchdogs = await windowsSupervisorProcesses()
+  }
+  for (const watchdog of watchdogs) {
+    await execFileP('taskkill.exe', ['/PID', String(watchdog.ProcessId), '/T', '/F']).catch(() => {})
+  }
+  const forceDeadline = Date.now() + 2_000
+  watchdogs = await windowsSupervisorProcesses()
+  while (watchdogs.length > 0 && Date.now() < forceDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    watchdogs = await windowsSupervisorProcesses()
+  }
+  if (watchdogs.length > 0) {
+    throw new Error(`Windows watchdog process(es) still running: ${watchdogs.map((item) => item.ProcessId).join(', ')}`)
+  }
+}
+
+/** Stop any RUNNING daemon process — the supervised one (after the service is
  *  uninstalled), a foreground one, or a stray/orphaned one. Sources: the pid the
- *  daemon records in running.json, plus a `pgrep` sweep for "agent computer". We
+ *  daemon records in running.json, plus an OS process sweep for "agent computer". We
  *  verify each candidate's command line really is a long-running daemon (and is
- *  NOT this --stop command or another one-shot CLI) before killing — SIGTERM,
- *  then SIGKILL anything that ignores it. Best-effort. */
+ *  NOT this --stop command or another one-shot CLI) before stopping it. Windows
+ *  uses a per-PID request file for graceful shutdown, then taskkill /T as the
+ *  bounded fallback so engine descendants cannot be orphaned. */
 async function killRunningDaemons(): Promise<void> {
   const candidates = new Set<number>()
   try {
     const pid = (JSON.parse(await readFile(RUNNING_STATE_PATH, 'utf8')) as { pid?: number }).pid
     if (typeof pid === 'number' && pid > 0) candidates.add(pid)
   } catch { /* no pid file */ }
-  if (process.platform !== 'win32') {
+  if (process.platform === 'win32') {
+    for (const item of await windowsDaemonProcesses()) candidates.add(item.ProcessId)
+  } else {
     try {
       const { stdout } = await execFileP('pgrep', ['-f', 'agent computer'])
       for (const l of stdout.split('\n')) { const p = parseInt(l.trim(), 10); if (p > 0) candidates.add(p) }
@@ -2724,8 +3066,7 @@ async function killRunningDaemons(): Promise<void> {
   const victims: number[] = []
   for (const pid of candidates) {
     try {
-      const { stdout } = await execFileP('ps', ['-p', String(pid), '-o', 'command='])
-      const cmd = stdout.trim()
+      const cmd = await commandLineForPid(pid)
       // A genuine long-running daemon: "agent computer" with NO one-shot flag —
       // so we never kill a sibling one-shot CLI. (Ourselves and our parent are
       // already out of `candidates`.)
@@ -2734,11 +3075,49 @@ async function killRunningDaemons(): Promise<void> {
       }
     } catch { /* gone */ }
   }
-  for (const pid of victims) { try { process.kill(pid, 'SIGTERM') } catch { /* gone */ } }
+  if (process.platform === 'win32') {
+    if (victims.length > 0) await mkdir(CONFIG_DIR, { recursive: true })
+    for (const pid of victims) {
+      await writeFile(windowsShutdownRequestPath(pid), 'stop\n', 'utf8').catch(() => {})
+    }
+    const deadline = Date.now() + SHUTDOWN_GRACE_MS + 2_000
+    let survivors = victims
+    while (survivors.length > 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 250))
+      const next: number[] = []
+      for (const pid of survivors) {
+        try {
+          if (isStoppableDaemonCommand(await commandLineForPid(pid))) next.push(pid)
+        } catch { /* exited */ }
+      }
+      survivors = next
+    }
+    for (const pid of survivors) {
+      await execFileP('taskkill.exe', ['/PID', String(pid), '/T', '/F']).catch(() => {})
+    }
+    for (const pid of victims) await rm(windowsShutdownRequestPath(pid), { force: true }).catch(() => {})
+    const forceDeadline = Date.now() + 2_000
+    let remaining = (await windowsDaemonProcesses()).filter((item) =>
+      item.ProcessId !== process.pid && item.ProcessId !== process.ppid &&
+      isStoppableDaemonCommand(item.CommandLine))
+    while (remaining.length > 0 && Date.now() < forceDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      remaining = (await windowsDaemonProcesses()).filter((item) =>
+        item.ProcessId !== process.pid && item.ProcessId !== process.ppid &&
+        isStoppableDaemonCommand(item.CommandLine))
+    }
+    if (remaining.length > 0) {
+      throw new Error(`Windows daemon process(es) still running: ${remaining.map((item) => item.ProcessId).join(', ')}`)
+    }
+  } else {
+    for (const pid of victims) { try { process.kill(pid, 'SIGTERM') } catch { /* gone */ } }
+    if (victims.length > 0) {
+      await new Promise((r) => setTimeout(r, 1500))
+      for (const pid of victims) { try { process.kill(pid, 0); process.kill(pid, 'SIGKILL') } catch { /* already exited */ } }
+    }
+  }
   if (victims.length > 0) {
-    await new Promise((r) => setTimeout(r, 1500))
-    for (const pid of victims) { try { process.kill(pid, 0); process.kill(pid, 'SIGKILL') } catch { /* already exited */ } }
-    console.log(`[computer] killed ${victims.length} running daemon process(es)`)
+    console.log(`[computer] stopped ${victims.length} running daemon process(es)`)
   }
   await rm(RUNNING_STATE_PATH, { force: true }).catch(() => {})
 }
@@ -2747,12 +3126,16 @@ async function killRunningDaemons(): Promise<void> {
  *  can't relaunch it) AND kill any daemon process still running. After this the
  *  agents are fully offline until you re-pair / re-install. */
 async function stopService(): Promise<void> {
-  if (isServiceInstalled()) {
+  if (process.platform === 'win32') {
+    // Always clean up on Windows: a manually deleted task may still have left a
+    // watchdog process or script behind, and that watchdog can relaunch a daemon.
+    await uninstallService()
+  } else if (await isServiceInstalled()) {
     await uninstallService() // removes the plist/unit + unloads → kills the supervised process
   } else {
     console.log('[computer] no background service installed — killing any running daemon process directly.')
   }
-  await killRunningDaemons()
+  if (process.platform !== 'win32') await killRunningDaemons()
   console.log('[computer] stopped — service removed and daemon process(es) killed. Re-pair to start again: npx cumora@latest agent computer --pair <code>')
 }
 
@@ -2765,7 +3148,7 @@ async function printStatus(): Promise<void> {
   // so we report the service's running version separately, read from its log.
   console.log(`cli:     cumora ${CURRENT_VERSION} (this command)`)
   console.log(cfg ? `paired:  computer ${cfg.computerId} @ ${cfg.serverUrl}` : 'paired:  NO — run: npx cumora@latest agent computer --pair <code>')
-  if (!isServiceInstalled()) {
+  if (!(await isServiceInstalled())) {
     console.log('service: not installed — run: npx cumora@latest agent computer --install-service')
     return
   }
@@ -2785,6 +3168,16 @@ async function printStatus(): Promise<void> {
     const pid = await execFileP('systemctl', ['--user', 'show', 'cumora', '-p', 'MainPID', '--value']).then((r) => r.stdout.trim()).catch(() => '')
     livePid = pid && pid !== '0' ? Number(pid) : null
     console.log(`service: installed · ${active}${livePid ? ` (pid ${livePid})` : ''}`)
+  } else if (process.platform === 'win32') {
+    try {
+      const state = JSON.parse(await readFile(RUNNING_STATE_PATH, 'utf8')) as { pid?: number }
+      if (typeof state.pid === 'number' && isStoppableDaemonCommand(await commandLineForPid(state.pid))) {
+        livePid = state.pid
+      }
+    } catch { /* task is between restarts or has not started yet */ }
+    console.log(livePid
+      ? `service: installed · running (pid ${livePid}, Task Scheduler)`
+      : `service: installed · registered in Task Scheduler`)
   }
   const running = await resolveRunningVersion(livePid)
   if (running) {
@@ -2826,8 +3219,8 @@ async function resolveRunningVersion(livePid: number | null): Promise<string> {
   } catch { return '' }
 }
 
-/** `--logs`: follow the service's output. macOS tails the log file; Linux
- *  streams journald (systemd doesn't write a file). Runs until Ctrl+C. */
+/** `--logs`: follow the service's output. macOS/Windows tail the log file;
+ *  Linux streams journald (systemd doesn't write a file). Runs until Ctrl+C. */
 async function tailLogs(): Promise<void> {
   if (process.platform === 'linux') {
     await new Promise<void>((resolve) => {
@@ -2842,7 +3235,12 @@ async function tailLogs(): Promise<void> {
     return
   }
   await new Promise<void>((resolve) => {
-    const c = spawn('tail', ['-n', '100', '-f', logPath], { stdio: 'inherit' })
+    const c = process.platform === 'win32'
+      ? spawn('powershell.exe', [
+          '-NoProfile', '-NonInteractive', '-Command',
+          `Get-Content -LiteralPath ${quotePowerShell(logPath)} -Encoding UTF8 -Tail 100 -Wait`,
+        ], { stdio: 'inherit' })
+      : spawn('tail', ['-n', '100', '-f', logPath], { stdio: 'inherit' })
     c.on('close', () => resolve()); c.on('error', () => resolve())
   })
 }
@@ -2933,7 +3331,7 @@ export async function runComputerDaemon(argv: string[]): Promise<void> {
   // Re-paired on a machine already managed by the background service: reload
   // the service so it adopts the new config (e.g. moved to another company),
   // instead of starting a SECOND foreground daemon that races the service.
-  if (args.pair && isServiceInstalled()) {
+  if (args.pair && await isServiceInstalled()) {
     await reloadService()
     console.log(`[computer] re-paired — reloaded the background service with the new config. (No foreground daemon needed; you can close this terminal.)`)
     return

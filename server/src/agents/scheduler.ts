@@ -643,6 +643,27 @@ export function shouldDeliverToMutedAgent(args: {
   return mention.test(args.body)
 }
 
+/** Which of `agentMemberIds` this message explicitly @-mentions.
+ *
+ *  Same token rule as {@link shouldDeliverToMutedAgent} — an exact `@id`, not a
+ *  prefix and not an email — so "addressed to" means one thing everywhere.
+ *
+ *  This is a PROMPT signal, never a delivery decision. Narrowing the wake to
+ *  the mentioned agents looks tempting and is not safe: a mentioned BYOA agent
+ *  whose laptop is closed has its wake deferred, and the peers who would have
+ *  covered were never woken — so the room stays silent. Worse, an excluded peer
+ *  who posts anything else in that room auto-acks their read cursor to NOW
+ *  (`cumora reply`), which puts the human's message permanently BEHIND the
+ *  cursor: not deferred, gone. So every member still wakes, and the mention only
+ *  tells them who it was for.
+ *
+ *  Exported for tests. */
+export function mentionedAgentIds(body: string, agentMemberIds: readonly string[]): string[] {
+  if (!body) return []
+  return agentMemberIds.filter((id) =>
+    new RegExp(`(^|[^\\w@])@${escapeRegex(id)}(?![\\w-])`, 'i').test(body))
+}
+
 /** Exported for tests — pulled out of `wake` so the wake-policy is
  *  easy to assert on. Fire-and-forget per recipient. */
 function renderTriageNote(verdict: InboxTriageVerdict): string {
@@ -658,7 +679,7 @@ async function triageWakeRecipient(agentId: string): Promise<WakeOptions | null>
     const inbox = await inprocClient.loadInbox(agentId)
     if (inbox.length === 0) return null
     const convoIds = [...new Set(inbox.map((m) => m.conversation_id))]
-    const context = await inprocClient.loadContext(agentId, convoIds)
+    const context = await inprocClient.loadContext(agentId, persona.companyId, convoIds)
     const verdict = await classifyInboxTriage({
       agentId,
       companyId: persona.companyId,

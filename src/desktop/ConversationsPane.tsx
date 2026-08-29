@@ -336,8 +336,8 @@ function ConvoRow({ c, selected, onClick, onContextMenu }: RowProps) {
               // Muted convos keep the count visible (per the spec: "still
               // show the per-row unread count") but switch to an ink chip
               // instead of coral — preserves the "silent" affordance.
-              background: muted ? 'var(--ink-200)' : (isFreshPulled ? 'var(--gold)' : 'var(--coral)'),
-              color: muted ? 'var(--ink-700)' : (isFreshPulled ? 'var(--ink-900)' : 'white'),
+              background: muted ? 'var(--ink-200)' : (isFreshPulled ? 'var(--unread-fresh)' : 'var(--coral)'),
+              color: muted ? 'var(--ink-700)' : (isFreshPulled ? 'var(--unread-fresh-fg)' : 'white'),
             }}
           >{c.unread}</span>
         )}

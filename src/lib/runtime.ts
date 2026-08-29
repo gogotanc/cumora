@@ -80,6 +80,26 @@ interface CumoraBridge {
     arm?: () => Promise<string>
     onToken: (handler: (payload: { token: string; companyId: string | null }) => void) => () => void
   }
+  /** Appearance preference → Electron `nativeTheme.themeSource` so
+   *  `prefers-color-scheme` in the renderer matches the user's pick. */
+  theme?: {
+    set: (source: 'system' | 'light' | 'dark') => void
+  }
+  /** Main-process PATH scan of CLIs on this machine. Electron only. */
+  detect?: {
+    localClis: () => Promise<{
+      hostNames: string[]
+      clis: Array<{
+        id: string
+        bin: string
+        path: string
+        version?: string | null
+        latest?: string | null
+        outdated?: boolean
+        updateCommand?: string | null
+      }>
+    }>
+  }
   /** Auto-update bridge — ported from alma's pattern. Surfaces
    *  electron-updater status to the renderer so the React side can
    *  render the upgrade UI without polling. Unavailable in browser /

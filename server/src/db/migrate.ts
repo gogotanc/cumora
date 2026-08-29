@@ -212,7 +212,7 @@ CREATE TABLE IF NOT EXISTS agent_triages (
   id                    TEXT PRIMARY KEY,
   agent_id              TEXT NOT NULL,
   company_id            TEXT,
-  source                TEXT NOT NULL,                 -- cloud | byoa-claude | byoa-codex | byoa-grok | byoa-cursor
+  source                TEXT NOT NULL,                 -- cloud | byoa-claude | byoa-codex | byoa-grok | byoa-cursor | byoa-opencode | byoa-pi
   model                 TEXT,
   actionable            BOOLEAN NOT NULL DEFAULT FALSE, -- verdict: woke the big brain?
   reason                TEXT,
@@ -241,7 +241,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_triages_agent_created ON agent_triages(agen
 --   - WHO: company_id (tenant), agent_id (when applicable), run_id (when part
 --          of a turn), conversation_id (when applicable, e.g. convene).
 --   - WHAT: purpose (the business reason), model, source (cloud|byoa-claude|
---           byoa-codex|byoa-grok|byoa-cursor — almost always 'cloud' here; BYOA local triages still
+--           byoa-codex|byoa-grok|byoa-cursor|byoa-opencode — almost always 'cloud' here; BYOA local triages still
 --           write to agent_triages with their own source).
 --   - HOW MUCH: cache-aware token breakdown + cost_usd (computed at insert
 --               via cost.ts → priceFor; cost_estimated flags seeded vs operator-
@@ -808,7 +808,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_events_kind    ON audit_events(kind, create
 -- provider gave us at link time — used for cross-provider lookup AND so we
 -- can audit changes if a provider later returns a different email.
 CREATE TABLE IF NOT EXISTS user_identities (
-  provider     TEXT NOT NULL,           -- 'google' | 'github'
+  provider     TEXT NOT NULL,           -- 'google' | 'github' | 'gitlab' | 'apple'
   provider_id  TEXT NOT NULL,           -- sub (Google) / numeric id (GitHub)
   user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   email_lower  TEXT NOT NULL,
@@ -1473,7 +1473,7 @@ CREATE TABLE IF NOT EXISTS computers (
   owner_user_id     TEXT,                                  -- NULL for the managed Cumora Cloud row
   name              TEXT NOT NULL,                         -- "Cumora Cloud", "MacBook Pro", "prod-vps-01"
   kind              TEXT NOT NULL,                         -- 'cloud' | 'local' | 'vps'
-  available_engines JSONB NOT NULL DEFAULT '[]'::jsonb,    -- ['claude','codex','grok','cursor']; ['managed'] for cloud
+  available_engines JSONB NOT NULL DEFAULT '[]'::jsonb,    -- ['claude','codex','grok','cursor','opencode','pi']; ['managed'] for cloud
   status            TEXT NOT NULL DEFAULT 'offline',       -- 'online' | 'offline' | 'busy'
   last_seen_at      TIMESTAMP WITH TIME ZONE,
   credential_hash   TEXT,                                  -- SHA256 of the device token; NULL for cloud
@@ -1495,7 +1495,7 @@ ALTER TABLE computers ADD COLUMN IF NOT EXISTS daemon_supervised BOOLEAN;
 -- a 'cloud' computer, means managed (current pod behavior). A 'local' /
 -- 'vps' computer means BYOA: wakes go to the paired daemon, no pod.
 ALTER TABLE participants ADD COLUMN IF NOT EXISTS computer_id TEXT;
-ALTER TABLE participants ADD COLUMN IF NOT EXISTS engine      TEXT;  -- 'managed' | 'claude' | 'codex' | 'grok' | 'cursor'
+ALTER TABLE participants ADD COLUMN IF NOT EXISTS engine      TEXT;  -- 'managed' | 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi'
 -- Per-agent model overrides. "model" (added earlier) is the big-brain / main
 -- reasoning model; "fast_model" is the small-brain model for cheap auxiliary
 -- work. For BYOA agents these pass through to the engine as --model (big) and,
@@ -1513,6 +1513,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS companies_pair_token_idx ON companies(pair_tok
 -- "reconnect" command bound to that exact row, preserving its assigned agents.
 ALTER TABLE computers ADD COLUMN IF NOT EXISTS pair_token TEXT;
 CREATE UNIQUE INDEX IF NOT EXISTS computers_pair_token_idx ON computers(pair_token) WHERE pair_token IS NOT NULL;
+
+-- Cached local-engine detection for the Agents tab / character editor.
+-- available_engines[0] remains the computer default; detected_engines holds
+-- bin + resolved path from the last pair/refresh. detect_requested_at is a
+-- one-shot flag the online daemon consumes on its next heartbeat.
+ALTER TABLE computers ADD COLUMN IF NOT EXISTS detected_engines JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE computers ADD COLUMN IF NOT EXISTS engines_detected_at TIMESTAMP WITH TIME ZONE;
+ALTER TABLE computers ADD COLUMN IF NOT EXISTS detect_requested_at TIMESTAMP WITH TIME ZONE;
+-- true = follow computers.available_engines[0]; false = pin participants.engine.
+ALTER TABLE participants ADD COLUMN IF NOT EXISTS engine_inherit BOOLEAN NOT NULL DEFAULT TRUE;
 
 -- ============== Evidence-backed feature shipping =======================
 -- A shipping feature is deliberately distinct from a generic board card.

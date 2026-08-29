@@ -716,7 +716,7 @@ export function CalendarView() {
 
           {/* View switcher — segmented control (cloud pill) */}
           <div
-            className="inline-flex items-center gap-0.5 rounded-full border border-ink-100 bg-cloud p-0.5 shadow-[0_1px_0_rgba(255,255,255,0.95)_inset,0_8px_20px_-18px_rgba(26,78,120,0.4)]"
+            className="inline-flex items-center gap-0.5 rounded-full border border-ink-100 bg-cloud p-0.5 shadow-[var(--select-shadow)]"
           >
             {(['day', 'week', 'month'] as const).map((m) => (
               <button

@@ -71,7 +71,7 @@ export function MobileChat() {
   // survives MobileChat unmounts (chat → list → chat keeps the half-typed
   // message). Send + convo-switch clears the entry; the cleanup happens
   // inside `send()` and the convoId effect below.
-  const draft = useApp((s) => (convoId ? s.composerDrafts[convoId] ?? '' : ''))
+  const draft = useApp((s) => (convoId ? s.composerDrafts[convoId]?.text ?? '' : ''))
   const setComposerDraft = useApp((s) => s.setComposerDraft)
   const setDraft = useCallback((text: string) => {
     if (!convoId) return
@@ -580,7 +580,7 @@ export function MobileChat() {
         ref={streamRef}
         className="flex-1 relative"
         style={{
-          background: 'radial-gradient(ellipse 80% 40% at 0% 0%, rgba(194, 230, 251, 0.3), transparent 60%), radial-gradient(ellipse 60% 40% at 100% 100%, rgba(255, 217, 210, 0.25), transparent 60%), var(--cloud)',
+          background: 'var(--chat-wash)',
         }}
       >
         <Virtuoso

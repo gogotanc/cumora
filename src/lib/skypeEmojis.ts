@@ -190,13 +190,31 @@ export function skypeEmojiUrl(key: string): string {
   return `/skype-emojis/anim/${key}.png`
 }
 
-/** Self-hosted sound file path. The audio archive isn't in any public
- *  repo, so we expect mp3s to land in `public/skype-sounds/{key}.mp3`
- *  out-of-band (e.g. extracted from a legacy Skype installer for
- *  internal use). Missing files cause `Audio.play()` to reject silently —
- *  the picker / message renderer never errors visibly. */
+/** Sound file URL. Every emoticon in the catalog has one; the files are
+ *  served from the deployment's CDN rather than committed here, and a
+ *  self-hoster can point VITE_SKYPE_SOUNDS_BASE at their own copies.
+ *
+ *  Two provenances behind that URL:
+ *   - Nine emoticons with a real Skype event-sound counterpart use the
+ *     genuine article (skype→IM pop, call→ring-in, phone→ring-out,
+ *     hi→login, sleepy→logout, wait→hold, talktothehand→busy, mail→sent,
+ *     handshake→contact-added). Microsoft IP, which is why they stay out
+ *     of the source tree.
+ *   - The rest are synthesized — classic Skype never had per-emoticon
+ *     audio, so there was nothing to source. `scripts/gen-skype-sounds.py`
+ *     regenerates them deterministically from the catalog: a semantic
+ *     archetype per emoticon (sparkle / sad / clink / zap …) plus a
+ *     per-emoticon pitch, so a family reads as a family and no two are
+ *     alike. Original work, safe to redistribute.
+ *
+ *  A missing file still degrades quietly: `Audio.play()` rejects and the
+ *  picker / message renderer never errors visibly. */
+const SKYPE_SOUNDS_BASE: string =
+  (import.meta.env?.VITE_SKYPE_SOUNDS_BASE as string | undefined)?.replace(/\/+$/, '')
+  || 'https://cdn.cumora.ai/skype-sounds'
+
 export function skypeSoundUrl(key: string): string {
-  return `/skype-sounds/${key}.mp3`
+  return `${SKYPE_SOUNDS_BASE}/${key}.mp3`
 }
 
 // Cache one Audio element per key so repeated plays don't refetch.

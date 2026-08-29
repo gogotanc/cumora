@@ -12,6 +12,8 @@
  *  - Identity pin: when a request body claims `agentId: <spoof>` while
  *    the JWT pins someone else, the row that lands in Postgres uses the
  *    JWT subject, not the body claim.
+ *  - Conversation scope: context reads return only conversations in the
+ *    JWT-pinned agent's tenant where that agent is a current member.
  *  - Payload validation: 400s for missing required fields, without ever
  *    touching the DB.
  *
@@ -92,6 +94,26 @@ async function seedAgent(): Promise<{ agentId: string; companyId: string; token:
   return { agentId, companyId, token }
 }
 
+async function seedContextConversation(opts: {
+  companyId: string
+  members: string[]
+  authorId: string
+  body: string
+}): Promise<string> {
+  const conversationId = `cv-${randomUUID().slice(0, 8)}`
+  await pool.query(
+    `INSERT INTO conversations (id, kind, title, members, company_id)
+       VALUES ($1, 'group', $2, $3::jsonb, $4)`,
+    [conversationId, `Context ${conversationId}`, JSON.stringify(opts.members), opts.companyId],
+  )
+  await pool.query(
+    `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id)
+       VALUES ($1, $2, $3, 'text', $4, 1, $5)`,
+    [`m-${randomUUID()}`, conversationId, opts.authorId, opts.body, opts.companyId],
+  )
+  return conversationId
+}
+
 // ── auth gate ──────────────────────────────────────────────────────────
 
 test('[integration] runtime: missing Authorization → 401', async () => {
@@ -130,6 +152,86 @@ test('[integration] runtime: expired token → 401', async () => {
   const r = await call('/runtime/inbox', { method: 'GET', token: tok })
   assert.equal(r.status, 401)
   assert.match(String(r.body?.error ?? ''), /expired/i)
+})
+
+test('[integration] runtime: /context requires a tenant-pinned token', async () => {
+  const { agentId } = await seedAgent()
+  const token = signAgentToken({ agentId, companyId: null })
+  const r = await call('/runtime/context', { token, body: { conversationIds: [] } })
+  assert.equal(r.status, 403)
+  assert.match(String(r.body?.error ?? ''), /companyId claim required/i)
+})
+
+test('[integration] runtime: /context enforces tenant and conversation membership', async () => {
+  const { agentId, companyId, token } = await seedAgent()
+  const peerId = `a-${randomUUID().slice(0, 8)}`
+  await pool.query(
+    `INSERT INTO participants (id, company_id, kind, name, role, initial, avatar_bg, status)
+       VALUES ($1, $2, 'agent', $3, 'tester', 'P', '#abcdef', 'avail')`,
+    [peerId, companyId, peerId],
+  )
+
+  const allowedId = await seedContextConversation({
+    companyId,
+    members: [agentId, peerId],
+    authorId: peerId,
+    body: 'member-visible',
+  })
+  const nonMemberId = await seedContextConversation({
+    companyId,
+    members: [peerId],
+    authorId: peerId,
+    body: 'same-tenant-private',
+  })
+  const otherTenant = await seedAgent()
+  const crossTenantId = await seedContextConversation({
+    companyId: otherTenant.companyId,
+    // Even a forged members array cannot override the JWT tenant boundary.
+    members: [agentId, otherTenant.agentId],
+    authorId: otherTenant.agentId,
+    body: 'cross-tenant-private',
+  })
+
+  const r = await call('/runtime/context', {
+    token,
+    body: { conversationIds: [allowedId, nonMemberId, crossTenantId] },
+  })
+
+  assert.equal(r.status, 200)
+  assert.deepEqual(
+    (r.body?.rows ?? []).map((row: { conversation_id: string; company_id: string; body: string }) => ({
+      conversationId: row.conversation_id,
+      companyId: row.company_id,
+      body: row.body,
+    })),
+    [{ conversationId: allowedId, companyId, body: 'member-visible' }],
+  )
+})
+
+test('[integration] runtime: /context binds authorization to the JWT companyId', async () => {
+  const claimedTenant = await seedAgent()
+  const actualTenant = await seedAgent()
+  const crossTenantId = await seedContextConversation({
+    companyId: actualTenant.companyId,
+    members: [actualTenant.agentId],
+    authorId: actualTenant.agentId,
+    body: 'mismatched-claim-private',
+  })
+  // Simulate a stale or incorrectly minted but validly signed token. The old
+  // query ignored companyId and authorized solely from sub + the target row,
+  // so it returned this conversation from actualTenant.
+  const mismatchedToken = signAgentToken({
+    agentId: actualTenant.agentId,
+    companyId: claimedTenant.companyId,
+  })
+
+  const r = await call('/runtime/context', {
+    token: mismatchedToken,
+    body: { conversationIds: [crossTenantId] },
+  })
+
+  assert.equal(r.status, 200)
+  assert.deepEqual(r.body?.rows ?? [], [])
 })
 
 // ── identity pin: agentId comes from JWT, not request body ────────────

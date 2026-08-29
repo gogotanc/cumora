@@ -487,7 +487,7 @@ function SignInToAccept({ token }: { token: string }) {
         type="button"
         onClick={() => go('google')}
         disabled={busy !== null}
-        className="h-11 rounded-[10px] border border-ink-200 bg-white hover:bg-cloud transition-colors flex items-center justify-center gap-3 text-[14px] text-ink-800 disabled:opacity-60"
+        className="h-11 rounded-[10px] border border-ink-100 bg-cloud hover:bg-sky2-50 text-ink-900 transition-colors flex items-center justify-center gap-3 text-[14px] font-medium disabled:opacity-60"
       >
         <GoogleMark />
         {busy === 'google' ? t('auth.redirecting') : t('auth.continueWithGoogle')}

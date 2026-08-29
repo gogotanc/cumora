@@ -1,10 +1,14 @@
 import { Router, type Request, type Response, type NextFunction } from 'express'
-import { storage, UPLOAD_DIR, freshenAttachmentUrl, normalizeStorageKey, storageKeyFromPublicUrl } from '../storage.js'
+import {
+  storage, UPLOAD_DIR, freshenAttachmentUrl, normalizeStorageKey,
+  storageKeyFromPublicUrl, messageAttachmentStorageKey,
+} from '../storage.js'
 import { pool } from '../db/pool.js'
 import { CH_MESSAGE_NEW, CH_REACTIONS, CH_CONVO_UPDATED, CH_DOCS, CH_TYPING, CH_CALENDAR_EVENTS, publish } from '../redis.js'
 import { createPoll, castVote, closePoll, PollError } from '../polls.js'
 import { env } from '../env.js'
 import { startConvene, getActiveConvene } from '../agents/convene.js'
+import { fetchImageBytes } from '../agents/image-fetcher.js'
 import { getTriageEconomics } from '../agents/observability.js'
 import { BUSY_STATUS_LEASE_MS } from '../status.js'
 import { notifyMessage, computeMessageRecipients } from '../push.js'
@@ -15,7 +19,7 @@ import {
 } from '../auth.js'
 import { joinAllHands, onboardStarterAgents, seedMemberDms } from '../onboardCompany.js'
 import {
-  type Provider, providerEnabled, createState, consumeState,
+  type Provider, providerEnabled, createState, consumeState, isWebOAuthProvider, WEB_OAUTH_PROVIDERS,
   authorizeUrl, handleCallback, handleLazycatSignIn, errorUrl, returnUrlAllowed,
 } from '../oauth.js'
 import { adminRouter } from './admin-router.js'
@@ -27,7 +31,8 @@ import {
   ensureCloudComputer, issuePairingCode, pairComputer, announceComputerOnline,
   resolveDevice, mintAgentRuntimeToken, listAgentsForComputer,
   listComputers, revokeComputer, assignAgentToComputer, heartbeatComputer,
-  cloudComputerId, issueRepairCode,
+  cloudComputerId, issueRepairCode, requestEngineDetect, reportDetectedEngines,
+  setComputerDefaultEngine,
 } from '../agents/computer/registry.js'
 import { companyTier } from '../tier.js'
 import { createShippingRouter } from './shipping-router.js'
@@ -669,9 +674,17 @@ api.post('/auth/lazycat', safe(async (req, res) => {
  *  `?return=<url>` is the post-callback redirect target. Must startsWith
  *  one of CUMORA_AUTH_RETURN_ALLOWLIST entries; otherwise rejected so we
  *  can't be turned into an open redirect. Omit to use AUTH_DONE_URL. */
+/** Which browser sign-in providers this deployment actually has credentials
+ *  for. The sign-in screens use it to avoid offering a button that can only
+ *  503 — GitLab is opt-in (and points at whichever instance the operator
+ *  configured), so most deployments will not have it. */
+api.get('/auth/providers', safe(async (_req, res) => {
+  res.json({ providers: [...WEB_OAUTH_PROVIDERS].filter((p) => providerEnabled(p as Provider)) })
+}))
+
 api.get('/auth/start/:provider', safe(async (req, res) => {
   const provider = req.params.provider as Provider
-  if (provider !== 'google' && provider !== 'github') {
+  if (!isWebOAuthProvider(provider)) {
     res.status(404).json({ error: 'unknown provider' }); return
   }
   if (!providerEnabled(provider)) {
@@ -700,7 +713,7 @@ api.get('/auth/start/:provider', safe(async (req, res) => {
  *  On failure we 302 to the same target with `#error=...`. */
 api.get('/auth/callback/:provider', safe(async (req, res) => {
   const provider = req.params.provider as Provider
-  if (provider !== 'google' && provider !== 'github') {
+  if (!isWebOAuthProvider(provider)) {
     res.status(404).json({ error: 'unknown provider' }); return
   }
   const code = typeof req.query.code === 'string' ? req.query.code : ''
@@ -741,11 +754,10 @@ api.get('/auth/callback/:provider', safe(async (req, res) => {
 api.post('/auth/apple/native', safe(async (req, res) => {
   const { handleAppleNativeSignIn, WaitlistedError, SuspendedError } = await import('../oauth.js')
   const body = (req.body ?? {}) as {
-    identityToken?: unknown; email?: unknown; name?: unknown; inviteToken?: unknown
+    identityToken?: unknown; name?: unknown; inviteToken?: unknown
   }
   const identityToken = typeof body.identityToken === 'string' ? body.identityToken : ''
   if (!identityToken) { res.status(400).json({ error: 'identityToken required' }); return }
-  const fallbackEmail = typeof body.email === 'string' ? body.email : null
   const fallbackName = typeof body.name === 'string' ? body.name : null
   const inviteToken = typeof body.inviteToken === 'string' ? body.inviteToken : null
   const ip = req.socket.remoteAddress ?? null
@@ -753,7 +765,6 @@ api.post('/auth/apple/native', safe(async (req, res) => {
   try {
     const r = await handleAppleNativeSignIn({
       identityToken,
-      fallbackEmail,
       fallbackName,
       // Only our bundle id is accepted. If we later ship an Android
       // app or web SIWA fallback they'll get distinct audiences.
@@ -1092,7 +1103,10 @@ api.post('/agents/:id/computer', safe(async (req, res) => {
     throw new HttpError(403, 'Free tier agents run on your own computer. Upgrade to Pro to use Cumora Cloud.')
   }
   const engine = typeof req.body?.engine === 'string' ? req.body.engine : undefined
-  const out = await assignAgentToComputer({ agentId: String(req.params.id), companyId, computerId, engine })
+  const inherit = req.body?.inherit === true
+  const out = await assignAgentToComputer({
+    agentId: String(req.params.id), companyId, computerId, engine, inherit: inherit || !engine,
+  })
   if (!out) throw new HttpError(400, 'invalid computer, agent, or engine for this company')
   res.json({ ok: true, ...out })
 }))
@@ -1106,6 +1120,7 @@ api.post('/computers/pair', safe(async (req, res) => {
   const engines = Array.isArray(req.body?.engines)
     ? (req.body.engines as unknown[]).filter((e): e is string => typeof e === 'string')
     : []
+  const detected = req.body?.detected
   const hostName = typeof req.body?.hostName === 'string' ? req.body.hostName : undefined
   const version = typeof req.body?.version === 'string' ? req.body.version : undefined
   const supervised = typeof req.body?.supervised === 'boolean' ? req.body.supervised : undefined
@@ -1113,7 +1128,7 @@ api.post('/computers/pair', safe(async (req, res) => {
   // its onboarding gate on that event and immediately reloads its roster, so the
   // starter team + "Everyone" group must already exist when it fires — otherwise
   // the user lands on an empty Conversations list that fills in a beat later.
-  const paired = await pairComputer({ code, hostName, engines, version, supervised, deferBroadcast: true })
+  const paired = await pairComputer({ code, hostName, engines, detected, version, supervised, deferBroadcast: true })
   if (!paired) throw new HttpError(400, 'invalid pairing token')
   // Free-tier BYOA onboarding on pair. The daemon sends the engines list with
   // the user's CHOSEN engine first (`cumora agent computer --pair … --engine X`),
@@ -1121,7 +1136,10 @@ api.post('/computers/pair', safe(async (req, res) => {
   // and any adopted agent are created with. Fall back to Claude if unreported.
   try {
     if ((await companyTier(paired.companyId)) === 'free') {
-      const engine = (engines[0] === 'claude' || engines[0] === 'codex' || engines[0] === 'grok' || engines[0] === 'cursor') ? engines[0] : 'claude'
+      const engine = (
+        engines[0] === 'claude' || engines[0] === 'codex' || engines[0] === 'grok' ||
+        engines[0] === 'cursor' || engines[0] === 'opencode' || engines[0] === 'pi'
+      ) ? engines[0] : 'claude'
       // Adopt only agents that are stranded on the managed Cumora Cloud (or
       // unassigned) onto the just-paired machine — earlier builds' boot backfill
       // wrongly seeded free starters on cloud, where free can't run them. Agents
@@ -1154,6 +1172,31 @@ api.post('/computers/pair', safe(async (req, res) => {
   res.json(paired)
 }))
 
+api.post('/computers/:id/detect', safe(async (req, res) => {
+  const { companyId } = await requireCompanyRole(req)
+  const ok = await requestEngineDetect({ computerId: String(req.params.id), companyId })
+  if (!ok) throw new HttpError(404, 'computer not found')
+  res.json({ ok: true })
+}))
+
+api.post('/computers/:id/default-engine', safe(async (req, res) => {
+  const { companyId } = await requireCompanyRole(req)
+  const engine = typeof req.body?.engine === 'string' ? req.body.engine : ''
+  const out = await setComputerDefaultEngine({ computerId: String(req.params.id), companyId, engine })
+  if (!out) throw new HttpError(400, 'engine is not installed on this computer')
+  res.json({ ok: true, ...out })
+}))
+
+api.post('/computers/me/engines', safe(async (req, res) => {
+  const { computerId } = await requireDevice(req)
+  const engines = Array.isArray(req.body?.engines)
+    ? (req.body.engines as unknown[]).filter((e): e is string => typeof e === 'string')
+    : []
+  const ok = await reportDetectedEngines({ computerId, engines, detected: req.body?.detected })
+  if (!ok) throw new HttpError(404, 'computer not found')
+  res.json({ ok: true })
+}))
+
 // Agents assigned to the calling computer (daemon discovery on boot).
 api.get('/computers/me/agents', safe(async (req, res) => {
   const { computerId } = await requireDevice(req)
@@ -1166,7 +1209,12 @@ api.post('/computers/heartbeat', safe(async (req, res) => {
   const { computerId } = await requireDevice(req)
   const version = typeof req.body?.version === 'string' ? req.body.version : undefined
   const supervised = typeof req.body?.supervised === 'boolean' ? req.body.supervised : undefined
-  await heartbeatComputer(computerId, version, supervised)
+  // Engines the daemon can currently see on PATH. Optional: an older daemon
+  // sends none and its stored list is left exactly as it was.
+  const engines = Array.isArray(req.body?.engines)
+    ? (req.body.engines as unknown[]).filter((e): e is string => typeof e === 'string')
+    : undefined
+  await heartbeatComputer(computerId, version, supervised, engines)
   res.json({ ok: true })
 }))
 
@@ -1824,12 +1872,14 @@ api.get('/participants', async (req, res) => {
     email: string | null; companySlug: string | null
     departedAt: string | null
     computerId: string | null; engine: string | null; fastModel: string | null
+    engineInherit: boolean | null
   }>(
     `SELECT p.id, p.kind, p.name, p.role, p.initial,
             p.avatar_bg AS "avatarBg", p.avatar_url AS "avatarUrl",
             p.status, p.status_updated_at AS "statusUpdatedAt",
             p.bio, p.tools, p.system_prompt AS "systemPrompt", p.model,
             p.computer_id AS "computerId", p.engine, p.fast_model AS "fastModel",
+            p.engine_inherit AS "engineInherit",
             -- Email resolution differs by kind:
             --  - agents carry their own minted address on participants.email
             --  - humans don't have one there; surface their real auth email
@@ -2650,8 +2700,12 @@ export async function generateAndPersistAvatar(args: {
   if (b64) {
     imageBuf = Buffer.from(b64, 'base64')
   } else if (remoteUrl) {
-    const fetched = await fetch(remoteUrl)
-    imageBuf = Buffer.from(await fetched.arrayBuffer())
+    const fetched = await fetchImageBytes(remoteUrl, {
+      maxBytes: 20 * 1024 * 1024,
+      timeoutMs: 30_000,
+    })
+    if (!fetched.ok) throw new HttpError(502, `image API download failed (${fetched.reason})`)
+    imageBuf = fetched.buffer
   } else {
     throw new HttpError(502, 'image API returned no image')
   }
@@ -3320,16 +3374,28 @@ api.post('/conversations/:id/messages', async (req, res) => {
   if (rawAttachment && typeof rawAttachment === 'object') {
     const a = rawAttachment as Record<string, unknown>
     if (typeof a.url === 'string' && typeof a.name === 'string') {
+      // URLs are display data and may be client-controlled or expired. Resolve
+      // the server-generated object key, then mint the URL ourselves so a chat
+      // attachment can never turn an agent wake into an arbitrary server fetch.
+      const key = messageAttachmentStorageKey(a)
+      if (!key) {
+        res.status(400).json({ error: 'attachment must reference Cumora storage' })
+        return
+      }
+      let url: string
+      try {
+        url = await storage.publicUrl(key)
+      } catch {
+        res.status(400).json({ error: 'attachment storage reference is invalid' })
+        return
+      }
       attachment = {
-        url: a.url,
-        name: a.name,
+        url,
+        name: a.name.trim().slice(0, 200),
         kind: (a.kind === 'pdf' || a.kind === 'file' || a.kind === 'fig' ? a.kind : 'img') as AttachmentPayload['kind'],
         mime: typeof a.mime === 'string' ? a.mime : undefined,
         size: typeof a.size === 'number' ? a.size : undefined,
-        // Preserve the storage `key` so we can later re-sign the URL on
-        // every read — without it, signed URLs would expire and break
-        // historical message bubbles after their TTL window.
-        key: typeof a.key === 'string' ? a.key : undefined,
+        key,
       }
     }
   }
@@ -4929,6 +4995,13 @@ async function wakeMentionedAgents(args: {
   companyId: string
   mentions: string[] | undefined
   actorId: string
+  /** What on the board caused this wake. Without it the agent is woken with an
+   *  empty chat inbox and `runAgentTurn` returns before it looks at anything —
+   *  which is why an assigned card could sit in Todo while the work itself was
+   *  reported done in chat. The brief is what gives the turn something to act
+   *  on, and it names the ids so the agent can drive the card with
+   *  `cumora card …` rather than guess. */
+  card?: { boardId: string; cardId: string; columnId?: string | null; title?: string | null; what: string }
 }): Promise<void> {
   if (!args.mentions || args.mentions.length === 0) return
   const targets = args.mentions.filter((id) => id !== args.actorId)
@@ -4943,8 +5016,27 @@ async function wakeMentionedAgents(args: {
   )
   if (rows.length === 0) return
   const { wakeAgent } = await import('../agents/scheduler.js')
+  const brief = args.card
+    ? {
+        source: 'kanban',
+        title: args.card.what,
+        body: [
+          args.card.title ? `Card: ${args.card.title}` : null,
+          `card id: ${args.card.cardId}`,
+          `board id: ${args.card.boardId}`,
+          args.card.columnId ? `column id: ${args.card.columnId}` : null,
+          '',
+          'Drive it with the board tools rather than only replying in chat:',
+          `  cumora card claim ${args.card.cardId}`,
+          `  cumora card comment ${args.card.cardId} "<progress / evidence>"`,
+          `  cumora card move ${args.card.cardId} <column_id>`,
+          '',
+          'If the work finishes here, leave the card in a state that says so — a board that still reads Todo while the work is done is worse than no board.',
+        ].filter((l) => l !== null).join('\n'),
+      }
+    : undefined
   for (const r of rows) {
-    void wakeAgent(r.id, 'manual', null).catch((e) => {
+    void wakeAgent(r.id, 'manual', null, null, brief ? { backgroundBrief: brief } : {}).catch((e) => {
       console.warn(`[boards] wake ${r.id} failed`, e)
     })
   }
@@ -5271,11 +5363,17 @@ api.post('/boards/:id/cards', async (req, res) => {
   await publishBoardEvent({
     companyId, kind: 'card.created', boardId, cardId: id, columnId, mentions, actorId: me,
   })
-  void wakeMentionedAgents({ companyId, mentions, actorId: me })
+  void wakeMentionedAgents({
+    companyId, mentions, actorId: me,
+    card: { boardId, cardId: id, columnId, title, what: 'You were mentioned on a new board card' },
+  })
   // Assignment counts as a mention even without an @-token in prose:
   // when you `assignee_id = someone`, that someone should know about it.
   if (assigneeId && assigneeId !== me) {
-    void wakeMentionedAgents({ companyId, mentions: [assigneeId], actorId: me })
+    void wakeMentionedAgents({
+      companyId, mentions: [assigneeId], actorId: me,
+      card: { boardId, cardId: id, columnId, title, what: 'A board card was assigned to you' },
+    })
   }
   res.json({ id, position, mentions })
 })
@@ -5349,12 +5447,18 @@ api.patch('/boards/:bid/cards/:cid', async (req, res) => {
     kind: columnChanged ? 'card.moved' : 'card.updated',
     boardId, cardId, mentions, actorId: me,
   })
-  void wakeMentionedAgents({ companyId, mentions, actorId: me })
+  void wakeMentionedAgents({
+    companyId, mentions, actorId: me,
+    card: { boardId, cardId, what: 'You were mentioned on a board card' },
+  })
   // A re-assignment also wakes the new assignee.
   if (typeof req.body?.assigneeId === 'string') {
     const newAssignee = String(req.body.assigneeId).trim()
     if (newAssignee && newAssignee !== me) {
-      void wakeMentionedAgents({ companyId, mentions: [newAssignee], actorId: me })
+      void wakeMentionedAgents({
+        companyId, mentions: [newAssignee], actorId: me,
+        card: { boardId, cardId, what: 'A board card was assigned to you' },
+      })
     }
   }
   res.json({ ok: true, mentions })

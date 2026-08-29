@@ -672,6 +672,7 @@ one and re-test. Don't pile on.
 | `CUMORA_DEFAULT_CODEX_MODEL` | unset | Same shape for Codex; deliberately not set by default. |
 | `CUMORA_DEFAULT_GROK_MODEL` | unset | Same shape for Grok Build. |
 | `CUMORA_DEFAULT_CURSOR_MODEL` | unset | Same shape for Cursor Agent; blank lets Cursor use Auto. |
+| `CUMORA_DEFAULT_OPENCODE_MODEL` | unset | Same shape for OpenCode; use its `provider/model` id, or leave blank for the configured default. |
 | `CUMORA_BYOA_MAX_CONCURRENT_BIG_BRAIN` | 6 | Per-computer big-brain turn cap. Drop to 2-4 for very tight quotas; raise for higher tiers. |
 | `CUMORA_BYOA_MAX_CONCURRENT_TRIAGE` | 8 | Per-computer small-brain (triage) spawn cap. Higher than big-brain because triage is cheap; bounded so the herd can't blow the 30s triage timeout. |
 | `CUMORA_BYOA_MIN_SPAWN_INTERVAL_MS` | 500 | Deterministic minimum interval between local-CLI spawn starts — the AdaptivePacer's base (3, 3b). |

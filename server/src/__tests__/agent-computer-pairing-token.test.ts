@@ -3,10 +3,11 @@
  *
  * Run: node --import tsx --test server/src/__tests__/agent-computer-pairing-token.test.ts
  */
-import { afterEach, test } from 'node:test'
+import { after, afterEach, test } from 'node:test'
 import assert from 'node:assert/strict'
 
 process.env.CUMORA_RUNTIME_CLIENT = 'http'
+process.env.OPENAI_API_KEY ??= 'test-key'
 
 const registry = await import('../agents/computer/registry.js')
 const { pool } = await import('../db/pool.js')
@@ -29,6 +30,15 @@ function installPoolMock(handler: (call: QueryCall) => { rows?: unknown[]; rowCo
 
 afterEach(() => {
   ;(pool as unknown as { query: typeof originalQuery }).query = originalQuery
+})
+
+after(async () => {
+  try { await pool.end() } catch { /* ignore */ }
+  try {
+    const { redis, sub } = await import('../redis.js')
+    redis.disconnect()
+    sub.disconnect()
+  } catch { /* ignore */ }
 })
 
 test('company add token is persistent and reattaches an existing host by name', async () => {
@@ -57,7 +67,7 @@ test('company add token is persistent and reattaches an existing host by name', 
   const paired = await registry.pairComputer({
     code: 'company-token',
     hostName: 'MacBook Air',
-    engines: ['claude', 'cursor', 'bogus'],
+    engines: ['claude', 'cursor', 'opencode', 'bogus'],
     deferBroadcast: true,
   })
   assert.equal(paired?.computerId, 'comp-existing')
@@ -65,7 +75,7 @@ test('company add token is persistent and reattaches an existing host by name', 
 
   const update = calls.find((c) => /UPDATE computers\s+SET credential_hash/.test(c.sql))
   assert.ok(update, 'existing computer should be updated instead of inserting a duplicate')
-  assert.equal(update.params[1], JSON.stringify(['claude', 'cursor']))
+  assert.equal(update.params[1], JSON.stringify(['claude', 'cursor', 'opencode']))
   assert.equal(calls.some((c) => /INSERT INTO computers/.test(c.sql)), false)
 })
 

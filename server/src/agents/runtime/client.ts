@@ -209,8 +209,10 @@ export interface AgentRuntimeClient {
     projectIds?: readonly string[];
     conversationIds?: readonly string[];
   }): Promise<MemoryRow[]>
-  /** Per-conversation recent history for every convo with unread items. */
-  loadContext(agentId: string, conversationIds: string[]): Promise<ContextRow[]>
+  /** Per-conversation recent history for every convo with unread items.
+   *  Implementations must treat conversationIds as selectors, not proof of
+   *  access, and enforce the authenticated tenant + current membership. */
+  loadContext(agentId: string, companyId: string, conversationIds: string[]): Promise<ContextRow[]>
   /** Agent's feelings about people (the climate model). */
   loadClimate(agentId: string): Promise<ClimateRow[]>
   /** Index of installed skills (name + description only — progressive

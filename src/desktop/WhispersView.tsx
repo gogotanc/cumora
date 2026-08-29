@@ -14,7 +14,7 @@ function StubRoom() {
   return (
     <main className="grid place-items-center text-center"
       style={{
-        background: 'radial-gradient(ellipse 80% 60% at 50% 0%, rgba(210, 201, 233, 0.30), transparent 60%), linear-gradient(180deg, var(--paper) 0%, var(--whisper-50) 100%)',
+        background: 'var(--whispers-wash)',
       }}>
       <div>
         <div className="font-display font-medium text-[28px] text-ink-900 mb-2" style={{ letterSpacing: '-0.02em' }}>

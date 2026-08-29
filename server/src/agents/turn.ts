@@ -20,6 +20,8 @@
 import type { ResponseInputItem, ResponseStreamEvent } from 'openai/resources/responses/responses'
 import { env } from '../env.js'
 import { redis } from '../redis.js'
+import { readLocalMessageAttachment } from '../local-attachment-files.js'
+import { messageAttachmentStorageKey } from '../storage-keys.js'
 import { classifyInboxTriage, gateSyntheticWake } from './inbox-triage.js'
 import { GLANCE_YIELD_RULES } from './glance-protocol.js'
 import { TOOL_DEFS_RESPONSES, executePodTool } from './runtime/pod-tools.js'
@@ -112,6 +114,9 @@ interface InboxRow {
   quoted: QuotedSummary | null
 }
 
+import { classifyWake } from './turn-wake.js'
+import { mentionedAgentIds } from './scheduler.js'
+
 export interface AgentTurnOptions {
   /** Why this turn was started. Message-driven turns remain the default. */
   trigger?: 'message.new' | 'idle' | 'manual' | 'background_scan' | 'poll.updated'
@@ -156,10 +161,11 @@ async function loadMemory(
 
 async function loadContext(
   agentId: string,
+  companyId: string,
   conversationIds: string[],
   rc: AgentRuntimeClient = runtime,
 ): Promise<ContextRow[]> {
-  return rc.loadContext(agentId, conversationIds)
+  return rc.loadContext(agentId, companyId, conversationIds)
 }
 
 async function loadClimate(
@@ -388,17 +394,25 @@ function publicUrlFor(url: string): string {
   return base.replace(/\/+$/, '') + url
 }
 
-/** Re-sign an attachment URL just-in-time for the agent's wake — the URL
- *  stored in messages.attachment.url could be hours/days old. With HMAC
- *  signing on, an expired URL would 403 when the agent (or OpenAI vision)
- *  tries to fetch. We resolve via the storage layer at the moment of use. */
-async function freshAttachmentUrl(att: InboxAttachment): Promise<string> {
-  if (!att.key) return att.url
+interface TrustedAttachmentSource {
+  key: string
+  url: string
+  mode: 'local' | 'r2'
+}
+
+/** Resolve message content exclusively from Cumora storage. The persisted URL
+ *  is presentation data and must never select a server-side fetch target;
+ *  regenerate it from the validated key and fail closed for legacy/external
+ *  references. External image links remain visible in text context, but are
+ *  deliberately not downloaded by this process. */
+async function trustedAttachmentSource(att: InboxAttachment): Promise<TrustedAttachmentSource | null> {
+  const key = messageAttachmentStorageKey(att, env.R2_PUBLIC_BASE)
+  if (!key) return null
   try {
     const { storage } = await import('../storage.js')
-    return await storage.publicUrl(att.key)
+    return { key, url: await storage.publicUrl(key), mode: storage.mode }
   } catch {
-    return att.url
+    return null
   }
 }
 
@@ -619,6 +633,18 @@ function renderContext(
       // quote target keep treating it as a general group message and
       // chime in unprompted; this puts the address signal in the
       // glance-zone of the wake prompt.
+      // An exact @-mention of the viewer is the strongest "this one is yours"
+      // signal a room carries, and it was only ever visible as raw text inside
+      // the body. Surface it in the same glance-zone as the quote tag below.
+      //
+      // Only the POSITIVE case is tagged. The mirror ("addressed to X — not
+      // you") would need the conversation's member list to tell a real
+      // participant from a stray @token, and the two errors are not
+      // symmetric: a wrong "not you" can silence the whole room, while a wrong
+      // "YOU" only costs one extra reply.
+      if (viewerAgentId && !m.is_self && mentionedAgentIds(m.body ?? '', [viewerAgentId]).length > 0) {
+        line += `  ↦ @-mentioned YOU`
+      }
       if (m.quoted_message_id && m.quoted && !m.is_self) {
         if (viewerAgentId && m.quoted.authorId === viewerAgentId) {
           line += `  ↦ addressed to YOU (quote-reply)`
@@ -704,27 +730,23 @@ async function readTextAttachment(att: InboxAttachment): Promise<TextExcerpt | n
   const looksTextual = mime.startsWith('text/') || TEXT_LIKE_MIMES.has(mime)
   if (!looksTextual) return null
 
+  const source = await trustedAttachmentSource(att)
+  if (!source) return null
   let buf: Buffer | null = null
-  if (att.url.startsWith('/uploads/')) {
+  if (source.mode === 'local') {
     // Local-mode file — read straight from disk to avoid a needless HTTP hop.
-    try {
-      const { readFile } = await import('node:fs/promises')
-      const { join } = await import('node:path')
-      const { UPLOAD_DIR } = await import('../storage.js')
-      const rel = att.url.replace(/^\/uploads\//, '')
-      const data = await readFile(join(UPLOAD_DIR, rel))
-      buf = Buffer.from(data)
-    } catch {
-      return null
-    }
+    // The helper resolves physical paths so an in-root symlink cannot escape.
+    const { UPLOAD_DIR } = await import('../storage.js')
+    buf = await readLocalMessageAttachment(UPLOAD_DIR, source.key)
   } else {
-    // R2 / external URL — re-sign just-in-time so an old persisted URL
-    // doesn't 403 at the Worker, then fetch with a short timeout so a
-    // flaky bucket can't stall the wake.
-    const fresh = await freshAttachmentUrl(att)
-    if (!/^https?:\/\//.test(fresh)) return null
+    // R2 URL was minted from the validated key above. Reject redirects so a
+    // compromised/misconfigured storage edge cannot pivot to a private host.
+    if (!/^https?:\/\//.test(source.url)) return null
     try {
-      const r = await fetch(fresh, { signal: AbortSignal.timeout(5000) })
+      const r = await fetch(source.url, {
+        signal: AbortSignal.timeout(5000),
+        redirect: 'error',
+      })
       if (!r.ok) return null
       buf = Buffer.from(await r.arrayBuffer())
     } catch {
@@ -765,8 +787,9 @@ async function collectImageAttachments(items: InboxRow[]): Promise<Array<{ messa
   for (const m of items) {
     const a = m.attachment
     if (!a || a.kind !== 'img' || !a.url) continue
-    const fresh = await freshAttachmentUrl(a)
-    const url = publicUrlFor(fresh)
+    const source = await trustedAttachmentSource(a)
+    if (!source) continue
+    const url = publicUrlFor(source.url)
     // Only ship images OpenAI can actually fetch. Local /uploads paths without
     // a PUBLIC_HOST get textually mentioned but not vision-fed.
     if (!/^https?:\/\//.test(url)) continue
@@ -1546,10 +1569,12 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
   if (!persona) return
 
   const inbox = await loadInbox(agentId)
-  const isIdleWake = options.trigger === 'idle' && inbox.length === 0
-  const isBackgroundScanWake = options.trigger === 'background_scan' && Boolean(options.backgroundBrief)
-  const isPollUpdateWake = options.trigger === 'poll.updated' && Boolean(options.pollBrief)
-  if (inbox.length === 0 && !isIdleWake && !isBackgroundScanWake && !isPollUpdateWake) return
+  const wake = classifyWake(options, inbox.length)
+  const isIdleWake = wake.idle
+  const isBackgroundScanWake = wake.backgroundScan
+  const isPollUpdateWake = wake.pollUpdate
+  const isBriefedManualWake = wake.briefedManual
+  if (inbox.length === 0 && !wake.survivesEmptyInbox) return
 
   const fingerprint = isIdleWake
     ? `idle:${new Date().toISOString()}`
@@ -1557,6 +1582,8 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
       ? `background_scan:${options.backgroundBrief?.source ?? 'scanner'}:${new Date().toISOString()}`
     : isPollUpdateWake
       ? `poll:${options.pollBrief?.messageId}:${options.pollBrief?.phase}:${options.pollBrief?.totalVotes ?? 0}:${new Date().toISOString()}`
+    : isBriefedManualWake
+      ? `manual:${options.backgroundBrief?.source ?? 'brief'}:${new Date().toISOString()}`
     : inbox.map((m) => m.id).join(',')
   const convoIds = [...new Set([
     ...inbox.map((m) => m.conversation_id),
@@ -1588,7 +1615,7 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
       source: options.trigger ?? 'scheduler',
       conversationIds: convoIds,
       idle: isIdleWake ? { reason: options.idleReason ?? 'idle heartbeat' } : undefined,
-      backgroundScan: isBackgroundScanWake
+      backgroundScan: (isBackgroundScanWake || isBriefedManualWake)
         ? {
             source: options.backgroundBrief?.source ?? 'scanner',
             title: options.backgroundBrief?.title ?? 'Background scan',
@@ -1864,7 +1891,7 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
       (options.trigger === undefined || options.trigger === 'message.new') &&
       !triageNote
     if (shouldRunInboxTriage) {
-      preloadedContext = await loadContext(agentId, convoIds)
+      preloadedContext = await loadContext(agentId, persona.companyId, convoIds)
       const verdict = await classifyInboxTriage({
         agentId,
         companyId: runCompanyId,
@@ -1920,7 +1947,7 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
   // agent up. For message wakes, use newest unread bodies. For idle
   // synthetic wakes, retrieve broad self/team memories without inventing
   // a fake message.
-  const memoryQuery = (isBackgroundScanWake
+  const memoryQuery = ((isBackgroundScanWake || isBriefedManualWake)
     ? [
         options.backgroundBrief?.title ?? 'background scan',
         options.backgroundBrief?.body ?? '',
@@ -1945,7 +1972,7 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
   ).slice(0, 4000)
 
   const [context, memory, climate, textExcerpts, skillsIndex] = await Promise.all([
-    preloadedContext ? Promise.resolve(preloadedContext) : loadContext(agentId, convoIds),
+    preloadedContext ? Promise.resolve(preloadedContext) : loadContext(agentId, persona.companyId, convoIds),
     loadMemory(agentId, memoryQuery, {}, runtime, { conversationIds: convoIds }),
     loadClimate(agentId),
     loadTextExcerpts(inbox),
@@ -2098,6 +2125,14 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
   const renderedConversationContext = renderContext(context, inbox.length, convoIds.length, textExcerpts, agentId)
   const wakeContext = isPollUpdateWake && options.pollBrief
     ? renderPollUpdateWakeContext(options.pollBrief, renderedConversationContext)
+    : isBriefedManualWake
+    ? `Someone just put this on you directly — it is a deliberate human action, not a scan or a heartbeat.
+
+${options.backgroundBrief?.title ?? 'Assigned work'}
+
+${options.backgroundBrief?.body ?? ''}
+
+Your chat inbox is empty; this wake exists because of the action above, so act on THAT rather than looking for a message to answer. Handle the work, or say plainly why you are not the right owner. If you genuinely have nothing to do here, call set_turn_status({ status: "done", reason: "...", next_step: "" }) and explain — do not silently drop it.`
     : isBackgroundScanWake
     ? `You just got an internal background scan brief. This is not a user chat message, and there is no obligation to interrupt anyone.
 

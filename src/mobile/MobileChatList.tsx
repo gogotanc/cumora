@@ -207,8 +207,8 @@ function MobileRow({ c, onTap, onLongPress }: {
               // Muted rows: keep the count visible (people still want
               // to know there's unread) but switch to a grey chip —
               // matches the "silent" affordance from the desktop pane.
-              background: muted ? 'var(--ink-200)' : (isFresh ? 'var(--gold)' : 'var(--coral)'),
-              color: muted ? 'var(--ink-700)' : (isFresh ? 'var(--ink-900)' : 'white'),
+              background: muted ? 'var(--ink-200)' : (isFresh ? 'var(--unread-fresh)' : 'var(--coral)'),
+              color: muted ? 'var(--ink-700)' : (isFresh ? 'var(--unread-fresh-fg)' : 'white'),
             }}>{c.unread}</span>
         )}
       </div>

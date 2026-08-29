@@ -38,9 +38,9 @@ export function DocumentsView() {
 
   return (
     <div className="grid h-full overflow-hidden" style={{ gridTemplateColumns: '280px 1fr' }}>
-      <aside className="border-r border-ink-100 bg-white flex flex-col min-h-0">
+      <aside className="border-r border-ink-100 bg-cloud flex flex-col min-h-0">
         <header className="px-4 py-3 flex items-center justify-between border-b border-ink-100">
-          <h2 className="font-display text-sm font-medium text-stone-800">{t('docs.title')}</h2>
+          <h2 className="font-display text-sm font-medium text-ink-900">{t('docs.title')}</h2>
           <button
             type="button"
             onClick={handleCreate}
@@ -53,10 +53,10 @@ export function DocumentsView() {
         </header>
         <div className="flex-1 overflow-y-auto py-2">
           {!loaded && (
-            <div className="px-4 py-6 text-xs text-stone-400">{t('common.loading')}</div>
+            <div className="px-4 py-6 text-xs text-ink-500">{t('common.loading')}</div>
           )}
           {loaded && list.length === 0 && (
-            <div className="px-4 py-6 text-xs text-stone-400">
+            <div className="px-4 py-6 text-xs text-ink-500">
               {t('docs.empty')}
             </div>
           )}
@@ -73,11 +73,11 @@ export function DocumentsView() {
                   'w-full text-left px-4 py-2.5 transition-colors block',
                   active
                     ? 'bg-skype/10 text-skype-deep'
-                    : 'hover:bg-stone-50 text-stone-700',
+                    : 'hover:bg-sky2-50 text-ink-700',
                 )}
               >
                 <div className="text-sm font-medium truncate">{d.title || t('docs.untitled')}</div>
-                <div className="text-[11px] text-stone-400 mt-0.5">
+                <div className="text-[11px] text-ink-500 mt-0.5">
                   {authorName} · {timeAgo(d.updatedAt, t)}
                 </div>
               </button>
@@ -85,11 +85,11 @@ export function DocumentsView() {
           })}
         </div>
       </aside>
-      <main className="min-h-0 overflow-hidden bg-white">
+      <main className="min-h-0 overflow-hidden bg-cloud">
         {selectedId ? (
           <DocumentEditor documentId={selectedId} />
         ) : (
-          <div className="h-full grid place-items-center text-stone-400 text-sm">
+          <div className="h-full grid place-items-center text-ink-500 text-sm">
             {list.length === 0
               ? t('docs.emptyCta')
               : t('docs.pickFromList')}

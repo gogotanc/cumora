@@ -150,6 +150,7 @@ runtimeRouter.get('/inbox', withAgent(async (c, req, res) => {
 // cloud quota. This is the whole point of BYOA: local compute. NB: no regex
 // decides anything — every actionability/mode call is the small model's.
 runtimeRouter.get('/inbox-triage/payload', withAgent(async (c, _req, res) => {
+  if (!c.companyId) { res.status(403).json({ error: 'companyId claim required' }); return }
   const persona = await inprocClient.loadPersona(c.sub)
   if (!persona) { res.status(404).json({ error: 'agent not found' }); return }
   const inbox = await inprocClient.loadInbox(c.sub)
@@ -169,7 +170,7 @@ runtimeRouter.get('/inbox-triage/payload', withAgent(async (c, _req, res) => {
     } })
     return
   }
-  const context = await inprocClient.loadContext(c.sub, convoIds)
+  const context = await inprocClient.loadContext(c.sub, c.companyId, convoIds)
   // Authoritative "real work here" signal (active worklog claims per
   // convo) — lets the gate suppress unclaimed agent-only chatter from FACT, and
   // sets the claim-aware loop-cap tier. Same gather the cloud path uses. The
@@ -260,8 +261,9 @@ runtimeRouter.post('/memory/query', withAgent(async (c, req, res) => {
 }))
 
 runtimeRouter.post('/context', withAgent(async (c, req, res) => {
+  if (!c.companyId) { res.status(403).json({ error: 'companyId claim required' }); return }
   const body = req.body as { conversationIds?: string[] } | undefined
-  const rows = await inprocClient.loadContext(c.sub, body?.conversationIds ?? [])
+  const rows = await inprocClient.loadContext(c.sub, c.companyId, body?.conversationIds ?? [])
   res.json({ rows })
 }))
 
@@ -421,7 +423,8 @@ runtimeRouter.post('/triage', withAgent(async (c, req, res) => {
 // per turn-completed (Codex) and batches them into one POST per N hops or
 // every ~250ms (whichever first). This endpoint accepts a batch + inserts
 // one llm_calls row per hop with the appropriate source ('byoa-claude' |
-// 'byoa-codex' | 'byoa-grok' | 'byoa-cursor'). Fire-and-forget; a DB hiccup must never break the wake.
+// 'byoa-codex' | 'byoa-grok' | 'byoa-cursor' | 'byoa-opencode' | 'byoa-pi').
+// Fire-and-forget; a DB hiccup must never break the wake.
 runtimeRouter.post('/llm-calls', withAgent(async (c, req, res) => {
   const body = req.body as {
     source?: string
@@ -441,7 +444,11 @@ runtimeRouter.post('/llm-calls', withAgent(async (c, req, res) => {
       extras?: Record<string, unknown>
     }>
   } | undefined
-  const source = (body?.source === 'byoa-claude' || body?.source === 'byoa-codex' || body?.source === 'byoa-grok' || body?.source === 'byoa-cursor') ? body.source : 'byoa-claude'
+  const source = (
+    body?.source === 'byoa-claude' || body?.source === 'byoa-codex' ||
+    body?.source === 'byoa-grok' || body?.source === 'byoa-cursor' ||
+    body?.source === 'byoa-opencode' || body?.source === 'byoa-pi'
+  ) ? body.source : 'byoa-claude'
   const daemonVersion = typeof body?.daemonVersion === 'string' && body.daemonVersion.trim() ? body.daemonVersion.trim().slice(0, 32) : null
   const hops = Array.isArray(body?.hops) ? body!.hops : []
   if (hops.length === 0) { res.json({ ok: true, inserted: 0 }); return }

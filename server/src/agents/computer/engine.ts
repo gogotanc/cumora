@@ -2,7 +2,8 @@
  * EngineAdapter — the pluggable "brain" for a BYOA agent.
  *
  * A BYOA agent's reasoning loop is delegated to a local CLI engine running
- * on the user's machine: Claude Code, Codex, Grok Build, or Cursor Agent. The daemon (daemon.ts) hands
+ * on the user's machine: Claude Code, Codex, Grok Build, Cursor Agent,
+ * OpenCode, or pi. The daemon (daemon.ts) hands
  * each wake to an adapter, which spawns the engine headlessly in the agent's
  * isolated home directory. The engine reads its persona + memory + skills
  * from that home natively (CLAUDE.md / AGENTS.md, .claude/skills, …) and acts
@@ -15,11 +16,12 @@
  * across engine versions. We pick sensible defaults for an isolated,
  * user-owned runner and let the user override via env
  * (CUMORA_CLAUDE_ARGS / CUMORA_CODEX_ARGS / CUMORA_GROK_ARGS /
- *  CUMORA_CURSOR_ARGS, space-split). Correctness of the
+ *  CUMORA_CURSOR_ARGS / CUMORA_OPENCODE_ARGS / CUMORA_PI_ARGS, space-split). Correctness of the
  * loop does not depend on the structured output — the agent acts via the
  * `cumora` tool regardless of how we parse stdout.
  */
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { mkdir, writeFile, access, mkdtemp } from 'node:fs/promises'
 import { existsSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
@@ -69,7 +71,10 @@ export function resolveSpawn(bin: string): { command: string; shell: boolean; wa
       const candidate = join(dir, bin + ext)
       if (existsSync(candidate)) {
         const isBatch = /\.(cmd|bat)$/i.test(candidate)
-        return { command: candidate, shell: true, wantsStdinPrompt: isBatch }
+        // When shell:true and the path contains spaces, cmd.exe will split the
+        // command at the space unless we quote it (e.g. "C:\Program Files\codex").
+        const command = isBatch && candidate.includes(' ') ? `"${candidate}"` : candidate
+        return { command, shell: isBatch, wantsStdinPrompt: isBatch }
       }
     }
   }
@@ -80,16 +85,19 @@ export function resolveSpawn(bin: string): { command: string; shell: boolean; wa
   for (const dir of (process.env.PATH ?? '').split(PATH_DELIMITER)) {
     if (!dir) continue
     const shim = join(dir, bin)
-    if (existsSync(shim)) return { command: shim, shell: true, wantsStdinPrompt: true }
+    if (existsSync(shim)) {
+      const command = shim.includes(' ') ? `"${shim}"` : shim
+      return { command, shell: true, wantsStdinPrompt: true }
+    }
   }
   // Not found on PATH at all — let the shell resolve it, and feed the prompt via stdin.
   return { command: bin, shell: true, wantsStdinPrompt: true }
 }
 
-export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor'
+export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi'
 
 /** The pairable engine ids, in the daemon's default detection order. */
-export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor']
+export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi']
 
 export interface EnginePersona {
   id: string
@@ -325,13 +333,24 @@ export interface EngineAdapter {
 /** The trivial prompt a `doctor` probe sends — one token of real work. */
 const DOCTOR_PROMPT = 'Connectivity check. Reply with exactly: OK'
 
-/** True if a binary is resolvable on PATH. */
-export async function binOnPath(bin: string): Promise<boolean> {
+type BinPathProbe = 'present' | 'absent' | 'error'
+
+/** Probe a binary without conflating "not installed" with an inability to run
+ *  the platform's PATH resolver at all. The distinction matters to the daemon's
+ *  periodic refresh: a healthy scan that finds nothing should clear a stale
+ *  inventory, while a missing/broken `which` or `where` should retain the last
+ *  known-good result. */
+async function probeBinOnPath(bin: string): Promise<BinPathProbe> {
   return new Promise((resolve) => {
     const probe = spawn(process.platform === 'win32' ? 'where' : 'which', [bin], { stdio: 'ignore' })
-    probe.on('error', () => resolve(false))
-    probe.on('close', (code) => resolve(code === 0))
+    probe.on('error', () => resolve('error'))
+    probe.on('close', (code) => resolve(code === 0 ? 'present' : code === 1 ? 'absent' : 'error'))
   })
+}
+
+/** True if a binary is resolvable on PATH. */
+export async function binOnPath(bin: string): Promise<boolean> {
+  return (await probeBinOnPath(bin)) === 'present'
 }
 
 async function exists(p: string): Promise<boolean> {
@@ -1330,10 +1349,11 @@ class CodexAdapter implements EngineAdapter {
     const model = ['--model', args.model || 'gpt-5.4-mini']
     const { command, shell } = resolveSpawn(this.bin)
     const argv = flags.length
-      ? ['exec', ...flags, args.prompt]
-      : ['exec', ...model, '--skip-git-repo-check', args.prompt]
+      ? ['exec', ...flags, '-']
+      : ['exec', ...model, '--skip-git-repo-check', '-']
     return spawnCapture(command, argv, {
       cwd: args.cwd, env: args.env, signal: args.signal, onLog: args.onLog, shell,
+      stdinText: args.prompt,
     })
   }
 
@@ -1343,9 +1363,9 @@ class CodexAdapter implements EngineAdapter {
     // for a tool-free one-token reply.
     const model = args.tier === 'small' ? ['--model', triageModel('gpt-5.4-mini')] : []
     const { command, shell } = resolveSpawn(this.bin)
-    const argv = ['exec', ...model, '--skip-git-repo-check', DOCTOR_PROMPT]
+    const argv = ['exec', ...model, '--skip-git-repo-check', '-']
     return spawnCapture(command, argv, {
-      cwd: args.cwd, env: args.env, signal: args.signal, shell,
+      cwd: args.cwd, env: args.env, signal: args.signal, shell, stdinText: DOCTOR_PROMPT,
     })
   }
 
@@ -1464,7 +1484,7 @@ class CodexAdapter implements EngineAdapter {
       : ['--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check']
     const model = args.model ? ['--model', args.model] : []
     const { command, shell } = resolveSpawn(this.bin)
-    return spawnEngine(command, ['exec', ...model, ...base, args.prompt], args, { shell })
+    return spawnEngine(command, ['exec', ...model, ...base, '-'], args, { shell, stdinText: args.prompt })
   }
 
   startSession(args: EngineSessionArgs): EngineSession | null {
@@ -2262,26 +2282,1070 @@ class CursorAdapter implements EngineAdapter {
   // the session id it reports (see the section note).
 }
 
+// ─── opencode ────────────────────────────────────────────────────────────
+//
+// OpenCode (the `opencode` CLI, contract verified against v1.18.20) is a
+// ONE-SHOT engine in Cumora. `opencode run --format json` starts a process for
+// one wake and emits JSONL events; continuity comes from passing the emitted
+// `sessionID` back through `--session <id>` on the next wake. OpenCode has an
+// ACP server, but that protocol is intended for editor clients and does not buy
+// us the daemon's standing-prompt/session semantics, so the supported path is
+// the documented `run` interface.
+//
+//   opencode run --format json --auto [--model provider/model]
+//     [--session <id>]                 # prompt always travels via stdin
+//
+// A `step_finish` event is one provider hop. Its token fields are already
+// disjoint (uncached input, output, reasoning, cache read/write), so the
+// adapter can report honest per-hop ledger rows and sum them for the turn.
+// OpenCode's event loop can race the terminal `session.status=idle` event and
+// omit the final step_finish even after a successful run, so process exit 0 is
+// authoritative; accounting is best-effort rather than a completion gate.
+// OpenCode's JSON stream does not currently include the resolved model when no
+// pin is supplied; in that case the hop uses the explicit `opencode` fallback
+// label rather than inventing a provider/model id.
+//
+// Full turns use `--auto` because the daemon is headless and the agent's home is
+// operator-owned. Triage/doctor deliberately do NOT: they select an injected
+// `cumora-triage` agent whose wildcard permission is `deny`, giving the small
+// brain a hard, tool-free boundary even if the user's normal OpenCode agent is
+// configured to allow shell or edits.
+
+interface OpenCodeTokens {
+  input?: unknown
+  output?: unknown
+  reasoning?: unknown
+  cache?: { read?: unknown; write?: unknown }
+}
+
+interface OpenCodePart {
+  type?: unknown
+  text?: unknown
+  tokens?: OpenCodeTokens
+}
+
+interface OpenCodeEvent {
+  type?: unknown
+  sessionID?: unknown
+  part?: OpenCodePart
+  error?: unknown
+}
+
+function openCodeUsage(tokens: OpenCodeTokens | undefined): EngineUsage | undefined {
+  if (!tokens || typeof tokens !== 'object') return undefined
+  const num = (value: unknown): number =>
+    typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : 0
+  return {
+    input_tokens: num(tokens.input),
+    // OpenCode keeps reasoning separate from ordinary output; Cumora's common
+    // usage shape prices both as output tokens, so fold them together here.
+    output_tokens: num(tokens.output) + num(tokens.reasoning),
+    cache_read_input_tokens: num(tokens.cache?.read),
+    cache_creation_input_tokens: num(tokens.cache?.write),
+  }
+}
+
+function addEngineUsage(total: EngineUsage | undefined, next: EngineUsage): EngineUsage {
+  return {
+    input_tokens: (total?.input_tokens ?? 0) + (next.input_tokens ?? 0),
+    output_tokens: (total?.output_tokens ?? 0) + (next.output_tokens ?? 0),
+    cache_read_input_tokens: (total?.cache_read_input_tokens ?? 0) + (next.cache_read_input_tokens ?? 0),
+    cache_creation_input_tokens: (total?.cache_creation_input_tokens ?? 0) + (next.cache_creation_input_tokens ?? 0),
+  }
+}
+
+function objectRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+function openCodeErrorText(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (!objectRecord(value)) return value == null ? 'unknown OpenCode error' : String(value)
+  const data = objectRecord(value.data) ? value.data : null
+  for (const candidate of [data?.message, value.message, value.name]) {
+    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim()
+  }
+  try { return JSON.stringify(value) } catch { return 'unknown OpenCode error' }
+}
+
+/** Fold OpenCode's JSONL into the common turn/result shape. */
+class OpenCodeTurnTracker {
+  sessionId: string | null = null
+  model: string | null
+  usage: EngineUsage | undefined
+  text = ''
+  error: string | null = null
+  private hopStartedAt: number | null = null
+  private hopIndex = 0
+  private hopTextChars = 0
+  private hopToolUses = 0
+
+  constructor(
+    pin: string | null,
+    private readonly onHopUsage?: (report: EngineHopReport) => void,
+  ) {
+    this.model = pin
+  }
+
+  observe(event: OpenCodeEvent): void {
+    if (typeof event.sessionID === 'string' && event.sessionID) this.sessionId = event.sessionID
+
+    if (event.type === 'error') {
+      this.error = openCodeErrorText(event.error)
+      return
+    }
+
+    if (event.type === 'step_start') {
+      this.hopStartedAt = Date.now()
+      this.hopTextChars = 0
+      this.hopToolUses = 0
+      return
+    }
+
+    if (event.type === 'text' && typeof event.part?.text === 'string') {
+      this.text += event.part.text
+      this.hopTextChars += event.part.text.length
+      return
+    }
+
+    if (event.type === 'tool_use') {
+      this.hopToolUses += 1
+      return
+    }
+
+    if (event.type !== 'step_finish') return
+    const hopUsage = openCodeUsage(event.part?.tokens)
+    if (!hopUsage) return
+    this.usage = addEngineUsage(this.usage, hopUsage)
+    this.hopIndex += 1
+    if (this.onHopUsage) {
+      try {
+        this.onHopUsage({
+          model: this.model ?? 'opencode',
+          usage: hopUsage,
+          latencyMs: this.hopStartedAt == null ? undefined : Date.now() - this.hopStartedAt,
+          hopIndex: this.hopIndex,
+          toolUses: this.hopToolUses,
+          textChars: this.hopTextChars,
+        })
+      } catch { /* ledger reporting is best-effort */ }
+    }
+    this.hopStartedAt = null
+    this.hopTextChars = 0
+    this.hopToolUses = 0
+  }
+}
+
+function parseOpenCodeLine(line: string): OpenCodeEvent | null {
+  if (!line.startsWith('{')) return null
+  try { return JSON.parse(line) as OpenCodeEvent } catch { return null }
+}
+
+/** Reuse the battle-tested one-shot process pump (UTF-8/chunk boundaries,
+ * abort handling, bounded failure tails) while folding each complete stdout
+ * line through the OpenCode tracker. */
+async function spawnOpenCodeStream(
+  command: string,
+  argv: string[],
+  opts: {
+    cwd: string
+    env: NodeJS.ProcessEnv
+    prompt: string
+    signal: AbortSignal
+    onLog?: (line: string) => void
+    shell: boolean
+    onHopUsage?: (report: EngineHopReport) => void
+    pin?: string | null
+  },
+): Promise<EngineRunResult & { text: string }> {
+  const tracker = new OpenCodeTurnTracker(opts.pin ?? null, opts.onHopUsage)
+  let processResult: EngineRunResult
+  try {
+    processResult = await spawnEngine(
+      command,
+      argv,
+      {
+        home: opts.cwd,
+        prompt: opts.prompt,
+        env: opts.env,
+        onLog: (line) => {
+          const event = parseOpenCodeLine(line)
+          if (event) tracker.observe(event)
+          opts.onLog?.(line)
+        },
+        signal: opts.signal,
+      },
+      { shell: opts.shell, stdinText: opts.prompt },
+    )
+  } catch (err) {
+    return {
+      exitCode: 1,
+      error: err instanceof Error ? err.message : String(err),
+      sessionId: tracker.sessionId,
+      usage: tracker.usage,
+      model: tracker.model,
+      text: tracker.text,
+    }
+  }
+
+  const eventError = tracker.error
+    ? `engine turn error: ${tracker.error.slice(0, MAX_FAILURE_CHARS)}`
+    : null
+  const streamError = eventError
+  const exitCode = processResult.exitCode !== 0 ? processResult.exitCode : (streamError ? 1 : 0)
+  return {
+    exitCode,
+    // A real process failure (auth, quota, bad flag, abort) is more useful than
+    // the secondary fact that its stream never reached step_finish. Promote a
+    // stream-only error only when the process itself exited cleanly. If the
+    // JSON stream also carried a provider error, append its decoded prose so
+    // stale-session/rate-limit recovery can match it without parsing JSON.
+    error: processResult.exitCode !== 0
+      ? [processResult.error, eventError].filter(Boolean).join('\n')
+      : (streamError ?? undefined),
+    sessionId: tracker.sessionId,
+    usage: tracker.usage,
+    model: tracker.model,
+    text: tracker.text,
+  }
+}
+
+const OPENCODE_TRIAGE_AGENT = 'cumora-triage'
+
+/** Inject a reserved, tool-free agent as the final inline config layer while
+ * preserving any provider/plugin config the operator already supplied there. */
+function openCodeTriageEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  let inline: Record<string, unknown> = {}
+  const raw = env.OPENCODE_CONFIG_CONTENT?.trim()
+  if (raw) {
+    let parsed: unknown
+    try { parsed = JSON.parse(raw) }
+    catch (err) {
+      throw new Error(`OPENCODE_CONFIG_CONTENT is not valid JSON: ${err instanceof Error ? err.message : String(err)}`)
+    }
+    if (!objectRecord(parsed)) throw new Error('OPENCODE_CONFIG_CONTENT must be a JSON object')
+    inline = parsed
+  }
+  const agents = objectRecord(inline.agent) ? inline.agent : {}
+  return {
+    ...env,
+    OPENCODE_CONFIG_CONTENT: JSON.stringify({
+      ...inline,
+      agent: {
+        ...agents,
+        [OPENCODE_TRIAGE_AGENT]: {
+          description: 'Cumora local small-brain classifier (tool-free)',
+          mode: 'primary',
+          prompt: 'Answer the user directly. Do not call tools or modify anything.',
+          permission: { '*': 'deny' },
+        },
+      },
+    }),
+  }
+}
+
+class OpenCodeAdapter implements EngineAdapter {
+  readonly id = 'opencode' as const
+  readonly bin = 'opencode'
+
+  private turn(prompt: string, args: {
+    cwd: string
+    env: NodeJS.ProcessEnv
+    signal: AbortSignal
+    onLog?: (line: string) => void
+    model?: string | null
+    resumeSessionId?: string | null
+    onHopUsage?: (report: EngineHopReport) => void
+  }): Promise<EngineRunResult & { text: string }> {
+    const { command, shell } = resolveSpawn(this.bin)
+    const model = args.model ? ['--model', args.model] : []
+    const resume = args.resumeSessionId ? ['--session', args.resumeSessionId] : []
+    return spawnOpenCodeStream(
+      command,
+      ['run', '--format', 'json', '--auto', ...resume, ...model],
+      {
+        cwd: args.cwd,
+        env: args.env,
+        prompt,
+        signal: args.signal,
+        onLog: args.onLog,
+        shell,
+        onHopUsage: args.onHopUsage,
+        pin: args.model ?? null,
+      },
+    )
+  }
+
+  private ask(prompt: string, args: {
+    cwd: string
+    env: NodeJS.ProcessEnv
+    signal: AbortSignal
+    onLog?: (line: string) => void
+    model?: string | null
+  }): Promise<EngineRunResult & { text: string }> {
+    const { command, shell } = resolveSpawn(this.bin)
+    const model = args.model ? ['--model', args.model] : []
+    return spawnOpenCodeStream(
+      command,
+      ['run', '--format', 'json', '--agent', OPENCODE_TRIAGE_AGENT, ...model],
+      {
+        cwd: args.cwd,
+        env: openCodeTriageEnv(args.env),
+        prompt,
+        signal: args.signal,
+        onLog: args.onLog,
+        shell,
+        pin: args.model ?? null,
+      },
+    )
+  }
+
+  async classify(args: EngineClassifyArgs): Promise<EngineClassifyResult> {
+    const flags = extraArgs('CUMORA_TRIAGE_ARGS')
+    if (flags.length) {
+      // User-owned output flags remain an escape hatch, but the reserved agent
+      // is appended last so the triage process stays tool-free.
+      const { command, shell } = resolveSpawn(this.bin)
+      return spawnCapture(command, ['run', ...flags, '--agent', OPENCODE_TRIAGE_AGENT], {
+        cwd: args.cwd,
+        env: openCodeTriageEnv(args.env),
+        signal: args.signal,
+        onLog: args.onLog,
+        shell,
+        stdinText: args.prompt,
+      })
+    }
+    const result = await this.ask(args.prompt, {
+      cwd: args.cwd,
+      env: args.env,
+      signal: args.signal,
+      onLog: args.onLog,
+      model: args.model,
+    })
+    return { text: result.text, error: result.error, usage: result.usage, model: result.model }
+  }
+
+  async probe(args: EngineProbeArgs): Promise<EngineClassifyResult> {
+    // OpenCode has no universal cheap model alias: provider/model ids are
+    // operator-specific. The small tier honors CUMORA_TRIAGE_MODEL; otherwise
+    // both probes use the operator's configured default.
+    const model = args.tier === 'small' ? (process.env.CUMORA_TRIAGE_MODEL?.trim() || null) : null
+    const result = await this.ask(DOCTOR_PROMPT, {
+      cwd: args.cwd,
+      env: args.env,
+      signal: args.signal,
+      model,
+    })
+    return { text: result.text, error: result.error, usage: result.usage, model: result.model }
+  }
+
+  probeWake(_args: EngineWakeProbeArgs): Promise<EngineWakeProbeResult> {
+    // The real wake is the same one-shot `opencode run` shape probe() already
+    // exercises; --session only adds continuity, not a second protocol.
+    return Promise.resolve({ ok: true, detail: '', skipped: true })
+  }
+
+  async seedHome(home: string, persona: EnginePersona): Promise<void> {
+    await ensureCommonHome(home)
+    await mkdir(join(home, '.opencode', 'skills'), { recursive: true })
+    await writeFile(
+      join(home, 'AGENTS.md'),
+      PERSONA_HEADER(persona, { personaFile: 'AGENTS.md', skillsDir: '.opencode/skills/' }),
+      'utf8',
+    )
+  }
+
+  async run(args: EngineRunArgs): Promise<EngineRunResult> {
+    const flags = extraArgs('CUMORA_OPENCODE_ARGS')
+    if (flags.length) {
+      // Whole user-owned run-flag override: output becomes opaque, but preserve
+      // the session id and stdin prompt so continuity and Windows safety remain.
+      const resume = args.resumeSessionId ? ['--session', args.resumeSessionId] : []
+      const { command, shell } = resolveSpawn(this.bin)
+      return spawnEngine(command, ['run', ...flags, ...resume], args, { shell, stdinText: args.prompt })
+    }
+    return this.turn(args.prompt, {
+      cwd: args.home,
+      env: args.env,
+      signal: args.signal,
+      onLog: args.onLog,
+      model: args.model,
+      resumeSessionId: args.resumeSessionId,
+      onHopUsage: args.onHopUsage,
+    })
+  }
+
+  // No startSession: the documented headless contract is one `run` process per
+  // wake; --session re-opens the same conversation in that fresh process.
+}
+
+// ─── pi ──────────────────────────────────────────────────────────────────
+//
+// pi (https://pi.dev, npm `@earendil-works/pi-coding-agent`) is a multi-provider
+// terminal coding agent. Two headless modes matter here, and they share ONE
+// event stream (pi's AgentSessionEvent JSONL):
+//   - `pi --mode json …`  one-shot: a `session` header line, then events, exit.
+//   - `pi --mode rpc`     persistent: JSON commands on stdin (`prompt`, `steer`,
+//                         `abort`, `get_state`, …), `response` frames + the same
+//                         events on stdout. LF-delimited on both sides.
+// A turn is finished at `agent_settled` — NOT `agent_end`, which pi can follow
+// with an automatic retry / queued continuation. Model failures do NOT change
+// the process exit code in json/rpc mode: they surface as an assistant message
+// with `stopReason: "error" | "aborted"` + `errorMessage`, so we read the stream,
+// not the exit status. Verified against pi 0.83.0.
+
+const PI_LOG_RAW = process.env.CUMORA_PI_VERBOSE === '1'
+
+/** pi's per-message token usage (`@earendil-works/pi-ai` Usage). `input`
+ *  EXCLUDES the cache-read portion — the same convention as Anthropic's
+ *  input_tokens — so it maps 1:1 onto the Claude-shaped EngineUsage the daemon
+ *  already prices (cacheWrite ↔ cache_creation, cacheRead ↔ cache_read). */
+interface PiUsage { input?: number; output?: number; cacheRead?: number; cacheWrite?: number }
+
+interface PiMessage {
+  role?: unknown
+  model?: unknown
+  usage?: PiUsage
+  stopReason?: unknown
+  errorMessage?: unknown
+  content?: unknown
+}
+
+/** The subset of pi's stream we act on (json + rpc). Everything else is logged
+ *  and ignored, so a new event type in a future pi never breaks a turn. */
+interface PiEvent {
+  type?: unknown
+  id?: unknown
+  command?: unknown
+  success?: unknown
+  error?: unknown
+  message?: PiMessage
+  data?: { sessionId?: unknown }
+  willRetry?: unknown
+  messages?: unknown
+}
+
+/** Streaming deltas: one line per token / per tool-output chunk. Never logged or
+ *  kept in the failure tail unless CUMORA_PI_VERBOSE=1 — the same fire-hose gate
+ *  Codex has (CUMORA_CODEX_VERBOSE). */
+function isNoisyPiEvent(ev: PiEvent): boolean {
+  return !PI_LOG_RAW && (ev.type === 'message_update' || ev.type === 'tool_execution_update')
+}
+
+/** What to log for one pi event. `turn_end` / `agent_end` embed the full
+ *  message list (the whole transcript slice) — collapse those to a one-liner so a
+ *  long turn doesn't dump kilobytes into the daemon log per hop; every other
+ *  event is logged verbatim (message_end included: that's the useful one). */
+function piLogLine(ev: PiEvent, raw: string): string {
+  if (PI_LOG_RAW) return raw
+  if (ev.type === 'agent_end') return `[pi] agent_end (${Array.isArray(ev.messages) ? ev.messages.length : '?'} messages, willRetry=${ev.willRetry === true})`
+  if (ev.type === 'turn_end') return '[pi] turn_end'
+  return raw
+}
+
+function piUsageToEngineUsage(u: PiUsage | undefined): EngineUsage | undefined {
+  if (!u || typeof u !== 'object') return undefined
+  return {
+    input_tokens: Number(u.input ?? 0) || 0,
+    output_tokens: Number(u.output ?? 0) || 0,
+    cache_read_input_tokens: Number(u.cacheRead ?? 0) || 0,
+    cache_creation_input_tokens: Number(u.cacheWrite ?? 0) || 0,
+  }
+}
+
+/** pi content items are `{type:'text'|'thinking'|'toolCall', …}` — the same
+ *  question countAssistantContent answers for Claude (did this hop's spend go
+ *  into tool routing or prose?), with pi's spelling of the tool item. */
+function countPiContent(content: unknown): { toolUses: number; textChars: number } {
+  if (!Array.isArray(content)) return { toolUses: 0, textChars: 0 }
+  let toolUses = 0, textChars = 0
+  for (const item of content) {
+    if (!item || typeof item !== 'object') continue
+    const it = item as { type?: unknown; text?: unknown }
+    if (it.type === 'toolCall') toolUses += 1
+    else if (it.type === 'text' && typeof it.text === 'string') textChars += it.text.length
+  }
+  return { toolUses, textChars }
+}
+
+function piTextOf(content: unknown): string {
+  if (!Array.isArray(content)) return ''
+  let out = ''
+  for (const item of content) {
+    if (!item || typeof item !== 'object') continue
+    const it = item as { type?: unknown; text?: unknown }
+    if (it.type === 'text' && typeof it.text === 'string') out += it.text
+  }
+  return out
+}
+
+/** Folds pi's event stream into what the daemon wants from a turn: the real
+ *  session id, ONE EngineHopReport per assistant message, the turn's summed
+ *  usage + last model (for the run row — pi has no Claude-style `result` total),
+ *  the assistant's final text (triage reads it), and the first hard error.
+ *  Shared by the persistent PiSession and the one-shot json spawn so both paths
+ *  ledger identically — the same split CursorTurnTracker serves for Cursor. */
+class PiTurnTracker {
+  sessionId: string | null = null
+  model: string | null = null
+  usage: EngineUsage | undefined
+  text = ''
+  error: string | null = null
+  private hopIndex = 0
+  private hopStartedAt: number | null = null
+
+  constructor(private readonly onHopUsage?: (r: EngineHopReport) => void) {}
+
+  /** Reset the per-turn accumulators (a persistent session runs many turns). */
+  beginTurn(): void {
+    this.usage = undefined
+    this.text = ''
+    this.error = null
+    this.hopIndex = 0
+    this.hopStartedAt = null
+  }
+
+  /** Feed one event. Returns true when the event terminates the turn. */
+  observe(ev: PiEvent): boolean {
+    if (ev.type === 'session') {
+      if (typeof ev.id === 'string' && ev.id) this.sessionId = ev.id
+      return false
+    }
+    // An assistant message begins streaming = one outbound model call begins.
+    if (ev.type === 'message_start' && ev.message?.role === 'assistant' && this.hopStartedAt == null) {
+      this.hopStartedAt = Date.now()
+      return false
+    }
+    if (ev.type === 'message_end' && ev.message?.role === 'assistant') {
+      const m = ev.message
+      const model = typeof m.model === 'string' && m.model ? m.model : null
+      if (model) this.model = model
+      const usage = piUsageToEngineUsage(m.usage)
+      if (usage) this.usage = addEngineUsage(this.usage, usage)
+      const text = piTextOf(m.content)
+      if (text) this.text = text
+      if (m.stopReason === 'error' || m.stopReason === 'aborted') {
+        this.error = typeof m.errorMessage === 'string' && m.errorMessage ? m.errorMessage : `pi turn ${String(m.stopReason)}`
+      }
+      // Per-hop trajectory — same contract as ClaudeSession.onStdout: one report
+      // per model call so the universal ledger sees BYOA hops at the same
+      // granularity as cloud hops.
+      if (usage && model && this.onHopUsage) {
+        const startedAt = this.hopStartedAt
+        this.hopStartedAt = null
+        this.hopIndex += 1
+        const { toolUses, textChars } = countPiContent(m.content)
+        try {
+          this.onHopUsage({ model, usage, latencyMs: startedAt != null ? Date.now() - startedAt : undefined, hopIndex: this.hopIndex, toolUses, textChars })
+        } catch { /* ledger is best-effort — never break the stream */ }
+      } else {
+        this.hopStartedAt = null
+      }
+      return false
+    }
+    return ev.type === 'agent_settled'
+  }
+}
+
+/** Parse one stdout line of pi's stream. Non-JSON lines (banners, warnings that
+ *  land on stdout) come back as null and are logged verbatim by the caller. */
+function parsePiLine(line: string): PiEvent | null {
+  if (!line.startsWith('{')) return null
+  try { return JSON.parse(line) as PiEvent } catch { return null }
+}
+
+/** One-shot `pi --mode json …`: spawn, fold the stream through a
+ *  PiTurnTracker, resolve on exit. The tracker's error is folded into the
+ *  result because pi's exit code says nothing about the model call (see the
+ *  module note above). Text is the last assistant message's text — what
+ *  classify()/probe() want. */
+function spawnPiJson(
+  command: string,
+  args: string[],
+  opts: { cwd: string; env: NodeJS.ProcessEnv; signal: AbortSignal; onLog?: (line: string) => void; shell: boolean; stdinText?: string; onHopUsage?: (r: EngineHopReport) => void },
+): Promise<EngineRunResult & { text: string }> {
+  return new Promise((resolve) => {
+    const tracker = new PiTurnTracker(opts.onHopUsage)
+    const child = spawn(command, args, {
+      cwd: opts.cwd, env: opts.env,
+      stdio: [opts.stdinText != null ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+      shell: opts.shell,
+    })
+    if (opts.stdinText != null) {
+      try { child.stdin?.write(opts.stdinText); child.stdin?.end() } catch { /* the 'error' handler resolves */ }
+    }
+    const onAbort = (): void => { child.kill('SIGTERM') }
+    opts.signal.addEventListener('abort', onAbort, { once: true })
+    // StringDecoder + carried partial line, for the same reason spawnEngine has
+    // them: a pipe read chops a long event (a big message_end) at an arbitrary
+    // byte offset, and a naive per-chunk split would hand JSON.parse two halves.
+    const decoder = new StringDecoder('utf8')
+    let carry = ''
+    const stderrTail: string[] = []
+    const stdoutTail: string[] = []
+    const takeLine = (raw: string): void => {
+      const line = cleanLine(raw)
+      if (!line) return
+      const ev = parsePiLine(line)
+      if (ev && isNoisyPiEvent(ev)) return
+      const shown = ev ? piLogLine(ev, line) : line
+      pushTail(stdoutTail, shown)
+      opts.onLog?.(shown)
+      if (ev) tracker.observe(ev)
+    }
+    const pump = (buf: Buffer | null): void => {
+      const text = buf === null ? decoder.end() : decoder.write(buf)
+      const lines = (carry + text).split('\n')
+      carry = buf === null ? '' : (lines.pop() ?? '')
+      for (const line of lines) takeLine(line)
+      if (buf === null && carry === '' && lines.length === 0) return
+    }
+    child.stdout?.on('data', (buf: Buffer) => pump(buf))
+    child.stderr?.on('data', (buf: Buffer) => {
+      for (const raw of buf.toString('utf8').split('\n')) {
+        const line = cleanLine(raw)
+        if (!line) continue
+        pushTail(stderrTail, line)
+        opts.onLog?.(line)
+      }
+    })
+    child.on('error', (err) => {
+      opts.signal.removeEventListener('abort', onAbort)
+      resolve({ exitCode: 1, error: err instanceof Error ? err.message : String(err), sessionId: null, text: '' })
+    })
+    child.on('close', (code, signalName) => {
+      opts.signal.removeEventListener('abort', onAbort)
+      pump(null) // flush a final line without a trailing newline
+      const procExit = code ?? (signalName ? 128 : 1)
+      const exitCode = procExit !== 0 ? procExit : (tracker.error ? 1 : 0)
+      const error = procExit !== 0
+        ? failurePreview({ exitCode: procExit, signalName, stderr: stderrTail, stdout: stdoutTail })
+        : (tracker.error ? `engine turn error: ${tracker.error.slice(0, MAX_FAILURE_CHARS)}` : undefined)
+      resolve({ exitCode, error, sessionId: tracker.sessionId, usage: tracker.usage, model: tracker.model, text: tracker.text })
+    })
+  })
+}
+
+/** A persistent pi process for ONE agent, driven over `pi --mode rpc` (see the
+ *  module note): each `send()` writes ONE `prompt` command and resolves at that
+ *  turn's `agent_settled`. Steering is native — `steer` is delivered by pi
+ *  itself before the agent's next model call — so there is no stream-boundary
+ *  bookkeeping here. The daemon calls send() serially. */
+class PiSession implements EngineSession {
+  private readonly child: ChildProcess
+  private readonly onLog: (line: string) => void
+  private readonly tracker: PiTurnTracker
+  private readonly decoder = new StringDecoder('utf8')
+  private outBuf = ''
+  private exited = false
+  private exitCode = 0
+  private reqId = 0
+  private pending: { id: string; resolve: (r: EngineRunResult) => void; stderr: string[]; stdout: string[] } | null = null
+  private stderrTail: string[] = []
+  private stdoutTail: string[] = []
+  private pendingTimer: ReturnType<typeof setTimeout> | null = null
+  private stopTimer: ReturnType<typeof setTimeout> | null = null
+  readonly carriesStandingPrompt: boolean
+
+  constructor(bin: string, args: string[], opts: EngineSessionArgs, sessionId: string, carriesStandingPrompt: boolean) {
+    this.onLog = opts.onLog
+    this.tracker = new PiTurnTracker(opts.onHopUsage)
+    this.tracker.sessionId = sessionId
+    this.carriesStandingPrompt = carriesStandingPrompt
+    // Cross-platform spawn (Windows: `pi.cmd` via the shell). Everything travels
+    // over stdin as JSON here, so there are no argv-quoting concerns.
+    const { command, shell } = resolveSpawn(bin)
+    this.child = spawn(command, args, { cwd: opts.home, env: opts.env, stdio: ['pipe', 'pipe', 'pipe'], shell })
+    this.child.stdout?.on('data', (b: Buffer) => this.onStdout(b))
+    this.child.stderr?.on('data', (b: Buffer) => this.onStderr(b))
+    this.child.on('error', (err) => this.die(1, err.message))
+    this.child.on('close', (code, signalName) =>
+      this.die(code ?? (signalName ? 128 : 1), signalName ? `terminated by ${signalName}` : `exited with code ${code}`))
+    // Ask pi which session it actually opened. It should be the --session-id we
+    // passed; if a future pi ever rewrites it, we resume the REAL one next time.
+    this.write({ id: 'state', type: 'get_state' })
+  }
+
+  get alive(): boolean { return !this.exited && this.child.stdin?.writable === true }
+  get sessionId(): string | null { return this.tracker.sessionId }
+
+  send(prompt: string): Promise<EngineRunResult> {
+    if (this.pending) {
+      return Promise.resolve({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.sessionId })
+    }
+    if (!this.alive) {
+      const exitCode = this.exitCode || 1
+      const detail = failurePreview({ exitCode, signalName: null, stderr: this.stderrTail, stdout: this.stdoutTail })
+      return Promise.resolve({ exitCode, error: detail || 'engine session is not alive (process gone)', sessionId: this.sessionId })
+    }
+    return new Promise<EngineRunResult>((resolve) => {
+      const id = `turn-${++this.reqId}`
+      this.pending = { id, resolve, stderr: [], stdout: [] }
+      this.tracker.beginTurn()
+      // Opt-in runaway backstop only (CUMORA_TURN_TIMEOUT_MS); OFF by default so a
+      // legit long task is never killed mid-work. When set: abort the run, fail the
+      // turn, tear the process down — the daemon respawns (--session-id) next wake.
+      if (TURN_TIMEOUT_MS > 0) {
+        this.pendingTimer = setTimeout(() => {
+          this.write({ type: 'abort' })
+          this.settle({ exitCode: 124, error: `engine turn exceeded CUMORA_TURN_TIMEOUT_MS (${Math.round(TURN_TIMEOUT_MS / 1000)}s) — aborted; session will respawn`, sessionId: this.sessionId })
+          this.stop()
+        }, TURN_TIMEOUT_MS)
+        this.pendingTimer.unref?.()
+      }
+      if (!this.write({ id, type: 'prompt', message: stripLoneSurrogates(prompt) })) {
+        this.settle({ exitCode: 1, error: 'failed to write turn to engine', sessionId: this.sessionId })
+      }
+    })
+  }
+
+  /** Same-turn steering: pi queues the message and delivers it after the current
+   *  assistant turn's tool calls, before the next model call — the exact "next
+   *  safe boundary" the Claude path has to compute by hand. No-op when idle (the
+   *  daemon's normal turn handles it then). */
+  steer(text: string): void {
+    if (this.pending && this.alive && text.trim()) this.write({ type: 'steer', message: stripLoneSurrogates(text) })
+  }
+
+  stop(): void {
+    this.exited = true
+    if (this.stopTimer) return
+    // pi exits cleanly when stdin closes (it disposes the session and returns 0),
+    // so close stdin first and only SIGTERM a process that hasn't gone by itself.
+    try { this.child.stdin?.end() } catch { /* ignore */ }
+    this.stopTimer = setTimeout(() => { try { this.child.kill('SIGTERM') } catch { /* ignore */ } }, 2000)
+    this.stopTimer.unref?.()
+  }
+
+  private write(msg: object): boolean {
+    try { this.child.stdin!.write(`${JSON.stringify(msg)}\n`); return true } catch { return false }
+  }
+
+  private onStdout(buf: Buffer): void {
+    // StringDecoder so a multi-byte character split across a pipe chunk never
+    // becomes U+FFFD inside a JSON line (same fix as the one-shot paths).
+    this.outBuf += this.decoder.write(buf)
+    let nl: number
+    while ((nl = this.outBuf.indexOf('\n')) >= 0) {
+      const line = cleanLine(this.outBuf.slice(0, nl))
+      this.outBuf = this.outBuf.slice(nl + 1)
+      if (!line) continue
+      const ev = parsePiLine(line)
+      if (ev && isNoisyPiEvent(ev)) continue
+      const shown = ev ? piLogLine(ev, line) : line
+      pushTail(this.stdoutTail, shown)
+      if (this.pending) pushTail(this.pending.stdout, shown)
+      this.onLog(shown)
+      if (!ev) continue
+      if (ev.type === 'response') { this.onResponse(ev); continue }
+      // Observe pi's NATIVE auto-compaction (telemetry only), like the Claude path.
+      if (ev.type === 'compaction_start') this.onLog('[pi] native context compaction started')
+      else if (ev.type === 'compaction_end') this.onLog('[pi] native context compaction finished')
+      if (this.tracker.observe(ev) && this.pending) {
+        this.settle({
+          exitCode: this.tracker.error ? 1 : 0,
+          error: this.tracker.error ? `engine turn error: ${this.tracker.error.slice(0, MAX_FAILURE_CHARS)}` : undefined,
+          sessionId: this.sessionId,
+          usage: this.tracker.usage,
+          model: this.tracker.model,
+        })
+      }
+    }
+  }
+
+  private onResponse(ev: PiEvent): void {
+    if (ev.id === 'state') {
+      const sid = ev.data?.sessionId
+      if (typeof sid === 'string' && sid) this.tracker.sessionId = sid
+      return
+    }
+    // A prompt rejected BEFORE acceptance (`success:false`) gets no events at all
+    // — settle now or the turn would hang until the daemon's timeout.
+    if (this.pending && ev.id === this.pending.id && ev.command === 'prompt' && ev.success === false) {
+      this.settle({ exitCode: 1, error: `pi rejected the turn: ${typeof ev.error === 'string' && ev.error ? ev.error : 'unknown error'}`, sessionId: this.sessionId })
+    }
+  }
+
+  private onStderr(buf: Buffer): void {
+    for (const raw of buf.toString('utf8').split('\n')) {
+      const line = cleanLine(raw)
+      if (!line) continue
+      pushTail(this.stderrTail, line)
+      if (this.pending) pushTail(this.pending.stderr, line)
+      this.onLog(line)
+    }
+  }
+
+  private settle(r: EngineRunResult): void {
+    if (this.pendingTimer) { clearTimeout(this.pendingTimer); this.pendingTimer = null }
+    const p = this.pending
+    this.pending = null
+    if (p) p.resolve(r)
+  }
+
+  /** Process died (error/close). Mark dead and fail any in-flight turn — always
+   *  logged, even when idle, for the same reason ClaudeSession does it. */
+  private die(code: number, why: string): void {
+    const alreadyDown = this.exited
+    this.exited = true
+    this.exitCode = code
+    if (this.stopTimer) { clearTimeout(this.stopTimer); this.stopTimer = null }
+    if (!alreadyDown) {
+      this.onLog(`[session] engine process died ${this.pending ? 'MID-TURN' : 'while idle'}: ${why} (exit ${code})`)
+    }
+    if (this.pending) {
+      const detail = failurePreview({ exitCode: code, signalName: null, stderr: this.pending.stderr, stdout: this.pending.stdout })
+      this.settle({ exitCode: code, error: detail || why, sessionId: this.sessionId })
+    }
+  }
+}
+
+class PiAdapter implements EngineAdapter {
+  readonly id = 'pi' as const
+  readonly bin = 'pi'
+
+  /** A clean, tool-free, persona-free one-shot: no session file, no built-in /
+   *  extension tools, no extensions, no skills, no AGENTS.md discovery. The pi
+   *  analogue of Claude's `--strict-mcp-config` triage spawn. */
+  private static readonly BARE = ['--no-session', '--no-tools', '--no-extensions', '--no-skills', '--no-context-files']
+
+  /** BYOA turns are short reactive cycles; extended thinking adds latency and,
+   *  in a group @all, makes the slowest agent bow out on the "don't duplicate"
+   *  rule (same reasoning as Claude's MAX_THINKING_TOKENS=0). pi's per-model
+   *  `provider/id:<level>` suffix is the user's opt-in — when the model carries
+   *  one, don't fight it. */
+  private static thinking(model: string | null | undefined): string[] {
+    return model && model.includes(':') ? [] : ['--thinking', 'off']
+  }
+
+  private oneShot(prompt: string, args: { cwd: string; env: NodeJS.ProcessEnv; signal: AbortSignal; onLog?: (line: string) => void; model?: string | null }): Promise<EngineRunResult & { text: string }> {
+    const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
+    const model = args.model ? ['--model', args.model] : []
+    // Windows: the .cmd shim runs via the shell, which can't carry a big
+    // multi-line prompt as an argv element → stdin (pi reads a piped stdin as the
+    // message when stdin isn't a TTY). POSIX: prompt in argv.
+    const base = ['--mode', 'json', ...PiAdapter.BARE, ...PiAdapter.thinking(args.model), ...model]
+    return spawnPiJson(command, wantsStdinPrompt ? base : [...base, prompt], {
+      cwd: args.cwd, env: args.env, signal: args.signal, onLog: args.onLog, shell,
+      stdinText: wantsStdinPrompt ? prompt : undefined,
+    })
+  }
+
+  async classify(args: EngineClassifyArgs): Promise<EngineClassifyResult> {
+    // pi is multi-provider, so there is no single cheap "cerebellum" id to hard-
+    // code (claude→haiku, codex→gpt-5.4-mini). CUMORA_TRIAGE_MODEL picks one
+    // (`provider/id`); unset → pi's own default model, which keeps triage local
+    // (never the cloud) at the cost of not being cheaper than the big brain.
+    // The json stream names the model that actually ran, so the ledger prices
+    // the real one either way.
+    const flags = extraArgs('CUMORA_TRIAGE_ARGS')
+    if (flags.length) {
+      // User-owned flag set → plain print mode, raw text back (mirrors Claude's
+      // override path: no envelope to unwrap, no usage).
+      const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
+      const base = [...flags, '-p']
+      return spawnCapture(command, wantsStdinPrompt ? base : [...base, args.prompt], {
+        cwd: args.cwd, env: args.env, signal: args.signal, onLog: args.onLog, shell,
+        stdinText: wantsStdinPrompt ? args.prompt : undefined,
+      })
+    }
+    const r = await this.oneShot(args.prompt, { cwd: args.cwd, env: args.env, signal: args.signal, onLog: args.onLog, model: args.model })
+    return { text: r.text, error: r.error, usage: r.usage, model: r.model }
+  }
+
+  async probe(args: EngineProbeArgs): Promise<EngineClassifyResult> {
+    // 'small' → whatever triage runs on (CUMORA_TRIAGE_MODEL, else pi's default —
+    // the same model as 'big', honestly reported as such); 'big' → pi's default.
+    const model = args.tier === 'small' ? (process.env.CUMORA_TRIAGE_MODEL || null) : null
+    const r = await this.oneShot(DOCTOR_PROMPT, { cwd: args.cwd, env: args.env, signal: args.signal, model })
+    return { text: r.text, error: r.error, usage: r.usage, model: r.model }
+  }
+
+  probeWake(args: EngineWakeProbeArgs): Promise<EngineWakeProbeResult> {
+    // Same gate as startSession(): a CUMORA_PI_ARGS override collapses the wake to
+    // one-shot print mode, which probe() already covers.
+    if (extraArgs('CUMORA_PI_ARGS').length) return Promise.resolve({ ok: true, detail: '', skipped: true })
+    // The real wake speaks the rpc protocol. The realistic breaks are: `--mode rpc`
+    // renamed/removed, or the command/response framing changed. Drive the cheapest
+    // round-trip there is — `get_state` needs no model call — and tear down.
+    const { command, shell } = resolveSpawn(this.bin)
+    return new Promise<EngineWakeProbeResult>((resolve) => {
+      let settled = false
+      const finish = (r: EngineWakeProbeResult): void => {
+        if (settled) return
+        settled = true
+        try { child.stdin?.end() } catch { /* ignore */ }
+        try { child.kill('SIGTERM') } catch { /* ignore */ }
+        resolve(r)
+      }
+      const child = spawn(command, ['--mode', 'rpc', ...PiAdapter.BARE], {
+        cwd: args.cwd, env: args.env, stdio: ['pipe', 'pipe', 'pipe'], shell,
+      })
+      const onAbort = (): void => finish({ ok: false, detail: 'aborted (timeout)' })
+      if (args.signal.aborted) { onAbort(); return }
+      args.signal.addEventListener('abort', onAbort, { once: true })
+      let buf = ''
+      let stderrTail = ''
+      try { child.stdin?.write(`${JSON.stringify({ id: 'doctor', type: 'get_state' })}\n`) } catch { /* close handler reports */ }
+      child.stdout?.on('data', (b: Buffer) => {
+        buf += b.toString('utf8')
+        for (;;) {
+          const nl = buf.indexOf('\n')
+          if (nl < 0) break
+          const line = buf.slice(0, nl).trim()
+          buf = buf.slice(nl + 1)
+          const ev = parsePiLine(line)
+          if (!ev || ev.type !== 'response' || ev.id !== 'doctor') continue
+          if (ev.success === true) finish({ ok: true, detail: '' })
+          else finish({ ok: false, detail: `rpc get_state failed: ${typeof ev.error === 'string' ? ev.error.slice(0, 240) : 'unknown error'}` })
+          return
+        }
+      })
+      child.stderr?.on('data', (b: Buffer) => {
+        const tail = stderrTail + b.toString('utf8')
+        stderrTail = tail.length > 2000 ? tail.slice(-2000) : tail
+      })
+      child.on('error', (err) => finish({ ok: false, detail: `spawn error: ${err.message}` }))
+      child.on('close', (code, sig) => {
+        if (settled) return
+        finish({ ok: false, detail: `rpc process died before answering get_state (${sig ? `terminated by ${sig}` : `exit ${code}`}): ${salientError(stderrTail) || 'no stderr'}` })
+      })
+    })
+  }
+
+  async seedHome(home: string, persona: EnginePersona): Promise<void> {
+    await ensureCommonHome(home)
+    await mkdir(join(home, '.pi', 'skills'), { recursive: true })
+    // Always rewrite AGENTS.md so persona edits land without requiring a fresh
+    // home (matches Claude and Codex). pi discovers AGENTS.md from its cwd
+    // natively; skills are loaded explicitly via --skill (see startSession) since
+    // pi's non-interactive modes ignore project resources in an untrusted dir.
+    await writeFile(
+      join(home, 'AGENTS.md'),
+      PERSONA_HEADER(persona, { personaFile: 'AGENTS.md', skillsDir: '.pi/skills/' }),
+      'utf8',
+    )
+  }
+
+  async run(args: EngineRunArgs): Promise<EngineRunResult> {
+    const flags = extraArgs('CUMORA_PI_ARGS')
+    if (flags.length) {
+      // User-owned flag set → one-shot print mode with their flags. We still pin
+      // the session so context carries across wakes; nothing structured comes
+      // back (no stream to sniff), so report the id we passed.
+      const sid = args.resumeSessionId ?? randomUUID()
+      const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
+      const base = [...flags, '--session-id', sid, '-p']
+      const r = await spawnEngine(command, wantsStdinPrompt ? base : [...base, args.prompt], args, { shell, stdinText: wantsStdinPrompt ? args.prompt : undefined })
+      return { ...r, sessionId: r.sessionId ?? sid }
+    }
+    // Default: the persistent rpc path is the ONLY protocol we drive, so a one-shot
+    // is simply a session that lives for one turn. Same parser, same ledger.
+    const session = this.startSession({
+      home: args.home, env: args.env, model: args.model, fastModel: args.fastModel,
+      resumeSessionId: args.resumeSessionId, onLog: args.onLog, onHopUsage: args.onHopUsage,
+    })
+    if (!session) return { exitCode: 1, error: 'pi session could not be started', sessionId: args.resumeSessionId ?? null }
+    const onAbort = (): void => session.stop()
+    args.signal.addEventListener('abort', onAbort, { once: true })
+    try {
+      return await session.send(args.prompt)
+    } finally {
+      args.signal.removeEventListener('abort', onAbort)
+      session.stop()
+    }
+  }
+
+  startSession(args: EngineSessionArgs): EngineSession | null {
+    // Respect a user's custom flag override by NOT using the persistent path —
+    // those flags are tuned for one-shot print mode; fall back to run().
+    if (extraArgs('CUMORA_PI_ARGS').length) return null
+    // Continuous context across wakes: pin the session id ourselves (`--session-id`
+    // creates it when missing, resumes it when present) so a respawn — daemon
+    // restart, timeout, crash — picks up where the agent left off.
+    const sid = args.resumeSessionId ?? randomUUID()
+    const model = args.model ? ['--model', args.model] : []
+    // The invariant standing prompt loads ONCE here (not re-sent every turn), so
+    // the per-turn stdin messages stay small and pi's native auto-compaction keeps
+    // up. `--append-system-prompt` takes a file path.
+    let sys: string[] = []
+    let carriesStanding = false
+    if (args.standingPrompt) {
+      const file = join(args.home, '.cumora-standing-prompt.md')
+      try { writeFileSync(file, args.standingPrompt, { mode: 0o600 }); sys = ['--append-system-prompt', file]; carriesStanding = true }
+      catch { /* couldn't write → leave it; the daemon inlines the standing prompt instead */ }
+    }
+    const argv = [
+      '--mode', 'rpc', '--session-id', sid, ...sys, ...model, ...PiAdapter.thinking(args.model),
+      // Load the agent's own skills explicitly: pi's non-interactive modes ignore
+      // project-local resources in an untrusted directory, and trusting the home
+      // outright (`--approve`) would also enable project settings/extensions.
+      '--skill', join(args.home, '.pi', 'skills'),
+    ]
+    return new PiSession(this.bin, argv, args, sid, carriesStanding)
+  }
+}
+
 const ADAPTERS: Record<EngineId, EngineAdapter> = {
   claude: new ClaudeAdapter(),
   codex: new CodexAdapter(),
   grok: new GrokAdapter(),
   cursor: new CursorAdapter(),
+  opencode: new OpenCodeAdapter(),
+  pi: new PiAdapter(),
 }
 
 export function getAdapter(id: EngineId): EngineAdapter {
   return ADAPTERS[id]
 }
 
+export interface EngineDetection {
+  engines: EngineId[]
+  /** False when `which` / `where` itself failed, so missing engines cannot be
+   *  distinguished from a broken scan and callers should keep their last good
+   *  inventory. */
+  reliable: boolean
+}
+
+/** Probe which engines are installed and whether absence is trustworthy. */
+export async function detectEnginesWithStatus(): Promise<EngineDetection> {
+  const ids = Object.keys(ADAPTERS) as EngineId[]
+  const probes = await Promise.all(ids.map(async (id) => {
+    const status = await probeBinOnPath(ADAPTERS[id].bin)
+    const installed = status === 'present' || (id === 'grok' && resolveGrokBin() != null)
+    return { id, installed, status }
+  }))
+  return {
+    engines: probes.filter((p) => p.installed).map((p) => p.id),
+    reliable: probes.every((p) => p.status !== 'error'),
+  }
+}
+
 /** Probe which engines are installed on this machine. */
 export async function detectEngines(): Promise<EngineId[]> {
-  const ids = Object.keys(ADAPTERS) as EngineId[]
-  const present = await Promise.all(ids.map(async (id) => {
-    if (await binOnPath(ADAPTERS[id].bin)) return id
-    if (id === 'grok' && resolveGrokBin()) return id
-    return null
+  return (await detectEnginesWithStatus()).engines
+}
+
+/** One detected engine as stored on the computer row and shown in the app.
+ *  Paths are resolved on the daemon machine (Windows `where` / POSIX `which`);
+ *  the renderer never probes PATH. */
+export interface DetectedEngineSnapshot {
+  id: EngineId
+  bin: string
+  path: string | null
+}
+
+/** Snapshot the installed engines, optionally in a caller-supplied order
+ *  (pairing puts the chosen default first). Does not spawn the CLIs. */
+export async function snapshotDetectedEngines(ids?: EngineId[]): Promise<DetectedEngineSnapshot[]> {
+  const present = ids ?? await detectEngines()
+  return Promise.all(present.map(async (id) => {
+    const bin = ADAPTERS[id].bin
+    const path = id === 'grok'
+      ? (resolveGrokBin() ?? await resolveBinPath(bin))
+      : await resolveBinPath(bin)
+    return { id, bin, path }
   }))
-  return present.filter((x): x is EngineId => x !== null)
 }
 
 /** Resolve a bin's absolute path on PATH (the first hit), or null if absent. */
@@ -2324,9 +3388,10 @@ export interface EngineHealth {
   big: BrainHealth | null
   small: BrainHealth | null
   /** Wake-path protocol health (codex app-server JSON-RPC handshake; claude
-   *  persistent-session flag set; grok ACP stdio handshake). Separate signal from big/small because the
-   *  failure modes are different — those are auth/quota; this is protocol/CLI
-   *  version compatibility. */
+   *  persistent-session flag set; grok ACP stdio handshake). Cursor/OpenCode
+   *  skip it because their wake path is the same one-shot call as the brain
+   *  probe. Separate signal from big/small because those failures are
+   *  auth/quota, while this one is protocol/CLI compatibility. */
   wake: WakeHealth | null
 }
 

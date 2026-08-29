@@ -122,8 +122,8 @@ function PillField({
   }
 
   return (
-    <div className="relative grid grid-cols-[60px_1fr] gap-2 items-start py-2 px-3 border-b border-ink-100">
-      <span className="text-[10.5px] font-bold text-ink-300 uppercase tracking-wider pt-1.5">{label}</span>
+    <div className="relative grid grid-cols-[60px_1fr] gap-2 items-start py-2 px-3 border-b" style={{ borderColor: 'var(--chrome-warm-rule)' }}>
+      <span className="text-[10.5px] font-bold uppercase tracking-wider pt-1.5" style={{ color: 'var(--email-muted)' }}>{label}</span>
       <div
         className="flex flex-wrap gap-1.5 items-center min-h-[28px] cursor-text"
         onClick={() => inputRef.current?.focus()}
@@ -154,7 +154,7 @@ function PillField({
           onKeyDown={onKey}
           onBlur={() => setTimeout(() => setOpenSuggest(false), 120)}
           placeholder={entries.length === 0 ? placeholder : ''}
-          className="flex-1 min-w-[140px] outline-none border-0 bg-transparent text-[13px] text-ink-900 placeholder:text-ink-300"
+          className="flex-1 min-w-[140px] outline-none border-0 bg-transparent text-[13px] text-ink-900 placeholder:text-[color:var(--email-muted)]"
         />
       </div>
       {openSuggest && suggestions.length > 0 && (
@@ -385,14 +385,14 @@ export function EmailComposer() {
       <button
         aria-label={t('email.closeComposerBackdropAria')}
         onClick={close}
-        className="absolute inset-0 bg-ink-900/15 pointer-events-auto animate-fade-in"
-        style={{ animationDuration: '120ms' }}
+        className="absolute inset-0 pointer-events-auto animate-fade-in"
+        style={{ background: 'var(--email-backdrop)', animationDuration: '120ms' }}
       />
       <div
         className="relative pointer-events-auto w-full max-w-[640px] h-full flex flex-col animate-slide-in-right"
         style={{
-          background: 'linear-gradient(180deg, #FBF8F0, #F4EEDD)',
-          boxShadow: '-12px 0 32px -10px rgba(60, 50, 30, 0.18)',
+          background: 'var(--chrome-warm)',
+          boxShadow: 'var(--chrome-warm-shadow)',
         }}
         onDragEnter={onDragEnter}
         onDragLeave={onDragLeave}
@@ -406,7 +406,7 @@ export function EmailComposer() {
             // child drop target keeps receiving the event.
             className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none animate-fade-in"
             style={{
-              background: 'rgba(0, 168, 240, 0.12)',
+              background: 'rgb(var(--skype-rgb) / 0.12)',
               border: '2px dashed var(--skype)',
               borderRadius: '4px',
               animationDuration: '120ms',
@@ -420,8 +420,8 @@ export function EmailComposer() {
             </div>
           </div>
         )}
-        <div className="flex items-center gap-2 py-3 px-4 border-b border-[rgba(120,110,95,0.25)]">
-          <IMail className="w-4 h-4 text-[#7A6A3F]" strokeWidth={2} />
+        <div className="flex items-center gap-2 py-3 px-4 border-b" style={{ borderColor: 'var(--chrome-warm-rule)' }}>
+          <IMail className="w-4 h-4" strokeWidth={2} style={{ color: 'var(--chrome-warm-icon)' }} />
           <h2 className="text-[14px] font-semibold text-ink-900 tracking-tight">
             {isReply ? t('email.composerReplyByEmail') : t('email.composerNewEmail')}
           </h2>
@@ -460,19 +460,19 @@ export function EmailComposer() {
           </div>
         ))}
         {!isReply && (
-          <div className="grid grid-cols-[60px_1fr] gap-2 items-center py-2 px-3 border-b border-[rgba(120,110,95,0.25)]">
-            <span className="text-[10.5px] font-bold text-ink-300 uppercase tracking-wider">{t('email.subjectLabel')}</span>
+          <div className="grid grid-cols-[60px_1fr] gap-2 items-center py-2 px-3 border-b" style={{ borderColor: 'var(--chrome-warm-rule)' }}>
+            <span className="text-[10.5px] font-bold uppercase tracking-wider" style={{ color: 'var(--email-muted)' }}>{t('email.subjectLabel')}</span>
             <input
               type="text"
               value={subject}
               onChange={(e) => setSubject(e.target.value)}
               placeholder={t('email.subjectPlaceholder')}
-              className="outline-none border-0 bg-transparent text-[15px] text-ink-900 placeholder:text-ink-300 font-display"
+              className="outline-none border-0 bg-transparent text-[15px] text-ink-900 placeholder:text-[color:var(--email-muted)] font-display"
             />
           </div>
         )}
         {isReply && replyOriginal?.email && (
-          <div className="py-2 px-3 border-b border-[rgba(120,110,95,0.18)] bg-[rgba(120,110,95,0.04)] text-[11.5px] text-ink-500">
+          <div className="py-2 px-3 border-b bg-ink-100/40 text-[11.5px] text-ink-500" style={{ borderColor: 'var(--chrome-warm-rule-soft)' }}>
             <div className="flex items-baseline gap-2">
               <span className="font-bold text-ink-300 uppercase tracking-wider text-[10px]">Re:</span>
               <span className="text-ink-700 font-medium">{replyOriginal.email.subject || t('email.noSubject')}</span>
@@ -496,12 +496,12 @@ export function EmailComposer() {
           value={body}
           onChange={(e) => setBody(e.target.value)}
           placeholder={isReply ? t('email.writeReplyPh') : t('email.writeMessagePh')}
-          className="flex-1 outline-none border-0 bg-transparent py-3 px-4 text-[14px] leading-[1.55] text-ink-700 placeholder:text-ink-300 resize-none font-sans"
+          className="flex-1 outline-none border-0 bg-transparent py-3 px-4 text-[14px] leading-[1.55] text-ink-700 placeholder:text-[color:var(--email-muted)] resize-none font-sans"
           autoFocus
         />
 
         {attachments.length > 0 && (
-          <div className="py-2 px-3 border-t border-[rgba(120,110,95,0.18)] space-y-1">
+          <div className="py-2 px-3 border-t space-y-1" style={{ borderColor: 'var(--chrome-warm-rule-soft)' }}>
             {attachments.map((a) => (
               <div key={a.localId} className="flex items-center gap-2 text-[12px]">
                 <span className="text-[14px] leading-none">
@@ -532,7 +532,7 @@ export function EmailComposer() {
           </div>
         )}
 
-        <div className="flex items-center gap-2 py-3 px-4 border-t border-[rgba(120,110,95,0.25)]">
+        <div className="flex items-center gap-2 py-3 px-4 border-t" style={{ borderColor: 'var(--chrome-warm-rule)' }}>
           <input
             ref={fileInputRef}
             type="file"
@@ -547,7 +547,7 @@ export function EmailComposer() {
             className="py-2 px-2.5 text-[12px] font-semibold text-ink-700 bg-cloud border border-ink-100 rounded-[7px] hover:border-sky2-200 hover:text-skype-deep transition disabled:opacity-50"
             title={t('email.attachFile')}
           >📎 Attach</button>
-          <span className="text-[11px] text-ink-300 mr-auto">
+          <span className="text-[11px] mr-auto" style={{ color: 'var(--email-muted)' }}>
             {t('email.fromLabel')} <span className="font-mono text-ink-500">{me?.email ?? t('email.noAuthEmail')}</span>
           </span>
           <button
@@ -565,7 +565,7 @@ export function EmailComposer() {
             )}
             style={{
               background: 'var(--skype)',
-              boxShadow: '0 4px 12px -3px rgba(0, 168, 240, 0.45)',
+              boxShadow: '0 4px 12px -3px rgb(var(--skype-rgb) / 0.45)',
             }}
           >{sending ? t('email.sending') : isReply ? t('email.sendReply') : t('email.send')}</button>
         </div>

@@ -124,7 +124,7 @@ export function Select<T extends string = string>({
   }
 
   return (
-    <div ref={rootRef} className={cn('relative', className)}>
+    <div ref={rootRef} className={cn('relative', open && 'z-[80]', className)}>
       <button
         id={selectId}
         type="button"
@@ -146,25 +146,22 @@ export function Select<T extends string = string>({
         onKeyDown={onButtonKeyDown}
         className={cn(
           'group flex h-11 w-full items-center justify-between gap-3 rounded-[14px] border border-ink-100 bg-cloud px-3.5 text-left text-[13px] font-semibold text-ink-900 outline-none transition',
-          'shadow-[0_1px_0_rgba(255,255,255,0.92)_inset,0_10px_24px_-24px_rgba(26,78,120,0.55)]',
+          'shadow-[var(--select-shadow)]',
           'hover:border-sky2-200 hover:bg-sky2-50/60',
-          'focus:border-sky2-300 focus:bg-white focus:ring-4 focus:ring-sky2-100',
-          open && 'border-sky2-300 bg-white ring-4 ring-sky2-100',
+          'focus:border-sky2-300 focus:bg-cloud focus:ring-4 focus:ring-sky2-100',
+          open && 'border-sky2-300 bg-cloud ring-4 ring-sky2-100',
           disabled && 'cursor-not-allowed opacity-55',
         )}
         style={{
-          backgroundImage: 'linear-gradient(180deg, rgba(255,255,255,0.98), rgba(246,250,253,0.94))',
+          backgroundImage: 'var(--select-face)',
         }}
       >
         <span className="min-w-0 flex-1 truncate">{selected?.label ?? 'Select'}</span>
-        {selected?.hint && (
-          <span className="shrink-0 text-[12px] font-semibold tabular-nums text-ink-400">{selected.hint}</span>
-        )}
         <span
           aria-hidden="true"
           className={cn(
             'grid h-7 w-7 shrink-0 place-items-center rounded-[9px] border border-sky2-100 bg-sky2-50 text-skype-deep transition',
-            'group-hover:bg-white group-focus:bg-sky2-50',
+            'group-hover:bg-cloud group-focus:bg-sky2-50',
             open && 'rotate-180 border-sky2-200 bg-sky2-50',
           )}
         >
@@ -181,7 +178,7 @@ export function Select<T extends string = string>({
         aria-hidden={!open}
         onAnimationEnd={() => setAnimateMenu(false)}
         className={cn(
-          'absolute left-0 right-0 top-full z-[70] mt-2 max-h-72 overflow-auto rounded-[16px] border border-sky2-100 bg-cloud p-2.5 shadow-[0_22px_55px_-24px_rgba(10,30,60,0.38),0_8px_18px_-12px_rgba(10,30,60,0.2),0_0_0_1px_rgba(255,255,255,0.72)_inset]',
+          'absolute left-0 right-0 top-full z-[70] mt-2 max-h-72 overflow-auto rounded-[16px] border border-[var(--select-menu-border)] bg-cloud p-2.5 shadow-[var(--select-menu-shadow)]',
           'origin-top transition-[opacity,transform,visibility] duration-150 ease-out',
           open ? 'visible translate-y-0 scale-100 opacity-100' : 'invisible pointer-events-none -translate-y-1 scale-[0.985] opacity-0',
           animateMenu && 'animate-rise',
@@ -203,7 +200,7 @@ export function Select<T extends string = string>({
               onMouseDown={(event) => event.preventDefault()}
               onClick={() => commit(idx)}
               className={cn(
-                'flex h-8 w-full items-center gap-2.5 rounded-[10px] px-3 text-left text-[12.5px] font-semibold transition disabled:cursor-not-allowed disabled:opacity-45',
+                'flex h-8 w-full items-center gap-2 rounded-[10px] px-2.5 text-left text-[12.5px] font-semibold transition disabled:cursor-not-allowed disabled:opacity-45',
                 selectedOption
                   ? 'bg-skype text-white shadow-[0_10px_22px_-16px_rgba(0,120,200,0.82)]'
                   : active
@@ -211,19 +208,19 @@ export function Select<T extends string = string>({
                     : 'text-ink-700 hover:bg-sky2-50 hover:text-skype-deep',
               )}
             >
-              <span className="grid h-4 w-4 shrink-0 place-items-center">
-                {selectedOption && (
+              <span className="shrink-0">{option.label}</span>
+              {option.hint && option.hint !== option.label && (
+                <span className={cn(
+                  'min-w-0 flex-1 truncate text-[11.5px]',
+                  selectedOption ? 'text-white/80' : 'text-ink-400',
+                )}>{option.hint}</span>
+              )}
+              {selectedOption && (
+                <span className="ml-auto grid h-4 w-4 shrink-0 place-items-center">
                   <svg viewBox="0 0 12 10" className="h-3 w-3" fill="none">
                     <path d="M1.5 5.1 4.4 8 10.5 1.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
                   </svg>
-                )}
-              </span>
-              <span className="min-w-0 flex-1 truncate">{option.label}</span>
-              {option.hint && (
-                <span className={cn(
-                  'shrink-0 pl-2 text-[11.5px] tabular-nums',
-                  selectedOption ? 'text-white/80' : 'text-ink-400',
-                )}>{option.hint}</span>
+                </span>
               )}
             </button>
           )
