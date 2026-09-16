@@ -1,5 +1,6 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { type ReactNode, useEffect, useState } from 'react'
 import { http } from '@/api/client'
+import { firstHttpUrlInMarkdown } from '@/lib/markdownUrls'
 
 /**
  * Inline OG card rendered under a chat bubble when its body contains a URL.
@@ -136,7 +137,7 @@ export function LinkPreview({ url }: { url: string }) {
         href={url}
         target="_blank"
         rel="noopener noreferrer"
-        className="flex w-full items-center px-3 transition hover:bg-[rgba(15,30,50,0.03)]"
+        className="flex w-full items-center px-3 transition hover:bg-sky2-50"
         style={{ color: 'var(--ink-700)', textDecoration: 'none' }}
       >
         <span className="truncate text-[12px]">{fallbackHost || url}</span>
@@ -154,7 +155,7 @@ export function LinkPreview({ url }: { url: string }) {
       href={data.url}
       target="_blank"
       rel="noopener noreferrer"
-      className="flex w-full transition-colors hover:bg-[rgba(15,30,50,0.03)]"
+      className="flex w-full transition-colors hover:bg-sky2-50"
       style={{ textDecoration: 'none' }}
     >
       {/* Thumbnail slot — fixed square so the layout doesn't depend on
@@ -221,15 +222,8 @@ export function LinkPreview({ url }: { url: string }) {
 
 /** Pull the first http(s) URL out of a message body. Returns null when the
  *  body has no link; used by the bubble to decide whether to mount a
- *  LinkPreview at all. Mirrors the regex in `parseBody` so what we render
- *  as a link in the inline pass is the same thing we expand into a card. */
+ *  LinkPreview at all. Uses the renderer's shared URL-boundary policy so the
+ *  address we render is the same one we expand into a card. */
 export function firstUrlInBody(body: string): string | null {
-  const m = body.match(/\bhttps?:\/\/[^\s<>"'`]+/)
-  if (!m) return null
-  // Trim sentence punctuation the same way parseBody does.
-  let url = m[0]
-  while (/[.,;:!?")\]}>'"]$/.test(url) && url.length > 'https://'.length) {
-    url = url.slice(0, -1)
-  }
-  return url
+  return firstHttpUrlInMarkdown(body)
 }

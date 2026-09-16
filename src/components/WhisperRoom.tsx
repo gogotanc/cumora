@@ -207,7 +207,7 @@ export function WhisperRoom({ pairId }: { pairId: string }) {
         // Single continuous gradient layer — soft wisteria from top-left,
         // warm peach from bottom-right, paper base. No more banded zones
         // that get sliced by inner borders.
-        background: 'radial-gradient(ellipse 70% 50% at 0% 0%, rgba(210, 201, 233, 0.28), transparent 60%), radial-gradient(ellipse 60% 40% at 100% 100%, rgba(255, 217, 210, 0.18), transparent 60%), var(--paper)',
+        background: 'var(--whisper-room-wash)',
         position: 'relative',
       }}
     >
@@ -310,7 +310,7 @@ export function WhisperInspector({ pairId }: { pairId: string }) {
   return (
     <aside className="border-l overflow-y-auto"
       style={{
-        background: 'linear-gradient(180deg, #FBFAFE, #EFE9F7)',
+        background: 'var(--chrome-whisper)',
         borderColor: 'var(--whisper-100)',
       }}>
       <div className="py-5 px-5 pb-4 text-center border-b"

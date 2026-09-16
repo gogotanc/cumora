@@ -16,19 +16,20 @@
  * regular members.
  */
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { api, type ApiInvitation, type ApiInvitationWithToken } from '@/api/client'
-import { useAuth } from '@/stores/auth'
+import { type ApiInvitation, type ApiInvitationWithToken, api } from '@/api/client'
 import { useT } from '@/lib/i18n'
+import { useAuth } from '@/stores/auth'
 
 interface Props {
   companyId: string
   companyName: string
+  actorRole: string
   onClose: () => void
 }
 
 type Tab = 'link' | 'email'
 
-export function InvitePeopleModal({ companyId, companyName, onClose }: Props) {
+export function InvitePeopleModal({ companyId, companyName, actorRole, onClose }: Props) {
   const t = useT()
   const [tab, setTab] = useState<Tab>('link')
   const [list, setList] = useState<ApiInvitation[]>([])
@@ -202,7 +203,7 @@ export function InvitePeopleModal({ companyId, companyName, onClose }: Props) {
                 {t('invite.fieldRole')}
               </label>
               <div className="flex gap-1.5">
-                {(['member', 'admin'] as const).map((r) => {
+                {(actorRole === 'owner' ? ['member', 'admin'] as const : ['member'] as const).map((r) => {
                   const on = role === r
                   return (
                     <button
@@ -249,6 +250,7 @@ export function InvitePeopleModal({ companyId, companyName, onClose }: Props) {
 
           <div>
             <button
+              type="button"
               onClick={submit}
               disabled={busy}
               className="w-full py-2.5 rounded-[10px] text-[13px] font-semibold text-white transition disabled:opacity-50"
@@ -306,6 +308,7 @@ export function InvitePeopleModal({ companyId, companyName, onClose }: Props) {
           </div>
           <div className="flex-1" />
           <button
+            type="button"
             onClick={onClose}
             className="px-4 py-2 rounded-[9px] text-[12.5px] font-semibold text-ink-700 bg-cloud hover:bg-sky2-50 transition"
             style={{ border: '1px solid var(--ink-100)' }}
@@ -389,6 +392,7 @@ function CreatedInviteCard({ invite, onDone }: { invite: ApiInvitationWithToken;
           onFocus={(e) => e.currentTarget.select()}
         />
         <button
+          type="button"
           onClick={copy}
           className="px-3 py-2 rounded-[8px] text-[12px] font-semibold text-white transition"
           style={{ background: copied ? 'var(--leaf-700, #2d8c72)' : 'var(--ink-700)' }}
@@ -396,6 +400,7 @@ function CreatedInviteCard({ invite, onDone }: { invite: ApiInvitationWithToken;
       </div>
       <div className="flex justify-end">
         <button
+          type="button"
           onClick={onDone}
           className="text-[11.5px] text-ink-400 hover:text-ink-700 transition"
         >{t('invite.dismissBtn')}</button>
@@ -453,6 +458,7 @@ function InvitationRow({
         <div className="flex items-center gap-1.5">
           <CopyLinkButton inviteId={inv.id} />
           <button
+            type="button"
             onClick={onRevoke}
             className="px-2 py-1.5 text-[11.5px] font-semibold rounded-[8px] transition"
             style={{ color: 'var(--coral-deep)', border: '1px solid var(--ink-100)' }}
@@ -480,6 +486,7 @@ function CopyLinkButton({ inviteId }: { inviteId: string }) {
   }
   return (
     <button
+      type="button"
       onClick={onClick}
       title={t('invite.copyRefTitle')}
       className="px-2 py-1.5 text-[11.5px] font-semibold rounded-[8px] transition"

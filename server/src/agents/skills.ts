@@ -44,11 +44,12 @@ export interface SkillFrontmatter {
  *  defines (scalar fields + a flat metadata mapping). For richer
  *  document trees we'd swap in `js-yaml`, but the spec doesn't need it. */
 export function parseSkillMd(content: string): { frontmatter: SkillFrontmatter | null; body: string } {
-  if (!content.startsWith('---\n')) return { frontmatter: null, body: content }
-  const end = content.indexOf('\n---', 4)
-  if (end < 0) return { frontmatter: null, body: content }
-  const fmRaw = content.slice(4, end)
-  const after = content.slice(end + 4).replace(/^\n/, '')
+  const normalized = content.replace(/\r\n/g, '\n')
+  if (!normalized.startsWith('---\n')) return { frontmatter: null, body: normalized }
+  const end = normalized.indexOf('\n---', 4)
+  if (end < 0) return { frontmatter: null, body: normalized }
+  const fmRaw = normalized.slice(4, end)
+  const after = normalized.slice(end + 4).replace(/^\n/, '')
 
   const scalar = (raw: string): string => {
     let v = raw.trim()
@@ -108,8 +109,10 @@ export interface SkillHubSearchHit {
   description: string
   version?: string
   author?: string
-  /** Full URL to fetch the install manifest. Optional — if absent we
-   *  fall back to `<hub>/skills/<name>`. */
+  /** Optional hub metadata. Cumora deliberately does not fetch this URL:
+   *  install requests are always rebuilt from the operator-configured hub
+   *  plus the skill id, so an agent or a compromised search response cannot
+   *  turn the server into an arbitrary HTTP client. */
   install_url?: string
 }
 
@@ -134,24 +137,32 @@ const MAX_FILE_BODY_BYTES = 256 * 1024  // 256KB per file
 export async function searchSkillHub(query: string, hubUrl: string): Promise<SkillHubSearchHit[]> {
   if (!hubUrl) throw new Error('SkillHub URL not configured — set SKILLHUB_URL on the server')
   const url = `${hubUrl.replace(/\/+$/, '')}/search?q=${encodeURIComponent(query)}`
-  const r = await fetch(url, { signal: AbortSignal.timeout(HUB_TIMEOUT_MS) })
+  const r = await fetch(url, {
+    redirect: 'error',
+    signal: AbortSignal.timeout(HUB_TIMEOUT_MS),
+  })
   if (!r.ok) throw new Error(`hub search failed: HTTP ${r.status}`)
   const json = await r.json()
   if (!Array.isArray(json)) throw new Error('hub search returned non-array')
   return json as SkillHubSearchHit[]
 }
 
-/** Resolve a skill id (or full install URL) to a manifest. When called
- *  with a bare id we look it up on the configured hub; with an http(s)
- *  URL we fetch directly (lets agents install from non-hub sources). */
-export async function fetchSkillManifest(idOrUrl: string, hubUrl: string): Promise<SkillManifest> {
-  const url = /^https?:\/\//.test(idOrUrl)
-    ? idOrUrl
-    : (() => {
-        if (!hubUrl) throw new Error('SkillHub URL not configured — set SKILLHUB_URL or pass a full install URL')
-        return `${hubUrl.replace(/\/+$/, '')}/skills/${encodeURIComponent(idOrUrl)}`
-      })()
-  const r = await fetch(url, { signal: AbortSignal.timeout(HUB_TIMEOUT_MS) })
+/** Resolve a skill id to a manifest on the operator-configured hub.
+ *
+ * Agent-controlled URLs are intentionally rejected. The server owns the
+ * network destination; the agent controls only an encoded path segment.
+ * Redirects are disabled as well, so a trusted-looking hub response cannot
+ * pivot the request to metadata, loopback, or another internal service. */
+export async function fetchSkillManifest(skillId: string, hubUrl: string): Promise<SkillManifest> {
+  if (/^https?:\/\//i.test(skillId) || skillId.startsWith('//')) {
+    throw new Error('explicit install URLs are not allowed — install by skill id from the configured SkillHub')
+  }
+  if (!hubUrl) throw new Error('SkillHub URL not configured — set SKILLHUB_URL')
+  const url = `${hubUrl.replace(/\/+$/, '')}/skills/${encodeURIComponent(skillId)}`
+  const r = await fetch(url, {
+    redirect: 'error',
+    signal: AbortSignal.timeout(HUB_TIMEOUT_MS),
+  })
   if (!r.ok) throw new Error(`hub install failed: HTTP ${r.status}`)
   const json = await r.json() as Partial<SkillManifest>
   if (!json || typeof json !== 'object') throw new Error('manifest is not an object')
@@ -182,9 +193,19 @@ export async function installSkillFromManifest(args: {
     throw new Error(`too many files: ${manifest.files.length} > ${MAX_FILES_PER_SKILL}`)
   }
   // Must contain a SKILL.md at the root.
-  if (!manifest.files.some((f) => f.path === 'SKILL.md')) {
+  const rootSkillFile = manifest.files.find((f) => f.path === 'SKILL.md')
+  if (!rootSkillFile) {
     throw new Error('manifest must include SKILL.md at the skill root')
   }
+  const rootParsed = parseSkillMd(rootSkillFile.body)
+  if (!rootParsed.frontmatter) {
+    throw new Error('SKILL.md has missing or malformed YAML frontmatter')
+  }
+  if (rootParsed.frontmatter.name !== manifest.name) {
+    throw new Error(`manifest name "${manifest.name}" does not match SKILL.md frontmatter name "${rootParsed.frontmatter.name}"`)
+  }
+
+  const seenPaths = new Set<string>()
   // Path-traversal / size validation per file.
   for (const f of manifest.files) {
     if (typeof f.path !== 'string' || typeof f.body !== 'string') {
@@ -193,44 +214,66 @@ export async function installSkillFromManifest(args: {
     if (f.path.length === 0 || f.path.length > 200) {
       throw new Error(`bad path length: ${f.path}`)
     }
-    if (f.path.startsWith('/') || f.path.includes('..') || /[\\:*?<>"|]/.test(f.path)) {
+    if (
+      f.path.startsWith('/') ||
+      f.path.startsWith('./') ||
+      f.path.endsWith('/') ||
+      f.path.includes('..') ||
+      f.path.includes('/./') ||
+      f.path.includes('//') ||
+      /[\\:*?<>"|]/.test(f.path)
+    ) {
       throw new Error(`unsafe path: ${f.path}`)
     }
+    if (seenPaths.has(f.path)) {
+      throw new Error(`duplicate file path in manifest: ${f.path}`)
+    }
+    seenPaths.add(f.path)
     if (Buffer.byteLength(f.body, 'utf8') > MAX_FILE_BODY_BYTES) {
       throw new Error(`file ${f.path} > ${MAX_FILE_BODY_BYTES} bytes`)
     }
   }
 
-  // Don't clobber an existing skill — the agent decides whether to
-  // delete the old one first.
-  const { rows: existing } = await pool.query<{ path: string }>(
-    `SELECT path FROM agent_workspace WHERE agent_id = $1 AND path = $2 LIMIT 1`,
-    [agentId, `skills/${manifest.name}/SKILL.md`],
-  )
-  if (existing[0]) {
-    throw new Error(`skill "${manifest.name}" already installed — \`cumora skills delete ${manifest.name}\` first if you want to reinstall`)
-  }
-
-  // Same tenant lookup the CLI's workspace writes do — without it
-  // `agent_workspace.company_id` lands NULL and the Observability
-  // panel (which filters by the user's company) can't see the files.
-  const { rows: ag } = await pool.query<{ company_id: string | null }>(
-    `SELECT company_id FROM participants WHERE id = $1 LIMIT 1`, [agentId],
-  )
-  const tenant = ag[0]?.company_id ?? null
-
-  let written = 0
-  for (const f of manifest.files) {
-    const path = `skills/${manifest.name}/${f.path}`
-    await pool.query(
-      `INSERT INTO agent_workspace (agent_id, path, body, company_id, updated_at)
-       VALUES ($1, $2, $3, $4, NOW())
-       ON CONFLICT (agent_id, path) DO UPDATE SET body = EXCLUDED.body, company_id = EXCLUDED.company_id, updated_at = NOW()`,
-      [agentId, path, f.body, tenant],
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    // Don't clobber an existing skill — the agent decides whether to
+    // delete the old one first.
+    const { rows: existing } = await client.query<{ path: string }>(
+      `SELECT path FROM agent_workspace WHERE agent_id = $1 AND path = $2 LIMIT 1 FOR UPDATE`,
+      [agentId, `skills/${manifest.name}/SKILL.md`],
     )
-    written++
+    if (existing[0]) {
+      throw new Error(`skill "${manifest.name}" already installed — \`cumora skills delete ${manifest.name}\` first if you want to reinstall`)
+    }
+
+    // Same tenant lookup the CLI's workspace writes do — without it
+    // `agent_workspace.company_id` lands NULL and the Observability
+    // panel (which filters by the user's company) can't see the files.
+    const { rows: ag } = await client.query<{ company_id: string | null }>(
+      `SELECT company_id FROM participants WHERE id = $1 LIMIT 1`, [agentId],
+    )
+    const tenant = ag[0]?.company_id ?? null
+
+    let written = 0
+    for (const f of manifest.files) {
+      const path = `skills/${manifest.name}/${f.path}`
+      await client.query(
+        `INSERT INTO agent_workspace (agent_id, path, body, company_id, updated_at)
+         VALUES ($1, $2, $3, $4, NOW())
+         ON CONFLICT (agent_id, path) DO UPDATE SET body = EXCLUDED.body, company_id = EXCLUDED.company_id, updated_at = NOW()`,
+        [agentId, path, f.body, tenant],
+      )
+      written++
+    }
+    await client.query('COMMIT')
+    return { name: manifest.name, files: written }
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw err
+  } finally {
+    client.release()
   }
-  return { name: manifest.name, files: written }
 }
 
 /** Load only `name` + `description` for each installed skill — the

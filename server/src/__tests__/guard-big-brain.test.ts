@@ -49,10 +49,10 @@ test('R3 — adapter.run() outside the daemon is caught; inside it is allowed', 
 })
 
 test('R4 — spawning a supported engine binary outside the engine adapter is caught', () => {
-  for (const bin of ['claude', 'codex', 'grok', 'cursor-agent']) {
+  for (const bin of ['claude', 'codex', 'grok', 'cursor-agent', 'opencode']) {
     assert.ok(lineViolations('server/src/agents/tools.ts', `spawn('${bin}', args)`).length > 0, bin)
   }
-  assert.deepEqual(lineViolations('server/src/agents/computer/engine.ts', `spawn('cursor-agent', args)`), [])
+  assert.deepEqual(lineViolations('server/src/agents/computer/engine.ts', `spawn('opencode', args)`), [])
 })
 
 test('commented-out examples do not trip the guard', () => {

@@ -3,14 +3,57 @@
 @tailwind utilities;
 
 :root {
-  --skype: #00A8F0;
-  --skype-deep: #0078C8;
-  --skype-ink: #003B6F;
-  --sky-50: #F2FAFE;
-  --sky-100: #E1F3FD;
-  --sky-200: #C2E6FB;
-  --sky-300: #8FD3F7;
-  --sky-glow: #4FC2F4;
+  color-scheme: light;
+  /* RGB channels are the source of truth so Tailwind opacity modifiers
+   * (`bg-paper/60`) keep working. `--name` is the hex-equivalent used by
+   * inline `var(--ink-900)` styles. Dark mode only remaps the channels. */
+  --skype-rgb: 0 168 240;
+  --skype-deep-rgb: 0 120 200;
+  --skype-ink-rgb: 0 59 111;
+  --sky-50-rgb: 242 250 254;
+  --sky-100-rgb: 225 243 253;
+  --sky-200-rgb: 194 230 251;
+  --sky-300-rgb: 143 211 247;
+  --sky-glow-rgb: 79 194 244;
+  --coral-rgb: 255 122 107;
+  --coral-soft-rgb: 255 217 210;
+  --coral-deep-rgb: 200 78 63;
+  --gold-rgb: 244 183 64;
+  --gold-deep-rgb: 186 132 24;
+  /* Whisper accent — a refined dusty iris / wisteria purple. Clearly
+   * reads as PURPLE (not gray, not candy), more sophisticated than the
+   * original electric #7C5CFF candy violet. Sits as the "private /
+   * intimate" register opposite the brand sky-blue and the warm coral. */
+  --whisper-rgb: 123 108 176;
+  --whisper-deep-rgb: 78 63 140;
+  --whisper-50-rgb: 247 245 251;
+  --whisper-100-rgb: 236 231 245;
+  --whisper-200-rgb: 210 201 233;
+  --avail-rgb: 110 197 106;
+  --working-rgb: 244 183 64;
+  /* Thinking = agent is mid-compute / about to act. Sits in the same
+   * purple register as --whisper but a touch more saturated so the small
+   * status dot still reads ACTIVE (not the muted resting gray). */
+  --thinking-rgb: 138 120 200;
+  --waiting-rgb: 255 122 107;
+  --resting-rgb: 184 196 209;
+  --ink-900-rgb: 10 27 46;
+  --ink-700-rgb: 35 58 83;
+  --ink-500-rgb: 91 113 134;
+  --ink-300-rgb: 148 168 188;
+  --ink-200-rgb: 197 210 222;
+  --ink-100-rgb: 229 236 242;
+  --paper-rgb: 250 252 254;
+  --cloud-rgb: 255 255 255;
+
+  --skype: rgb(var(--skype-rgb));
+  --skype-deep: rgb(var(--skype-deep-rgb));
+  --skype-ink: rgb(var(--skype-ink-rgb));
+  --sky-50: rgb(var(--sky-50-rgb));
+  --sky-100: rgb(var(--sky-100-rgb));
+  --sky-200: rgb(var(--sky-200-rgb));
+  --sky-300: rgb(var(--sky-300-rgb));
+  --sky-glow: rgb(var(--sky-glow-rgb));
   /* Aliases matching the Tailwind palette name ("sky2"). Components refer to
    * both spellings; an undefined var() here doesn't just miss a color — it
    * invalidates the whole shorthand it appears in (a `border: 1.5px solid
@@ -20,36 +63,102 @@
   --sky2-200: var(--sky-200);
   --sky2-300: var(--sky-300);
   --sky2-glow: var(--sky-glow);
-  --coral: #FF7A6B;
-  --coral-soft: #FFD9D2;
-  --coral-deep: #C84E3F;
-  --gold: #F4B740;
-  --gold-deep: #BA8418;
-  /* Whisper accent — a refined dusty iris / wisteria purple. Clearly
-   * reads as PURPLE (not gray, not candy), more sophisticated than the
-   * original electric #7C5CFF candy violet. Sits as the "private /
-   * intimate" register opposite the brand sky-blue and the warm coral. */
-  --whisper: #7B6CB0;
-  --whisper-deep: #4E3F8C;
-  --whisper-50: #F7F5FB;
-  --whisper-100: #ECE7F5;
-  --whisper-200: #D2C9E9;
-  --avail: #6EC56A;
-  --working: #F4B740;
-  /* Thinking = agent is mid-compute / about to act. Sits in the same
-   * purple register as --whisper but a touch more saturated so the small
-   * status dot still reads ACTIVE (not the muted resting gray). */
-  --thinking: #8A78C8;
-  --waiting: #FF7A6B;
-  --resting: #B8C4D1;
-  --ink-900: #0A1B2E;
-  --ink-700: #233A53;
-  --ink-500: #5B7186;
-  --ink-300: #94A8BC;
-  --ink-200: #C5D2DE;
-  --ink-100: #E5ECF2;
-  --paper: #FAFCFE;
-  --cloud: #FFFFFF;
+  --coral: rgb(var(--coral-rgb));
+  --coral-soft: rgb(var(--coral-soft-rgb));
+  --coral-deep: rgb(var(--coral-deep-rgb));
+  --gold: rgb(var(--gold-rgb));
+  --gold-deep: rgb(var(--gold-deep-rgb));
+  --whisper: rgb(var(--whisper-rgb));
+  --whisper-deep: rgb(var(--whisper-deep-rgb));
+  --whisper-50: rgb(var(--whisper-50-rgb));
+  --whisper-100: rgb(var(--whisper-100-rgb));
+  --whisper-200: rgb(var(--whisper-200-rgb));
+  --avail: rgb(var(--avail-rgb));
+  --working: rgb(var(--working-rgb));
+  --thinking: rgb(var(--thinking-rgb));
+  --waiting: rgb(var(--waiting-rgb));
+  --resting: rgb(var(--resting-rgb));
+  --ink-900: rgb(var(--ink-900-rgb));
+  --ink-700: rgb(var(--ink-700-rgb));
+  --ink-500: rgb(var(--ink-500-rgb));
+  --ink-300: rgb(var(--ink-300-rgb));
+  --ink-200: rgb(var(--ink-200-rgb));
+  --ink-100: rgb(var(--ink-100-rgb));
+  --paper: rgb(var(--paper-rgb));
+  --cloud: rgb(var(--cloud-rgb));
+
+  /* Chrome washes used by the rail, titlebar, and side drawers. Dark
+   * mode collapses them to the paper surface so they don't stay a
+   * frozen light-blue gradient. */
+  --chrome: linear-gradient(180deg, #FBFDFF 0%, #F1F7FB 100%);
+  --chrome-rail: linear-gradient(180deg, #F8FBFD, #EDF4F9);
+  --chrome-pane: linear-gradient(180deg, #FBFDFE, #F4F8FC);
+  --chrome-whisper: linear-gradient(180deg, #FBFAFE, #EFE9F7);
+  --chrome-warm: linear-gradient(180deg, #FBF8F0, #F4EEDD);
+  --chrome-warm-rule: rgba(120, 110, 95, 0.25);
+  --chrome-warm-rule-soft: rgba(120, 110, 95, 0.18);
+  --chrome-warm-icon: #7A6A3F;
+  --chrome-warm-shadow: -12px 0 32px -10px rgba(60, 50, 30, 0.18);
+  --email-backdrop: rgb(var(--ink-900-rgb) / 0.15);
+  --email-muted: rgb(var(--ink-300-rgb));
+  --modal-scrim: rgb(var(--ink-900-rgb) / 0.4);
+  --select-face: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(246, 250, 253, 0.94));
+  --select-shadow: 0 1px 0 rgba(255, 255, 255, 0.92) inset, 0 10px 24px -24px rgba(26, 78, 120, 0.55);
+  --select-menu-shadow: 0 22px 55px -24px rgba(10, 30, 60, 0.38), 0 8px 18px -12px rgba(10, 30, 60, 0.2), 0 0 0 1px rgba(255, 255, 255, 0.72) inset;
+  --select-menu-border: rgb(var(--sky-100-rgb));
+  /* Desktop-corner toast (Electron panel) + in-app frost toast. Light
+   * keeps the original white card; dark remaps onto cloud / ink. */
+  --toast-bg: #ffffff;
+  --toast-border: rgb(33 28 22 / 0.12);
+  --toast-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
+  --toast-frost-bg: rgb(255 255 255 / 0.82);
+  --toast-frost-border: rgb(10 30 60 / 0.08);
+  --toast-frost-shadow: 0 18px 40px -14px rgba(10, 30, 60, 0.24), 0 6px 14px -8px rgba(10, 30, 60, 0.14), 0 0 0 1px rgba(255, 255, 255, 0.55) inset;
+  /* Chat surface atmosphere + a few chrome pieces that were frozen as
+   * light RGBA. Dark remaps these; light stays pixel-identical. */
+  --chat-wash: radial-gradient(ellipse 80% 40% at 0% 0%, rgba(194, 230, 251, 0.3), transparent 60%), radial-gradient(ellipse 60% 40% at 100% 100%, rgba(255, 217, 210, 0.25), transparent 60%), var(--cloud);
+  --whispers-wash: radial-gradient(ellipse 80% 60% at 50% 0%, rgba(210, 201, 233, 0.30), transparent 60%), linear-gradient(180deg, var(--paper) 0%, var(--whisper-50) 100%);
+  --whisper-room-wash: radial-gradient(ellipse 70% 50% at 0% 0%, rgba(210, 201, 233, 0.28), transparent 60%), radial-gradient(ellipse 60% 40% at 100% 100%, rgba(255, 217, 210, 0.18), transparent 60%), var(--paper);
+  --error-card: linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(255, 217, 210, 0.18));
+  --error-card-border: 1px solid rgba(255, 122, 107, 0.18);
+  --error-card-shadow: 0 12px 32px -16px rgba(200, 78, 63, 0.25);
+  --error-icon-bg: rgba(255, 122, 107, 0.12);
+  --unread-fresh: rgb(var(--gold-rgb));
+  --unread-fresh-fg: rgb(var(--ink-900-rgb));
+  /* Shipping workspace canvas + nested cards. Light keeps the original
+   * hex; dark collapses onto paper / cloud so the contract pane doesn't
+   * stay a frozen white sheet. */
+  --ship-canvas: #F7FAFC;
+  --ship-face: #FAFCFD;
+  /* Markdown / TipTap editor. Light keeps the original stone hexes;
+   * dark remaps onto ink / paper so the toolbar doesn't stay a frozen
+   * wash and body copy doesn't stay near-black on charcoal. */
+  --doc-toolbar: rgb(250 250 249 / 0.6);
+  --doc-toolbar-border: #f5f5f4;
+  --doc-toolbar-icon: #57534e;
+  --doc-toolbar-icon-muted: #d6d3d1;
+  --doc-toolbar-hover: #f5f5f4;
+  --doc-toolbar-rule: #e7e5e4;
+  --doc-muted: #a8a29e;
+  --doc-muted-strong: #78716c;
+  --doc-body: #1c1917;
+  --doc-quote: #57534e;
+  --doc-rule: #e7e5e4;
+  --doc-placeholder: #a8a29e;
+  --doc-img-bg: #fafaf9;
+  --doc-img-border: #e7e5e4;
+  --doc-img-shadow: 0 12px 28px rgba(28, 25, 23, 0.08);
+  --doc-pre-bg: #0f172a;
+  --doc-pre-fg: #e2e8f0;
+  --doc-code-bg: rgb(var(--skype-rgb) / 0.08);
+  --doc-cell: #e7e5e4;
+  --doc-th: rgb(var(--skype-rgb) / 0.05);
+  /* Kanban columns + tiles. Light keeps the original cloud/60 well and
+   * white card; dark splits them so tiles don't vanish into the canvas. */
+  --board-column: rgb(var(--cloud-rgb) / 0.6);
+  --board-card: rgb(var(--cloud-rgb));
+  --board-card-border: rgb(var(--ink-100-rgb));
+  --board-card-shadow: 0 2px 8px -2px rgba(10, 30, 60, 0.08);
 
   --safe-top: env(safe-area-inset-top);
   --safe-bottom: env(safe-area-inset-bottom);
@@ -59,6 +168,104 @@
   /* Live keyboard height — set from Capacitor's keyboardWillShow event
      so bottom-anchored composers can lift above the soft keyboard. */
   --kb-height: 0px;
+}
+
+/* Dark palette is One Dark Pro's editor chrome (Atom / VS Code), mapped
+ * onto Cumora's existing token names so `bg-paper` / `text-ink-900` /
+ * `border-ink-100` flip without a `dark:` variant on every component.
+ * Accents (skype / coral / gold / whisper) become the One Dark syntax
+ * hues so status dots and brand buttons still read, just on a cooler
+ * ground. */
+html.dark {
+  color-scheme: dark;
+  --skype-rgb: 97 175 239;
+  --skype-deep-rgb: 82 139 255;
+  --skype-ink-rgb: 171 178 191;
+  --sky-50-rgb: 44 49 60;
+  --sky-100-rgb: 49 54 64;
+  --sky-200-rgb: 62 68 81;
+  --sky-300-rgb: 75 82 99;
+  --sky-glow-rgb: 97 175 239;
+  --coral-rgb: 224 108 117;
+  --coral-soft-rgb: 61 42 46;
+  --coral-deep-rgb: 224 108 117;
+  --gold-rgb: 229 192 123;
+  --gold-deep-rgb: 209 154 102;
+  --whisper-rgb: 198 120 221;
+  --whisper-deep-rgb: 198 120 221;
+  --whisper-50-rgb: 47 42 56;
+  --whisper-100-rgb: 53 45 64;
+  --whisper-200-rgb: 74 61 92;
+  --avail-rgb: 152 195 121;
+  --working-rgb: 229 192 123;
+  --thinking-rgb: 198 120 221;
+  --waiting-rgb: 224 108 117;
+  --resting-rgb: 92 99 112;
+  --ink-900-rgb: 171 178 191;
+  --ink-700-rgb: 157 165 180;
+  --ink-500-rgb: 127 132 142;
+  --ink-300-rgb: 92 99 112;
+  --ink-200-rgb: 62 68 81;
+  --ink-100-rgb: 44 49 60;
+  --paper-rgb: 33 37 43;
+  --cloud-rgb: 40 44 52;
+  --chrome: rgb(var(--paper-rgb));
+  --chrome-rail: rgb(var(--paper-rgb));
+  --chrome-pane: rgb(var(--paper-rgb));
+  --chrome-whisper: rgb(var(--whisper-50-rgb));
+  --chrome-warm: rgb(var(--paper-rgb));
+  --chrome-warm-rule: rgb(var(--ink-200-rgb));
+  --chrome-warm-rule-soft: rgb(var(--ink-100-rgb));
+  --chrome-warm-icon: rgb(var(--gold-rgb));
+  --chrome-warm-shadow: -12px 0 32px -10px rgba(0, 0, 0, 0.5);
+  --email-backdrop: rgb(0 0 0 / 0.5);
+  --email-muted: rgb(var(--ink-500-rgb));
+  --modal-scrim: rgb(0 0 0 / 0.5);
+  --select-face: none;
+  --select-shadow: 0 0 #0000;
+  --select-menu-shadow: 0 22px 55px -24px rgba(0, 0, 0, 0.55), 0 8px 18px -12px rgba(0, 0, 0, 0.35);
+  --select-menu-border: rgb(var(--ink-200-rgb));
+  --toast-bg: rgb(var(--cloud-rgb));
+  --toast-border: rgb(var(--ink-200-rgb));
+  --toast-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+  --toast-frost-bg: rgb(var(--cloud-rgb) / 0.88);
+  --toast-frost-border: rgb(var(--ink-200-rgb) / 0.85);
+  --toast-frost-shadow: 0 18px 40px -14px rgba(0, 0, 0, 0.55), 0 6px 14px -8px rgba(0, 0, 0, 0.35), 0 0 0 1px rgb(255 255 255 / 0.04) inset;
+  --chat-wash: rgb(var(--cloud-rgb));
+  --whispers-wash: rgb(var(--cloud-rgb));
+  --whisper-room-wash: rgb(var(--paper-rgb));
+  --error-card: rgb(var(--sky-50-rgb));
+  --error-card-border: 1px solid rgb(var(--ink-200-rgb));
+  --error-card-shadow: 0 16px 36px -18px rgba(0, 0, 0, 0.55);
+  --error-icon-bg: rgba(224, 108, 117, 0.18);
+  --unread-fresh: rgb(var(--gold-deep-rgb));
+  --unread-fresh-fg: #21252b;
+  --ship-canvas: rgb(var(--paper-rgb));
+  --ship-face: rgb(var(--cloud-rgb));
+  --doc-toolbar: rgb(var(--paper-rgb));
+  --doc-toolbar-border: rgb(var(--ink-100-rgb));
+  --doc-toolbar-icon: rgb(var(--ink-700-rgb));
+  --doc-toolbar-icon-muted: rgb(var(--ink-300-rgb));
+  --doc-toolbar-hover: rgb(var(--ink-100-rgb));
+  --doc-toolbar-rule: rgb(var(--ink-200-rgb));
+  --doc-muted: rgb(var(--ink-300-rgb));
+  --doc-muted-strong: rgb(var(--ink-500-rgb));
+  --doc-body: rgb(var(--ink-900-rgb));
+  --doc-quote: rgb(var(--ink-500-rgb));
+  --doc-rule: rgb(var(--ink-200-rgb));
+  --doc-placeholder: rgb(var(--ink-300-rgb));
+  --doc-img-bg: rgb(var(--paper-rgb));
+  --doc-img-border: rgb(var(--ink-200-rgb));
+  --doc-img-shadow: 0 12px 28px rgba(0, 0, 0, 0.35);
+  --doc-pre-bg: rgb(var(--paper-rgb));
+  --doc-pre-fg: rgb(var(--ink-900-rgb));
+  --doc-code-bg: rgb(var(--skype-rgb) / 0.16);
+  --doc-cell: rgb(var(--ink-200-rgb));
+  --doc-th: rgb(var(--skype-rgb) / 0.12);
+  --board-column: rgb(var(--paper-rgb));
+  --board-card: rgb(var(--sky-100-rgb));
+  --board-card-border: rgb(var(--ink-200-rgb));
+  --board-card-shadow: 0 2px 10px -2px rgba(0, 0, 0, 0.45);
 }
 
 /* Native-shell tweaks (iOS / Android Capacitor builds). main.tsx adds
@@ -236,6 +443,14 @@ body {
   50% { transform: translate(60px, 30px); }
 }
 
+html.dark body:not(.electron) {
+  background: var(--paper);
+}
+html.dark body:not(.electron)::before,
+html.dark body:not(.electron)::after {
+  display: none;
+}
+
 /* Toast auto-dismiss progress bar — drains right-to-left over the toast's
  * lifetime. Used by NotificationToasts; the toast pauses the animation on
  * hover so the user gets time to read longer messages. */
@@ -361,8 +576,9 @@ body {
 /* ─── Cumora code-block syntax theme ─────────────────────────────────────
  * Token colors mapped onto the brand palette (sky / coral / gold / wisteria
  * / ink) so highlighted code never visually fights the surrounding chat.
- * Used by `<CodeBlock>` in Message.tsx. Designed for a light paper-toned
- * panel; if we ever ship a dark variant we'll need a separate selector.
+ * Used by `<CodeBlock>` in Message.tsx. Light: paper-toned. Dark: One
+ * Dark Pro roles (purple keywords, green strings, blue functions) so a
+ * fenced block reads like the editor the palette came from.
  */
 .cumora-code, .cumora-code code { color: var(--ink-700); }
 .cumora-code .hljs-keyword,
@@ -403,6 +619,44 @@ body {
 .cumora-code .hljs-addition { background: rgba(110, 197, 106, 0.12); color: #2D6F2A; }
 .cumora-code .hljs-deletion { background: rgba(255, 122, 107, 0.12); color: var(--coral-deep); }
 
+html.dark .cumora-code,
+html.dark .cumora-code code { color: #abb2bf; }
+html.dark .cumora-code .hljs-keyword,
+html.dark .cumora-code .hljs-selector-tag,
+html.dark .cumora-code .hljs-tag,
+html.dark .cumora-code .hljs-name { color: #c678dd; font-weight: 600; }
+html.dark .cumora-code .hljs-built_in { color: #56b6c2; font-weight: 600; }
+html.dark .cumora-code .hljs-literal { color: #d19a66; font-weight: 600; }
+html.dark .cumora-code .hljs-string,
+html.dark .cumora-code .hljs-regexp,
+html.dark .cumora-code .hljs-symbol,
+html.dark .cumora-code .hljs-template-tag,
+html.dark .cumora-code .hljs-template-variable { color: #98c379; }
+html.dark .cumora-code .hljs-number,
+html.dark .cumora-code .hljs-attr,
+html.dark .cumora-code .hljs-attribute { color: #d19a66; }
+html.dark .cumora-code .hljs-title,
+html.dark .cumora-code .hljs-title.class_,
+html.dark .cumora-code .hljs-title.function_,
+html.dark .cumora-code .hljs-class .hljs-title,
+html.dark .cumora-code .hljs-function .hljs-title,
+html.dark .cumora-code .hljs-type,
+html.dark .cumora-code .hljs-section { color: #61afef; font-weight: 600; }
+html.dark .cumora-code .hljs-comment,
+html.dark .cumora-code .hljs-quote { color: #5c6370; font-style: italic; }
+html.dark .cumora-code .hljs-meta,
+html.dark .cumora-code .hljs-meta .hljs-keyword,
+html.dark .cumora-code .hljs-doctag { color: #5c6370; }
+html.dark .cumora-code .hljs-variable,
+html.dark .cumora-code .hljs-property,
+html.dark .cumora-code .hljs-params { color: #e06c75; }
+html.dark .cumora-code .hljs-operator,
+html.dark .cumora-code .hljs-punctuation { color: #abb2bf; }
+html.dark .cumora-code .hljs-bullet,
+html.dark .cumora-code .hljs-link { color: #61afef; }
+html.dark .cumora-code .hljs-addition { background: rgba(152, 195, 121, 0.15); color: #98c379; }
+html.dark .cumora-code .hljs-deletion { background: rgba(224, 108, 117, 0.15); color: #e06c75; }
+
 /* Scrollbars */
 *::-webkit-scrollbar { width: 8px; height: 8px; }
 *::-webkit-scrollbar-track { background: transparent; }
@@ -426,6 +680,26 @@ body {
 
 button { font: inherit; }
 input, textarea { font: inherit; }
+
+/* Shipping contract pane. Native inputs/selects follow Chromium's
+ * `field` system color (tied to Electron nativeTheme), which can stay
+ * white even when html.dark has remapped --cloud. Pin them to tokens
+ * so the draft form matches the rest of the workspace. Light cloud is
+ * still #fff, so light mode stays the same. */
+.ship-workspace :is(input, textarea, select):not([type='checkbox']):not([type='radio']) {
+  background-color: rgb(var(--cloud-rgb));
+  color: rgb(var(--ink-900-rgb));
+}
+.ship-workspace :is(input, textarea, select)::placeholder {
+  color: rgb(var(--ink-300-rgb));
+}
+html.dark .ship-workspace {
+  color-scheme: dark;
+}
+html.dark .ship-workspace option {
+  background-color: rgb(var(--cloud-rgb));
+  color: rgb(var(--ink-900-rgb));
+}
 
 /* RichInput contenteditable placeholder. The composer drops a
  * `data-placeholder` attribute on the editor; this rule surfaces it
@@ -480,7 +754,7 @@ input, textarea { font: inherit; }
  * native set of styles for ProseMirror output rather than depend on
  * `prose`. Scoped to `.tiptap` so it can't leak into chat or marketing
  * pages. */
-.tiptap { color: #1c1917; font-family: 'Fraunces', 'Georgia', serif; font-size: 17px; line-height: 1.65; }
+.tiptap { color: var(--doc-body); caret-color: var(--doc-body); font-family: 'Fraunces', 'Georgia', serif; font-size: 17px; line-height: 1.65; }
 .tiptap > * + * { margin-top: 0.85em; }
 .tiptap h1 { font-size: 1.9em; font-weight: 600; line-height: 1.2; margin-top: 1.4em; }
 .tiptap h2 { font-size: 1.45em; font-weight: 600; line-height: 1.25; margin-top: 1.2em; }
@@ -493,11 +767,11 @@ input, textarea { font: inherit; }
 .tiptap blockquote {
   border-left: 3px solid var(--skype);
   padding-left: 1em;
-  color: #57534e;
+  color: var(--doc-quote);
   font-style: italic;
 }
 .tiptap code {
-  background: rgba(0, 168, 240, 0.08);
+  background: var(--doc-code-bg);
   color: var(--skype-deep);
   border-radius: 4px;
   padding: 0.1em 0.35em;
@@ -505,8 +779,8 @@ input, textarea { font: inherit; }
   font-size: 0.92em;
 }
 .tiptap pre {
-  background: #0f172a;
-  color: #e2e8f0;
+  background: var(--doc-pre-bg);
+  color: var(--doc-pre-fg);
   border-radius: 10px;
   padding: 0.9em 1.1em;
   overflow-x: auto;
@@ -522,7 +796,7 @@ input, textarea { font: inherit; }
   text-decoration-thickness: 1px;
 }
 .tiptap a:hover { color: var(--skype); }
-.tiptap hr { border: 0; border-top: 1px solid #e7e5e4; margin: 1.5em 0; }
+.tiptap hr { border: 0; border-top: 1px solid var(--doc-rule); margin: 1.5em 0; }
 /* Tables (GFM from agents + tiptap TableKit). Match the doc's serif look:
  * hairline rules, roomy cells, header in small caps-ish weight. */
 .tiptap table {
@@ -533,14 +807,14 @@ input, textarea { font: inherit; }
   font-size: 0.95em;
 }
 .tiptap th, .tiptap td {
-  border: 1px solid #e7e5e4;
+  border: 1px solid var(--doc-cell);
   padding: 0.45em 0.7em;
   vertical-align: top;
   text-align: left;
 }
 .tiptap th {
   font-weight: 600;
-  background: rgba(0, 168, 240, 0.05);
+  background: var(--doc-th);
 }
 .tiptap th p, .tiptap td p { margin: 0; }
 /* tiptap wraps the table in a scrollable div when it overflows */
@@ -551,10 +825,10 @@ input, textarea { font: inherit; }
   max-width: min(100%, 720px);
   max-height: 520px;
   object-fit: contain;
-  border: 1px solid #e7e5e4;
+  border: 1px solid var(--doc-img-border);
   border-radius: 12px;
-  background: #fafaf9;
-  box-shadow: 0 12px 28px rgba(28, 25, 23, 0.08);
+  background: var(--doc-img-bg);
+  box-shadow: var(--doc-img-shadow);
 }
 .tiptap img.ProseMirror-selectednode {
   outline: 3px solid rgba(0, 168, 240, 0.28);
@@ -574,7 +848,7 @@ input, textarea { font: inherit; }
 /* TipTap placeholder for empty first paragraph. */
 .tiptap p.is-editor-empty:first-child::before {
   content: attr(data-placeholder);
-  color: #a8a29e;
+  color: var(--doc-placeholder);
   float: left;
   height: 0;
   pointer-events: none;
@@ -666,8 +940,8 @@ input:focus, textarea:focus, button:focus { outline: none; }
   color: var(--ink-500);
 }
 .reaction-quick-button:hover {
-  background: rgba(0, 168, 240, 0.08);
-  box-shadow: 0 8px 18px -16px rgba(0, 120, 200, 0.5);
+  background: rgb(var(--skype-rgb) / 0.12);
+  box-shadow: 0 8px 18px -16px rgb(var(--skype-deep-rgb) / 0.5);
 }
 .reaction-burst {
   position: absolute;

@@ -107,7 +107,7 @@ function ConvoAvatar({ c, size = 48 }: { c: Conversation; size?: number }) {
 function MutedGlyph() {
   const t = useT()
   return (
-    <span className="inline-flex items-center justify-center w-3.5 h-3.5 shrink-0 text-ink-300" aria-label={t('mclist.muted')}>
+    <span role="img" className="inline-flex items-center justify-center w-3.5 h-3.5 shrink-0 text-ink-300" aria-label={t('mclist.muted')}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5">
         <path d="M13.73 21a2 2 0 0 1-3.46 0" />
         <path d="M18.63 13A17.9 17.9 0 0 1 18 8" />
@@ -207,8 +207,8 @@ function MobileRow({ c, onTap, onLongPress }: {
               // Muted rows: keep the count visible (people still want
               // to know there's unread) but switch to a grey chip —
               // matches the "silent" affordance from the desktop pane.
-              background: muted ? 'var(--ink-200)' : (isFresh ? 'var(--gold)' : 'var(--coral)'),
-              color: muted ? 'var(--ink-700)' : (isFresh ? 'var(--ink-900)' : 'white'),
+              background: muted ? 'var(--ink-200)' : (isFresh ? 'var(--unread-fresh)' : 'var(--coral)'),
+              color: muted ? 'var(--ink-700)' : (isFresh ? 'var(--unread-fresh-fg)' : 'white'),
             }}>{c.unread}</span>
         )}
       </div>

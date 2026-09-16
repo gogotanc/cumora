@@ -21,10 +21,13 @@ export function LanguagePicker({ className }: { className?: string }) {
       value={locale}
       ariaLabel={t('common.language')}
       onValueChange={setLocale}
-      // `label` is the language's own name; `hint` is its English name, so
-      // someone stuck in a language they can't read can still find their
-      // way back out.
-      options={LOCALES.map((l) => ({ value: l.code, label: l.label, hint: l.english }))}
+      // Native name in the control; English name only in the open menu,
+      // and only when it actually differs (otherwise "English English").
+      options={LOCALES.map((l) => ({
+        value: l.code,
+        label: l.label,
+        hint: l.english === l.label ? undefined : l.english,
+      }))}
     />
   )
 }

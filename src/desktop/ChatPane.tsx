@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
 import { useApp } from '@/stores/app'
+import { EMPTY_DRAFT, type ComposerDraft } from '@/stores/composerDrafts'
 import { useMe } from '@/stores/auth'
-import { useConversations } from '@/stores/conversations'
+import { isMuted, useConversations } from '@/stores/conversations'
 import { useParticipants } from '@/stores/participants'
 import { useMessages, sendUserMessage, messagesFor, VIRTUOSO_FIRST_INDEX_BASE } from '@/stores/messages'
 import type { MessagesState } from '@/stores/messages'
@@ -235,6 +236,7 @@ function ChatHeader({
             <>
               <span className="w-1 h-1 rounded-full bg-ink-300 shrink-0" />
               <button
+                type="button"
                 onClick={startEditTopic}
                 className="text-ink-300 italic font-display hover:text-skype-deep transition shrink-0"
                 title={t('chat.setTopic')}
@@ -262,6 +264,7 @@ function ChatHeader({
           />
         ) : c.topic ? (
           <button
+            type="button"
             onClick={startEditTopic}
             // Italic glyphs lean past their box — without right padding,
             // `truncate`'s overflow:hidden chops the slanted edge of the
@@ -278,6 +281,7 @@ function ChatHeader({
           already lists the names below it, so this is a redundant visual
           worth dropping when space is tight. */}
       <button
+        type="button"
         ref={memberStackRef}
         onClick={onClickStack}
         aria-haspopup="dialog"
@@ -303,6 +307,7 @@ function ChatHeader({
           action in this header. */}
       <div className="flex gap-1 text-ink-500 shrink-0">
         <button
+          type="button"
           onClick={onToggleSearch}
           title={t('chat.search')}
           aria-label={t('chat.search')}
@@ -314,6 +319,7 @@ function ChatHeader({
           <ISearch className="w-[19px] h-[19px]" />
         </button>
         <button
+          type="button"
           onClick={async () => {
             // Optimistic flip so the icon updates instantly; reload to sync
             // pinned-order in the sidebar. Mirrors the conversations-pane flow.
@@ -340,6 +346,7 @@ function ChatHeader({
         </button>
         <div className="relative">
           <button
+            type="button"
             onClick={() => setShowConveneSoon((v) => !v)}
             title={t('chat.convene')}
             className="px-3.5 inline-flex items-center gap-1.5 font-semibold text-[12.5px] rounded-full text-white"
@@ -413,6 +420,7 @@ function EmojiPopover({ onPick, onClose }: { onPick: (e: string) => void; onClos
       <div className="flex gap-1 mb-2 px-0.5">
         {(['std', 'skype'] as const).map((k) => (
           <button
+            type="button"
             key={k}
             onClick={() => setTab(k)}
             className={cn(
@@ -426,6 +434,7 @@ function EmojiPopover({ onPick, onClose }: { onPick: (e: string) => void; onClos
         <div className="grid grid-cols-6 gap-1">
           {COMPOSER_EMOJIS.map((e) => (
             <button
+              type="button"
               key={e}
               onClick={() => onPick(e)}
               className="h-8 w-8 rounded grid place-items-center hover:bg-sky2-50 transition"
@@ -439,6 +448,7 @@ function EmojiPopover({ onPick, onClose }: { onPick: (e: string) => void; onClos
         >
           {SKYPE_EMOJIS.map((e) => (
             <button
+              type="button"
               key={e.key}
               onClick={() => {
                 onPick(e.shortcodes[0])
@@ -457,12 +467,11 @@ function EmojiPopover({ onPick, onClose }: { onPick: (e: string) => void; onClos
   )
 }
 
-type ComposerDraftState = {
-  text: string
-  attachment: ApiAttachment | null
-}
+/** The draft shape is owned by the store — both shells and the persistence
+ *  layer have to agree on it, so it can't be redeclared here. */
+type ComposerDraftState = ComposerDraft
 
-const EMPTY_COMPOSER_DRAFT: ComposerDraftState = { text: '', attachment: null }
+const EMPTY_COMPOSER_DRAFT: ComposerDraftState = EMPTY_DRAFT
 
 function resolveDraftText(next: string | ((prev: string) => string), prev: string) {
   return typeof next === 'function' ? next(prev) : next
@@ -565,7 +574,13 @@ export function Composer({
   // Draft scope key — distinct namespace for thread mode so swapping between
   // the main composer and a thread drawer doesn't share text.
   const scopeKey = isThread ? `${convoId}::thread::${threadRootId}` : convoId
-  const [draftsByScope, setDraftsByScope] = useState<Record<string, ComposerDraftState>>({})
+  // Drafts live in the app store, not here. DesktopApp mounts views
+  // conditionally (`{view === 'conversations' && <ConversationsLayout />}`), so
+  // switching to Boards or Me unmounts this entire pane — component state
+  // would take the user's half-typed message with it. The store also mirrors
+  // to localStorage, so a reload doesn't lose it either.
+  const draftsByScope = useApp((s) => s.composerDrafts)
+  const updateDraftInStore = useApp((s) => s.updateComposerDraft)
   const [uploadingByScope, setUploadingByScope] = useState<Record<string, boolean>>({})
   const [uploadErrorsByScope, setUploadErrorsByScope] = useState<Record<string, string>>({})
   const editorRef = useRef<RichInputHandle>(null)
@@ -584,23 +599,15 @@ export function Composer({
   const uploading = Boolean(uploadingByScope[scopeKey])
   const uploadError = uploadErrorsByScope[scopeKey] ?? null
 
+  // Same signature as before; the empty-draft deletion and the
+  // nothing-changed short-circuit now live in the store so both shells share
+  // one definition of what a draft is.
   const updateComposerDraft = useCallback((
     targetScope: string,
     updater: (current: ComposerDraftState) => ComposerDraftState,
   ) => {
-    setDraftsByScope((prev) => {
-      const current = prev[targetScope] ?? EMPTY_COMPOSER_DRAFT
-      const next = updater(current)
-      if (next.text === current.text && next.attachment === current.attachment) return prev
-      if (next.text === '' && next.attachment === null) {
-        if (!prev[targetScope]) return prev
-        const copy = { ...prev }
-        delete copy[targetScope]
-        return copy
-      }
-      return { ...prev, [targetScope]: next }
-    })
-  }, [])
+    updateDraftInStore(targetScope, updater)
+  }, [updateDraftInStore])
 
   const setDraft = useCallback((nextText: string | ((prev: string) => string)) => {
     updateComposerDraft(scopeKey, (current) => ({
@@ -1038,6 +1045,7 @@ export function Composer({
               <div className="text-[10.5px] text-ink-500 truncate">{attachment.mime ?? attachment.kind}{attachment.size ? ` · ${Math.round(attachment.size / 1024)}KB` : ''}</div>
             </div>
             <button
+              type="button"
               onClick={() => setAttachment(null)}
               className="ml-1 w-6 h-6 rounded-md grid place-items-center text-ink-500 hover:bg-cloud hover:text-ink-900 transition shrink-0"
               aria-label={t('chat.removeAttachment')}
@@ -1075,6 +1083,7 @@ export function Composer({
               </div>
             </div>
             <button
+              type="button"
               onClick={() => setReplyingTo(convoId, null)}
               className="w-6 h-6 rounded-md grid place-items-center text-ink-500 hover:bg-cloud hover:text-ink-900 transition shrink-0 self-center"
               aria-label={t('chat.cancelReply')}
@@ -1223,11 +1232,13 @@ export function Composer({
             onChange={onPickFile}
           />
           <button
+            type="button"
             onClick={() => fileRef.current?.click()}
             className="w-7 h-7 rounded-[7px] grid place-items-center hover:bg-sky2-50 hover:text-skype-deep transition"
             title={t('chat.attachFile')}
           ><IClip className="w-[17px] h-[17px]" /></button>
           <button
+            type="button"
             onMouseDown={(e) => e.preventDefault()}
             onClick={() => insertAtCursor('@')}
             className="w-7 h-7 rounded-[7px] grid place-items-center hover:bg-sky2-50 hover:text-skype-deep transition"
@@ -1235,6 +1246,7 @@ export function Composer({
           ><IAt className="w-[17px] h-[17px]" /></button>
           <div className="relative">
             <button
+              type="button"
               onClick={() => setEmojiOpen((v) => !v)}
               className={cn(
                 'w-7 h-7 rounded-[7px] grid place-items-center hover:bg-sky2-50 hover:text-skype-deep transition',
@@ -1250,6 +1262,7 @@ export function Composer({
             )}
           </div>
           <button
+            type="button"
             onClick={send}
             disabled={!canSend}
             className="ml-auto h-[30px] px-3.5 rounded-full font-semibold text-[12px] text-white inline-flex items-center gap-1.5 transition disabled:cursor-not-allowed"
@@ -1322,15 +1335,15 @@ function ThreadError({ message, onRetry }: { message: string; onRetry: () => voi
       <div
         className="flex flex-col items-center text-center max-w-[340px] gap-3 rounded-2xl px-6 py-6 backdrop-blur-sm"
         style={{
-          background: 'linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(255, 217, 210, 0.18))',
-          border: '1px solid rgba(255, 122, 107, 0.18)',
-          boxShadow: '0 12px 32px -16px rgba(200, 78, 63, 0.25)',
+          background: 'var(--error-card)',
+          border: 'var(--error-card-border)',
+          boxShadow: 'var(--error-card-shadow)',
         }}
       >
         <div
           className="w-10 h-10 rounded-full grid place-items-center"
           style={{
-            background: 'rgba(255, 122, 107, 0.12)',
+            background: 'var(--error-icon-bg)',
             color: 'var(--coral-deep)',
           }}
         >
@@ -1350,6 +1363,7 @@ function ThreadError({ message, onRetry }: { message: string; onRetry: () => voi
           {message}
         </div>
         <button
+          type="button"
           onClick={handleRetry}
           disabled={retrying}
           className="mt-1 h-[30px] px-3.5 rounded-full font-semibold text-[12px] text-white inline-flex items-center gap-1.5 transition disabled:cursor-not-allowed"
@@ -1387,8 +1401,13 @@ function EmptyConversationState() {
   // italic counter pattern in WhispersView's sidebar header.
   const list = useConversations((s) => s.list)
   const total = list.length
+  // isMuted, not the raw flag: a "muted for 15 min" row keeps `muted: true`
+  // locally until something reloads the list, so the raw read keeps silencing
+  // the count after the mute has lapsed. Every other unread total already goes
+  // through the helper — Rail, MobileTabBar, ConversationsPane, App — and this
+  // one sits on the same screen as the Rail badge, disagreeing with it.
   const unread = useMemo(
-    () => list.reduce((n, c) => n + (c.muted ? 0 : (c.unread ?? 0)), 0),
+    () => list.reduce((n, c) => n + (isMuted(c) ? 0 : (c.unread ?? 0)), 0),
     [list],
   )
 
@@ -1933,7 +1952,7 @@ export function ChatPane() {
         // chat surface (header + thread + composer share one continuous
         // background). Putting the gradient on the inner thread div used
         // to clip the coral haze right where the composer started.
-        background: 'radial-gradient(ellipse 80% 40% at 0% 0%, rgba(194, 230, 251, 0.3), transparent 60%), radial-gradient(ellipse 60% 40% at 100% 100%, rgba(255, 217, 210, 0.25), transparent 60%), var(--cloud)',
+        background: 'var(--chat-wash)',
       }}
     >
       <ChatHeader

@@ -209,16 +209,18 @@ export interface AgentRuntimeClient {
     projectIds?: readonly string[];
     conversationIds?: readonly string[];
   }): Promise<MemoryRow[]>
-  /** Per-conversation recent history for every convo with unread items. */
-  loadContext(agentId: string, conversationIds: string[]): Promise<ContextRow[]>
+  /** Per-conversation recent history for every convo with unread items.
+   *  Implementations must treat conversationIds as selectors, not proof of
+   *  access, and enforce the authenticated tenant + current membership. */
+  loadContext(agentId: string, companyId: string, conversationIds: string[]): Promise<ContextRow[]>
   /** Agent's feelings about people (the climate model). */
   loadClimate(agentId: string): Promise<ClimateRow[]>
   /** Index of installed skills (name + description only — progressive
    *  disclosure; full SKILL.md loaded lazily). */
   loadSkillsIndex(agentId: string): Promise<SkillIndexEntry[]>
-  /** Participant avatar portraits — for every id passed in, returns
-   *  the public URL if a portrait exists. */
-  loadFaces(participantIds: string[]): Promise<FaceRow[]>
+  /** Participant avatar portraits within the authenticated tenant — ids are
+   *  selectors, not authorization, and must never cross company boundaries. */
+  loadFaces(companyId: string, participantIds: string[]): Promise<FaceRow[]>
 
   // === Identity (system prompt) ===
   /** Full system prompt incl. IDENTITY.md / SOUL.md, persona, global
@@ -342,9 +344,10 @@ export interface AgentRuntimeClient {
    *  Body shape: `{ kind: 'notice', noticeKind, text }` — SystemRow renders
    *  the text as a centered italic line.
    *
-   *  `dedupeKey` + `dedupeTtlSec` deduplicate via Redis NX/EX so multiple
-   *  agents 429-ing in the same room don't all post the same notice. Returns
-   *  `{ posted }` — false when the dedupe window swallowed it. */
+   *  `dedupeKey` + `dedupeTtlSec` use a durable PostgreSQL idempotency marker
+   *  so multiple agents failing in the same room do not post duplicates, even
+   *  across Redis/process failures. Returns `{ posted }` — false when the
+   *  dedupe window swallowed it. */
   postSystemNotice(args: {
     conversationId: string
     companyId?: string | null
@@ -381,6 +384,7 @@ export interface AgentRuntimeClient {
    *  cursor is already past, this is a no-op. */
   markConversationRead(args: {
     agentId: string
+    companyId?: string | null
     conversationId: string
     upToMessageId: string
   }): Promise<void>

@@ -247,6 +247,7 @@ function MutedGlyph({ title }: { title: string }) {
   // Slack-style bell-off — small, ink-300, matches the row's secondary tone.
   return (
     <span
+      role="img"
       className="inline-flex items-center justify-center w-3 h-3 shrink-0 text-ink-300"
       title={title}
       aria-label={title}
@@ -336,8 +337,8 @@ function ConvoRow({ c, selected, onClick, onContextMenu }: RowProps) {
               // Muted convos keep the count visible (per the spec: "still
               // show the per-row unread count") but switch to an ink chip
               // instead of coral — preserves the "silent" affordance.
-              background: muted ? 'var(--ink-200)' : (isFreshPulled ? 'var(--gold)' : 'var(--coral)'),
-              color: muted ? 'var(--ink-700)' : (isFreshPulled ? 'var(--ink-900)' : 'white'),
+              background: muted ? 'var(--ink-200)' : (isFreshPulled ? 'var(--unread-fresh)' : 'var(--coral)'),
+              color: muted ? 'var(--ink-700)' : (isFreshPulled ? 'var(--unread-fresh-fg)' : 'white'),
             }}
           >{c.unread}</span>
         )}
@@ -464,6 +465,7 @@ function SearchResultsPane({
           const sel = idx === selectedIdx
           return (
             <button
+              type="button"
               key={`p-${p.id}`}
               data-search-idx={idx}
               onMouseEnter={() => onHover(idx)}
@@ -548,6 +550,7 @@ function SearchResultsPane({
           })
           return (
             <button
+              type="button"
               key={`m-${m.id}`}
               data-search-idx={idx}
               onMouseEnter={() => onHover(idx)}
@@ -598,6 +601,7 @@ function SearchConvoButton({ id, kind, title, members, byId, query, index, isSel
   })()
   return (
     <button
+      type="button"
       key={id}
       data-search-idx={index}
       onMouseEnter={() => onHover(index)}
@@ -645,6 +649,12 @@ export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React
   // Backend search: debounced API call with abort. We must not load every
   // message into the client — the universal search hits SQL on each
   // keystroke (after debounce) and returns four ranked buckets.
+  //
+  // 300ms, not 150: at typing speed the shorter window fired a second query
+  // before the first had returned, and each one occupies a connection for as
+  // long as the message-body bucket runs. The server now cancels an abandoned
+  // search (see `searchMessagesBounded`), but not issuing it at all is cheaper
+  // still, and the extra 150ms is imperceptible against the round trip.
   const [results, setResults] = useState<ApiSearchResults | null>(null)
   const [searching, setSearching] = useState(false)
   useEffect(() => {
@@ -661,7 +671,7 @@ export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React
           console.warn('[search] failed', err)
           setSearching(false)
         })
-    }, 150)
+    }, 300)
     return () => { window.clearTimeout(handle); ctl.abort() }
   }, [query])
 
@@ -950,6 +960,7 @@ export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React
           const isActive = filter === f
           return (
             <button
+              type="button"
               key={f}
               onClick={() => setFilter(f)}
               className={cn(
@@ -984,6 +995,7 @@ export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React
           const isActive = filter === filterKey
           return (
             <button
+              type="button"
               key={p.id}
               onClick={() => setFilter(filterKey)}
               className={cn(
@@ -1164,6 +1176,7 @@ function AddToGroupPicker({ participantId, participantName, groups, onClose }: {
             <div className="flex flex-col gap-1.5">
               {groups.map((g) => (
                 <button
+                  type="button"
                   key={g.id}
                   onClick={() => pick(g)}
                   disabled={busy}
@@ -1187,6 +1200,7 @@ function AddToGroupPicker({ participantId, participantName, groups, onClose }: {
         </div>
         <div className="px-6 py-4 border-t border-ink-100 flex items-center justify-end shrink-0 bg-paper">
           <button
+            type="button"
             onClick={onClose}
             className="px-4 py-2 rounded-[9px] text-[12.5px] font-semibold text-ink-700 bg-cloud hover:bg-sky2-50 transition"
             style={{ border: '1px solid var(--ink-100)' }}
@@ -1221,12 +1235,14 @@ function ConfirmLeave({ c, onCancel, onLeft }: {
         </p>
         <div className="flex gap-2">
           <button
+            type="button"
             onClick={onCancel}
             disabled={busy}
             className="flex-1 py-2 px-3 rounded-[9px] text-[12.5px] font-semibold text-ink-700 bg-cloud hover:bg-sky2-50 transition"
             style={{ border: '1px solid var(--ink-100)' }}
           >{t('common.cancel')}</button>
           <button
+            type="button"
             onClick={async () => { setBusy(true); await onLeft() }}
             disabled={busy}
             className="flex-1 py-2 px-3 rounded-[9px] text-[12.5px] font-semibold text-white transition disabled:opacity-50"
@@ -1315,6 +1331,7 @@ function AddMembersPicker({ group, candidates, onClose }: {
             const busy = busyId === p.id
             return (
               <button
+                type="button"
                 key={p.id}
                 disabled={busy}
                 onClick={() => void pick(p)}
@@ -1353,6 +1370,7 @@ function AddMembersPicker({ group, candidates, onClose }: {
         )}
         <div className="px-5 py-3 border-t border-ink-100 flex shrink-0">
           <button
+            type="button"
             onClick={onClose}
             className="ml-auto py-2 px-4 rounded-[9px] text-[12.5px] font-semibold text-ink-700 bg-cloud hover:bg-sky2-50 transition"
             style={{ border: '1px solid var(--ink-100)' }}

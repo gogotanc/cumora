@@ -21,12 +21,15 @@ function fromApi(c: ApiComputer): Computer {
     kind: c.kind,
     status: c.status,
     availableEngines: c.available_engines ?? [],
+    detectedEngines: c.detected_engines ?? [],
+    enginesDetectedAt: c.engines_detected_at ?? null,
     lastSeenAt: c.last_seen_at ?? null,
     pairedAt: c.paired_at ?? null,
     daemonVersion: c.daemon_version ?? null,
     daemonSupervised: c.daemon_supervised ?? null,
     latestDaemonVersion: c.latest_daemon_version ?? null,
     daemonOutdated: c.daemon_outdated ?? false,
+    engineDefaults: c.engine_defaults,
   }
 }
 

@@ -1,10 +1,13 @@
 import { randomUUID } from 'node:crypto'
+import type { PoolClient } from 'pg'
 import { pool } from '../db/pool.js'
-import { effectiveCostUsd, priceFor, modelPriceTable, EMPTY_USAGE, type TokenUsage } from './cost.js'
+import { EMPTY_USAGE, effectiveCostUsd, modelPriceTable, priceFor, type TokenUsage } from './cost.js'
 
 export type AgentRunStatus = 'running' | 'completed' | 'failed' | 'skipped'
-export type TriageSource = 'cloud' | 'byoa-claude' | 'byoa-codex' | 'byoa-grok' | 'byoa-cursor'
+export type TriageSource = 'cloud' | 'byoa-claude' | 'byoa-codex' | 'byoa-grok' | 'byoa-cursor' | 'byoa-opencode' | 'byoa-pi' | 'byoa-gemini' | 'byoa-qwen' | 'byoa-antigravity' | 'byoa-zcode'
 export type AgentEventLevel = 'debug' | 'info' | 'warn' | 'error'
+
+type Queryable = Pick<PoolClient, 'query'>
 
 const MAX_STRING_CHARS = 24_000
 const MAX_JSON_CHARS = 160_000
@@ -46,9 +49,9 @@ export async function createAgentRun(args: {
   inputMessageIds?: string[]
   inboxCount?: number
   fingerprint?: string
-}): Promise<string> {
+}, db: Queryable = pool): Promise<string> {
   const id = `run-${randomUUID()}`
-  await pool.query(
+  await db.query(
     `INSERT INTO agent_runs (
        id, agent_id, company_id, trigger, status, stage,
        input_message_ids, inbox_count, fingerprint
@@ -100,27 +103,91 @@ export async function recordAgentEvent(args: {
   )
 }
 
-export async function finishAgentRun(args: {
+/** Record a daemon-supplied event only when the JWT-pinned agent still owns
+ *  the target run. The authorization predicate lives in the same statement as
+ *  the INSERT so a guessed run id can never create an event or bump another
+ *  agent's stage between a route-level check and the write itself. */
+export async function recordAgentEventForOwner(args: {
+  runId: string
+  agentId: string
+  companyId: string
+  kind: string
+  level?: AgentEventLevel
+  title: string
+  data?: Record<string, unknown>
+  stage?: string
+}, db: Queryable = pool): Promise<boolean> {
+  const result = await db.query(
+    `WITH owned_run AS MATERIALIZED (
+       SELECT ar.id
+         FROM agent_runs ar
+        WHERE ar.id = $2
+          AND ar.agent_id = $3
+          AND ar.company_id = $4
+          AND EXISTS (
+            SELECT 1 FROM participants p
+             WHERE p.id = $3 AND p.company_id = $4
+               AND p.kind = 'agent' AND p.departed_at IS NULL
+          )
+     ), inserted AS (
+       INSERT INTO agent_events (id, run_id, agent_id, company_id, kind, level, title, data)
+       SELECT $1, owned_run.id, $3, $4, $5, $6, $7, $8::jsonb
+         FROM owned_run
+       RETURNING run_id
+     )
+     UPDATE agent_runs ar
+        SET updated_at = NOW(),
+            stage = COALESCE($9, ar.stage)
+       FROM inserted
+      WHERE ar.id = inserted.run_id
+      RETURNING ar.id`,
+    [
+      `evt-${randomUUID()}`,
+      args.runId,
+      args.agentId,
+      args.companyId,
+      args.kind,
+      args.level ?? 'info',
+      args.title,
+      jsonForDb(args.data ?? {}),
+      args.stage ?? null,
+    ],
+  )
+  return result.rowCount === 1
+}
+
+interface FinishAgentRunArgs {
   runId: string
   status: AgentRunStatus
   summary?: string
   error?: string | null
   toolCallCount?: number
   tokenCount?: number
-  /** Model id (for cache-aware pricing). */
   model?: string | null
-  /** Cache-aware token breakdown. When present we also store the breakdown +
-   *  effective cost; when absent, only the legacy fields are written (COALESCE
-   *  leaves the cost columns at their defaults). */
   usage?: TokenUsage | null
-}): Promise<void> {
+}
+
+async function finishAgentRunRow(
+  args: FinishAgentRunArgs,
+  owner?: { agentId: string; companyId: string },
+  db: Queryable = pool,
+): Promise<boolean> {
   const usage = args.usage ?? null
   const cost = usage ? effectiveCostUsd(args.model, usage) : null
   // Legacy token_count = input+output sum; keep it populated for back-compat.
   const tokenCount = args.tokenCount ?? (usage
     ? usage.inputTokens + usage.cachedInputTokens + usage.cacheCreationTokens + usage.outputTokens
     : 0)
-  await pool.query(
+  const ownerPredicate = owner
+    ? `AND agent_id = $14
+       AND company_id = $15
+       AND EXISTS (
+         SELECT 1 FROM participants p
+          WHERE p.id = $14 AND p.company_id = $15
+            AND p.kind = 'agent' AND p.departed_at IS NULL
+       )`
+    : ''
+  const result = await db.query(
     `UPDATE agent_runs
         SET status = $2,
             stage = $2,
@@ -137,7 +204,9 @@ export async function finishAgentRun(args: {
             model                 = COALESCE($13, model),
             updated_at = NOW(),
             finished_at = NOW()
-      WHERE id = $1`,
+      WHERE id = $1
+        ${ownerPredicate}
+      RETURNING id`,
     [
       args.runId,
       args.status,
@@ -152,8 +221,23 @@ export async function finishAgentRun(args: {
       cost?.usd ?? null,
       cost ? cost.estimated : null,
       args.model ?? null,
+      ...(owner ? [owner.agentId, owner.companyId] : []),
     ],
   )
+  return result.rowCount === 1
+}
+
+export async function finishAgentRun(args: FinishAgentRunArgs): Promise<void> {
+  await finishAgentRunRow(args)
+}
+
+/** Finish a daemon run only when its persisted owner matches the current JWT. */
+export async function finishAgentRunForOwner(
+  args: FinishAgentRunArgs & { agentId: string; companyId: string },
+  db: Queryable = pool,
+): Promise<boolean> {
+  const { agentId, companyId, ...run } = args
+  return finishAgentRunRow(run, { agentId, companyId }, db)
 }
 
 /** Record one inbox-triage call (the small-brain gate) with its cache-aware cost.
@@ -203,6 +287,40 @@ export async function touchAgentRun(runId: string): Promise<void> {
     `UPDATE agent_runs SET updated_at = NOW() WHERE id = $1 AND status = 'running'`,
     [runId],
   )
+}
+
+/** Ownership-aware daemon heartbeat. `owned` distinguishes an already-finished
+ *  caller-owned run (valid no-op) from a missing or foreign run without leaking
+ *  which of those two cases occurred. */
+export async function touchAgentRunForOwner(args: {
+  runId: string
+  agentId: string
+  companyId: string
+}, db: Queryable = pool): Promise<{ owned: boolean; touched: boolean }> {
+  const { rows } = await db.query<{ owned: boolean; touched: boolean }>(
+    `WITH owned_run AS MATERIALIZED (
+       SELECT ar.id, ar.status
+         FROM agent_runs ar
+        WHERE ar.id = $1
+          AND ar.agent_id = $2
+          AND ar.company_id = $3
+          AND EXISTS (
+            SELECT 1 FROM participants p
+             WHERE p.id = $2 AND p.company_id = $3
+               AND p.kind = 'agent' AND p.departed_at IS NULL
+          )
+     ), touched_run AS (
+       UPDATE agent_runs ar
+          SET updated_at = NOW()
+         FROM owned_run
+        WHERE ar.id = owned_run.id AND owned_run.status = 'running'
+       RETURNING ar.id
+     )
+     SELECT EXISTS (SELECT 1 FROM owned_run) AS owned,
+            EXISTS (SELECT 1 FROM touched_run) AS touched`,
+    [args.runId, args.agentId, args.companyId],
+  )
+  return rows[0] ?? { owned: false, touched: false }
 }
 
 export async function markStaleAgentRuns(maxAgeMs: number = 10 * 60_000): Promise<Array<{ id: string; agent_id: string }>> {
@@ -537,4 +655,282 @@ export async function getTriageEconomics(args: {
     perAgent: perAgent.sort((a, b) => b.triageCount - a.triageCount),
     recent,
   }
+}
+
+/** How long after a wake we still count a post as "this run answered".
+ *  Ten minutes is the window @yetone used to publish the 26.3% figure in #70;
+ *  keeping it identical is what makes this surface comparable to that number
+ *  rather than a second, differently-shaped statistic. */
+const SILENT_WINDOW_MS = 10 * 60_000
+
+export interface SilentWakeBucket {
+  /** 'group' | 'direct' — a DM legitimately answers far more often, so the two
+   *  must never be averaged into one rate. */
+  conversationKind: string
+  runs: number
+  silentRuns: number
+  silentRate: number
+  /** Big-brain spend on the silent runs, priced at query time from the stored
+   *  token counts (same rule as the triage ledger: tokens are real, prices are
+   *  live). */
+  silentSpendUsd: number
+}
+
+export interface WakeEconomics {
+  sinceHours: number
+  buckets: SilentWakeBucket[]
+  /** Any price used was a seed/fallback rather than an operator-supplied rate.
+   *  The RATIOS are measured either way; only the dollars are modelled. */
+  costEstimated: boolean
+  /** Fan-out width: how many big-brain turns a human message causes. Room-wide
+   *  — the agentId filter above does not apply to it. See getTurnsPerMessage. */
+  turnsPerMessage: TurnsPerMessageBucket[]
+}
+
+/** How often a wake produced nothing.
+ *
+ *  A run counts as SILENT when the agent posted no message into any of the
+ *  conversations that woke it, within SILENT_WINDOW_MS of the run starting.
+ *  That is the whole point of #70: a group message wakes every member, each
+ *  reasons over the same room, and most of them conclude it was not theirs —
+ *  after the big brain has already been paid.
+ *
+ *  This exists so that decision stops needing a hand-written query. The routing
+ *  change in #92 is meant to move this number; without a surface, "did it work"
+ *  is an argument rather than a measurement.
+ *
+ *  Deliberately NOT a counterfactual: it reports what happened, not what would
+ *  have been saved. The one modelled quantity is the dollar column, and
+ *  `costEstimated` says so. */
+export async function getWakeEconomics(args: {
+  companyId: string
+  agentId?: string | null
+  sinceHours?: number
+}): Promise<WakeEconomics> {
+  const sinceHours = Math.min(720, Math.max(1, args.sinceHours ?? 24))
+  const ms = sinceHours * 3_600_000
+  const agentFilter = args.agentId ? 'AND r.agent_id = $4' : ''
+  const params: unknown[] = [args.companyId, ms, SILENT_WINDOW_MS]
+  if (args.agentId) params.push(args.agentId)
+
+  // One aggregate, grouped in SQL — never a row per run in JS. Runs are reached
+  // through idx_agent_runs_company_started; the silence probe is an anti-join
+  // per (conversation, agent, window), which idx_messages_convo_created serves.
+  // Only runs that actually spent tokens are counted: an orphaned 0-token row
+  // never reached the model, so calling it a "silent wake" would inflate the
+  // very number this exists to track.
+  const { rows } = await pool.query<{
+    conversation_kind: string
+    runs: number
+    silent_runs: number
+    model: string | null
+    input_tokens: string
+    cached_tokens: string
+    cache_creation_tokens: string
+    output_tokens: string
+  }>(
+    `WITH run_convo AS (
+       SELECT r.id, r.agent_id, r.started_at, r.model,
+              r.input_tokens, r.cached_input_tokens, r.cache_creation_tokens, r.output_tokens,
+              (SELECT cid FROM jsonb_array_elements_text(r.trigger->'conversationIds') AS cid LIMIT 1) AS conversation_id
+         FROM agent_runs r
+        WHERE r.company_id = $1
+          AND r.started_at > NOW() - ($2::double precision * INTERVAL '1 millisecond')
+          AND (r.input_tokens + r.cached_input_tokens + r.output_tokens) > 0
+          ${agentFilter}
+     )
+     SELECT COALESCE(c.kind, 'group') AS conversation_kind,
+            rc.model,
+            count(*)::int AS runs,
+            count(*) FILTER (
+              WHERE NOT EXISTS (
+                SELECT 1 FROM messages m
+                 WHERE m.conversation_id = rc.conversation_id
+                   AND m.author_id = rc.agent_id
+                   AND m.created_at >= rc.started_at
+                   AND m.created_at < rc.started_at + ($3::double precision * INTERVAL '1 millisecond')
+              )
+            )::int AS silent_runs,
+            COALESCE(sum(rc.input_tokens) FILTER (WHERE NOT EXISTS (
+                SELECT 1 FROM messages m
+                 WHERE m.conversation_id = rc.conversation_id AND m.author_id = rc.agent_id
+                   AND m.created_at >= rc.started_at
+                   AND m.created_at < rc.started_at + ($3::double precision * INTERVAL '1 millisecond')
+            )), 0)::bigint AS input_tokens,
+            COALESCE(sum(rc.cached_input_tokens) FILTER (WHERE NOT EXISTS (
+                SELECT 1 FROM messages m
+                 WHERE m.conversation_id = rc.conversation_id AND m.author_id = rc.agent_id
+                   AND m.created_at >= rc.started_at
+                   AND m.created_at < rc.started_at + ($3::double precision * INTERVAL '1 millisecond')
+            )), 0)::bigint AS cached_tokens,
+            COALESCE(sum(rc.cache_creation_tokens) FILTER (WHERE NOT EXISTS (
+                SELECT 1 FROM messages m
+                 WHERE m.conversation_id = rc.conversation_id AND m.author_id = rc.agent_id
+                   AND m.created_at >= rc.started_at
+                   AND m.created_at < rc.started_at + ($3::double precision * INTERVAL '1 millisecond')
+            )), 0)::bigint AS cache_creation_tokens,
+            COALESCE(sum(rc.output_tokens) FILTER (WHERE NOT EXISTS (
+                SELECT 1 FROM messages m
+                 WHERE m.conversation_id = rc.conversation_id AND m.author_id = rc.agent_id
+                   AND m.created_at >= rc.started_at
+                   AND m.created_at < rc.started_at + ($3::double precision * INTERVAL '1 millisecond')
+            )), 0)::bigint AS output_tokens
+       FROM run_convo rc
+       LEFT JOIN conversations c ON c.id = rc.conversation_id
+      GROUP BY conversation_kind, rc.model`,
+    params,
+  )
+
+  const byKind = new Map<string, { runs: number; silent: number; usd: number }>()
+  let anyEstimated = false
+  for (const r of rows) {
+    const { usd, estimated } = effectiveCostUsd(r.model, {
+      inputTokens: Number(r.input_tokens),
+      cachedInputTokens: Number(r.cached_tokens),
+      cacheCreationTokens: Number(r.cache_creation_tokens),
+      outputTokens: Number(r.output_tokens),
+    })
+    if (estimated) anyEstimated = true
+    const cur = byKind.get(r.conversation_kind) ?? { runs: 0, silent: 0, usd: 0 }
+    cur.runs += r.runs
+    cur.silent += r.silent_runs
+    cur.usd += usd
+    byKind.set(r.conversation_kind, cur)
+  }
+
+  return {
+    sinceHours,
+    costEstimated: anyEstimated,
+    buckets: [...byKind].map(([conversationKind, v]) => ({
+      conversationKind,
+      runs: v.runs,
+      silentRuns: v.silent,
+      silentRate: v.runs > 0 ? v.silent / v.runs : 0,
+      silentSpendUsd: v.usd,
+    })).sort((a, b) => b.runs - a.runs),
+    turnsPerMessage: await getTurnsPerMessage({ companyId: args.companyId, sinceHours }),
+  }
+}
+
+/** One row of the fan-out-width distribution. */
+export interface TurnsPerMessageBucket {
+  conversationKind: string
+  /** Denominator: human-authored messages in rooms with at least one agent. */
+  messages: number
+  /** Numerator: (message, run) pairs — runs whose drained inbox included the
+   *  message. A run draining a burst counts toward each message it read. */
+  turns: number
+  avgTurns: number
+  medianTurns: number
+  hist: { turns: string; messages: number }[]
+}
+
+/** How many big-brain turns does one human message cause?
+ *
+ *  The silent-rate panel above answers "of the turns that fired, how many said
+ *  nothing". This is the other half of #70's ledger: how MANY turns a message
+ *  fires in the first place. The scheduler picks recipients purely by
+ *  membership, so the width of that fan-out is the number any routing change
+ *  (#92's `me`, a future `one-of-us`) claims to shrink — measured here instead
+ *  of argued, per the ordering agreed in the #70 review.
+ *
+ *  Attribution: `agent_runs.input_message_ids` is the inbox a run actually
+ *  drained, so a message's turn count is the number of token-bearing runs that
+ *  read it. A run draining a burst of k messages counts toward each of them —
+ *  that is deliberate (the message genuinely participated in that turn) and it
+ *  is why this panel reports counts, not dollars: dollars per message would
+ *      need fractional run attribution, which is a different, denser metric.
+ *
+ *  Denominator: human-authored, non-system messages in group/direct rooms with
+ *  at least one agent member — so a message nobody's inbox ever reached shows
+ *  up as 0 turns rather than vanishing. Room-wide by design: the agent filter
+ *  above does not apply, because fan-out width is a property of the room. */
+export async function getTurnsPerMessage(args: {
+  companyId: string
+  sinceHours?: number
+}): Promise<TurnsPerMessageBucket[]> {
+  const sinceHours = Math.min(720, Math.max(1, args.sinceHours ?? 24))
+  const ms = sinceHours * 3_600_000
+
+  const { rows } = await pool.query<{
+    conversation_kind: string
+    messages: number
+    turns: number
+    avg_turns: string
+    median_turns: string
+    w0: number
+    w1: number
+    w2: number
+    w3_5: number
+    w6: number
+  }>(
+    `WITH scope AS (
+       SELECT m.id AS mid, c.kind AS conversation_kind
+         FROM messages m
+         JOIN conversations c ON c.id = m.conversation_id
+         JOIN participants a ON a.id = m.author_id AND a.company_id = c.company_id
+        WHERE c.company_id = $1
+          AND c.kind IN ('group', 'direct')
+          AND m.kind <> 'system'
+          AND m.created_at > NOW() - ($2::double precision * INTERVAL '1 millisecond')
+          AND a.kind = 'human'
+          AND a.departed_at IS NULL
+          AND EXISTS (
+            SELECT 1
+              FROM conversation_members cm
+              JOIN participants ap
+                ON ap.id = cm.participant_id
+               AND ap.company_id = cm.company_id
+             WHERE cm.conversation_id = c.id
+               AND cm.company_id = c.company_id
+               AND ap.kind = 'agent' AND ap.departed_at IS NULL
+          )
+     ),
+     turns AS (
+       SELECT j.mid, count(DISTINCT r.id)::int AS turns
+         FROM agent_runs r
+         CROSS JOIN LATERAL jsonb_array_elements_text(r.input_message_ids) AS j(mid)
+        WHERE r.company_id = $1
+          AND r.started_at > NOW() - ($2::double precision * INTERVAL '1 millisecond')
+          AND (r.input_tokens + r.cached_input_tokens + r.output_tokens) > 0
+        GROUP BY j.mid
+     )
+     SELECT s.conversation_kind,
+            count(*)::int AS messages,
+            COALESCE(sum(t.turns), 0)::int AS turns,
+            -- COALESCE INSIDE the aggregate, not around it. A message no
+            -- inbox reached has t.turns = NULL after the LEFT JOIN, and SQL
+            -- aggregates skip NULLs — so avg and median silently dropped the
+            -- zero-turn messages while the histogram (which already coalesces)
+            -- counted them. On 4 messages, 2 of them unwoken, that reported a
+            -- fan-out of 3.0 where the real width was 1.5, next to a rendered
+            -- turns/messages pair that divides to 1.5. The whole point of
+            -- this panel is that number.
+            COALESCE(avg(COALESCE(t.turns, 0)), 0) AS avg_turns,
+            COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY COALESCE(t.turns, 0)), 0) AS median_turns,
+            count(*) FILTER (WHERE COALESCE(t.turns, 0) = 0)::int AS w0,
+            count(*) FILTER (WHERE COALESCE(t.turns, 0) = 1)::int AS w1,
+            count(*) FILTER (WHERE COALESCE(t.turns, 0) = 2)::int AS w2,
+            count(*) FILTER (WHERE COALESCE(t.turns, 0) BETWEEN 3 AND 5)::int AS w3_5,
+            count(*) FILTER (WHERE COALESCE(t.turns, 0) >= 6)::int AS w6
+       FROM scope s
+       LEFT JOIN turns t ON t.mid = s.mid
+      GROUP BY s.conversation_kind`,
+    [args.companyId, ms],
+  )
+
+  return rows.map((r) => ({
+    conversationKind: r.conversation_kind,
+    messages: r.messages,
+    turns: r.turns,
+    avgTurns: Number(r.avg_turns),
+    medianTurns: Number(r.median_turns),
+    hist: [
+      { turns: '0', messages: r.w0 },
+      { turns: '1', messages: r.w1 },
+      { turns: '2', messages: r.w2 },
+      { turns: '3–5', messages: r.w3_5 },
+      { turns: '6+', messages: r.w6 },
+    ],
+  }))
 }

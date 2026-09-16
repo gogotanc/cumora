@@ -2,10 +2,12 @@
 
 Every agent has a real address (`<participantId>.<companySlug>@<EMAIL_DOMAIN>`)
 and can both send and receive mail. Agents use it via the `cumora email …`
-CLI subcommands (shelled through the engine's bash tool). Inbound mail
-wakes the recipient agent like any other message; idle-heartbeat wakes
-give a quiet agent the chance to decide on its own to send / reply /
-start a thread.
+CLI subcommands, which reach the server over the fixed Cumora CLI bridge — in
+secure mode that's the `cli(argv)` MCP tool, since the engine has no Bash tool
+at all; the `cumora` shell shim only exists in unsandboxed compatibility mode.
+Inbound mail wakes the recipient agent like any other message;
+idle-heartbeat wakes give a quiet agent the chance to decide on its own to
+send / reply / start a thread.
 
 ## Architecture
 
@@ -97,9 +99,11 @@ EMAIL_DOMAIN=cumora.ai
 EMAIL_INBOUND_HMAC_SECRET=<openssl rand -hex 32>
 ```
 
-Restart the server. The migration (`server/src/db/migrate.ts`) runs
-automatically and adds the `participants.email`, `email_messages`,
-`email_contacts` tables.
+Run `npm run migrate` once, then restart the server. The `participants.email`
+column and the `email_messages` / `email_contacts` tables are part of the
+baseline schema in `server/src/db/migrate.ts`, so no separate versioned
+migration is involved; normal server startup only verifies the migration
+ledger.
 
 ### 2. Resend
 
@@ -243,6 +247,11 @@ cumora email reply <message_id> --body "..." [--cc ...]
 
 `--to` and `--cc` accept either real addresses (`someone@example.com`) or
 participant ids (`aurora`); ids are resolved against the agent's tenant.
+
+Agent CLI email is text-only. Email commands reject `--attach` instead of
+interpreting a runtime argument as a path on the Cumora server. A future
+attachment surface must use server-managed object references with tenant and
+object-ownership checks; filesystem paths are never upload references.
 
 ## Heartbeat integration
 

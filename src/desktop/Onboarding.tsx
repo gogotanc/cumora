@@ -1,9 +1,9 @@
 import { useEffect, useState } from 'react'
-import { api, getComputerServerOrigin, getInternalComputerOrigin } from '@/api/client'
+import { api, getPairingServerOrigin } from '@/api/client'
 import { useComputers } from '@/stores/computers'
-import { isWindows } from '@/lib/runtime'
 import { TitleBar } from '@/desktop/TitleBar'
 import { useT } from '@/lib/i18n'
+import { RUNNABLE_ENGINES, engineLabel, type RunnableEngineId } from '@/lib/engines'
 
 /**
  * First-run gate for free-tier users: their agents run on their own machine
@@ -22,13 +22,11 @@ export function Onboarding() {
   // Claude is the default; ANY other pick must be named explicitly. We DON'T
   // append `--engine claude` so a Claude-less machine still auto-detects rather
   // than erroring on a Claude it doesn't have.
-  const [engine, setEngine] = useState<'claude' | 'codex' | 'grok' | 'cursor'>('claude')
-  // Default to installing the always-on service: it auto-starts on boot,
+  const [engine, setEngine] = useState<RunnableEngineId>('claude')
+  // Default to installing the always-on service: it auto-starts at sign-in,
   // auto-restarts on crash, and auto-updates — so the user isn't tied to a
   // terminal that must stay open. Appends `--install-service` to the command.
-  // `--install-service` only supports macOS + Linux (the daemon throws on
-  // Windows), so default it off there and hide the option entirely.
-  const [asService, setAsService] = useState(!isWindows)
+  const [asService, setAsService] = useState(true)
 
   useEffect(() => { void useComputers.getState().refresh() }, [])
   useEffect(() => {
@@ -37,17 +35,13 @@ export function Onboarding() {
     return () => window.clearTimeout(t)
   }, [copied])
 
-  const origin = getComputerServerOrigin()
-  const internalOrigin = getInternalComputerOrigin()
+  const origin = getPairingServerOrigin()
   // Every non-default engine, not just Codex: without the flag the daemon
   // auto-detects and the server takes engines[0] as this computer's DEFAULT, so
   // picking Grok on a machine that also has Claude silently paired it to Claude.
   const engineFlag = engine === 'claude' ? '' : ` --engine ${engine}`
   const serviceFlag = asService ? ' --install-service' : ''
   const cmd = code ? `npx cumora@latest agent computer --pair ${code}${origin ? ` --server ${origin}` : ''}${engineFlag}${serviceFlag}` : ''
-  const internalCmd = code && internalOrigin
-    ? `npx cumora@latest agent computer --pair ${code} --server ${internalOrigin}${engineFlag}${serviceFlag}`
-    : ''
 
   async function getCode() {
     setErr(null); setBusy(true)
@@ -80,7 +74,7 @@ export function Onboarding() {
                 {/* biome-ignore lint/security/noDangerouslySetInnerHtml: static copy from the locale bundle, not user input */}
                 <div className="text-[13px] text-ink-600 mb-4" dangerouslySetInnerHTML={{ __html: t('onboard.cmdIntro') }} />
                 {err && <div className="text-[12px] text-coral-deep bg-coral-soft rounded-[8px] p-2 mb-3">{err}</div>}
-                <button onClick={getCode} disabled={busy}
+                <button type="button" onClick={getCode} disabled={busy}
                   className="px-5 py-2.5 rounded-[11px] bg-skype text-white text-[14px] font-semibold disabled:opacity-50">
                   {busy ? t('onboard.generating') : t('onboard.addComputer')}
                 </button>
@@ -91,43 +85,34 @@ export function Onboarding() {
                 <div className="text-[11.5px] text-ink-500 mb-2.5 italic font-display">
                   {t('onboard.tokenHint')}
                 </div>
-                <div className="flex items-center gap-2.5 mb-2.5">
-                  <span className="text-[12px] text-ink-500">{t('onboard.engine')}</span>
-                  <div className="inline-flex rounded-[9px] p-0.5" style={{ background: 'var(--ink-100)' }}>
-                    {([['claude', 'Claude Code'], ['codex', 'Codex'], ['grok', 'Grok Build'], ['cursor', 'Cursor']] as const).map(([id, label]) => (
-                      <button key={id} type="button" onClick={() => setEngine(id)}
-                        className="px-3 py-1 rounded-[7px] text-[12px] font-semibold transition-colors duration-150"
-                        style={engine === id
-                          ? { background: 'var(--paper)', color: 'var(--ink-900)', boxShadow: '0 1px 2px rgba(0,0,0,0.08)' }
-                          : { color: 'var(--ink-500)' }}>
-                        {label}
-                      </button>
-                    ))}
+                <div className="mb-2.5">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <span className="text-[12px] text-ink-500 shrink-0">{t('onboard.engine')}</span>
+                    <div className="flex-1 min-w-0 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+                      <div className="inline-flex min-w-max rounded-[9px] p-0.5" style={{ background: 'var(--ink-100)' }}>
+                        {RUNNABLE_ENGINES.map((id) => (
+                          <button key={id} type="button" onClick={() => setEngine(id)}
+                            className="shrink-0 whitespace-nowrap px-3 py-1 rounded-[7px] text-[12px] font-semibold transition-colors duration-150"
+                            style={engine === id
+                              ? { background: 'var(--paper)', color: 'var(--ink-900)', boxShadow: '0 1px 2px rgba(0,0,0,0.08)' }
+                              : { color: 'var(--ink-500)' }}>
+                            {engineLabel(id)}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
                   </div>
-                  <span className="text-[11px] text-ink-400">{t('onboard.engineHint')}</span>
+                  <div className="mt-1.5 text-[11px] leading-relaxed text-ink-400">{t('onboard.engineHint')}</div>
                 </div>
-                {isWindows ? (
-                  <div className="mb-2.5 text-[12px] text-ink-600">
-                    {t('onboard.windowsKeep')}
-                    <span className="text-ink-400"> — {t('onboard.windowsServiceNote')}</span>
-                  </div>
-                ) : (
-                  <label className="flex items-start gap-2 mb-2.5 cursor-pointer select-none">
-                    <input type="checkbox" checked={asService} onChange={(e) => setAsService(e.target.checked)} className="mt-[3px]" />
-                    <span className="text-[12px] text-ink-600">
-                      {t('onboard.background')} <span className="text-ink-400">{t('onboard.backgroundDetail')}</span>
-                    </span>
-                  </label>
-                )}
+                <label className="flex items-start gap-2 mb-2.5 cursor-pointer select-none">
+                  <input type="checkbox" checked={asService} onChange={(e) => setAsService(e.target.checked)} className="mt-[3px]" />
+                  <span className="text-[12px] text-ink-600">
+                    {t('onboard.background')} <span className="text-ink-400">{t('onboard.backgroundDetail')}</span>
+                  </span>
+                </label>
                 <pre className="bg-ink-900 text-cloud rounded-[10px] p-3 text-[12px] overflow-x-auto whitespace-pre-wrap break-all font-mono select-all">{cmd}</pre>
-                {internalCmd && (
-                  <div className="mt-2 text-[11px] text-ink-500 leading-relaxed">
-                    {t('computer.onBoxHint')}
-                    <pre className="mt-1 bg-ink-50 border border-ink-100 text-ink-700 rounded-[8px] p-2 text-[11px] overflow-x-auto whitespace-pre-wrap break-all font-mono select-all">{internalCmd}</pre>
-                  </div>
-                )}
                 <div className="flex items-center gap-3 mt-3">
-                  <button onClick={() => { void navigator.clipboard?.writeText(cmd); setCopied(true) }}
+                  <button type="button" onClick={() => { void navigator.clipboard?.writeText(cmd); setCopied(true) }}
                     className="inline-flex items-center justify-center min-w-[120px] text-[12px] font-semibold px-3 py-1.5 rounded-[9px] text-white transition-colors duration-200"
                     style={{ background: copied ? '#3BB273' : 'var(--skype)' }}>
                     {copied ? t('onboard.copied') : t('onboard.copy')}

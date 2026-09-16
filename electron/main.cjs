@@ -5,6 +5,7 @@ const fs = require('node:fs')
 const http = require('node:http')
 const crypto = require('node:crypto')
 const { pathToFileURL } = require('node:url')
+const { initialWindowSize } = require('./window-size.cjs')
 const autoUpdater = require('./autoUpdater.cjs')
 
 const isDev = !app.isPackaged
@@ -374,6 +375,36 @@ const AUTH_DONE_HTML = `<!doctype html>
   if (nonce) frag.set('n', nonce);
   const deepLink = 'cumora://auth#' + frag.toString();
 
+  // PRIMARY handoff: POST straight back to the loopback server that served
+  // this page. Same origin, so no CORS and no preflight, and the token goes
+  // to THE process that armed the nonce — the one waiting for it.
+  //
+  // The deep link below cannot do that. The cumora:// scheme is resolved by
+  // the OS against whatever it has registered for it, which on a dev
+  // machine is regularly the WRONG binary: an unpackaged "electron ." run
+  // registers its Electron.app bundle, so a stray "npx electron" (or an old
+  // release/ build, or a mounted DMG) can win the scheme and swallow every
+  // sign-in — the token opens a stranger's window and the app you are
+  // actually running never sees it. It stays as the fallback for the case
+  // this POST can't cover: the app quit between opening the browser and
+  // finishing, so nothing is listening here anymore.
+  fetch('/auth/token', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token, companyId, nonce }),
+  }).then((r) => {
+    if (!r.ok) throw new Error('handoff rejected: ' + r.status);
+    h1.textContent = 'Signed in';
+    sub.textContent = 'Cumora has your session.';
+    label.innerHTML = '<span class="ok">✓</span> Signed in';
+    btn.disabled = true;
+    hint.textContent = 'You can close this tab.';
+  }).catch(() => {
+    // Loopback gone (app quit) or handoff refused — offer the OS route.
+    sub.textContent = 'Ready when you are.';
+    hint.textContent = 'You can close this tab after Cumora opens.';
+  });
+
   let opened = false;
   btn.addEventListener('click', () => {
     if (opened) return;
@@ -429,15 +460,27 @@ function armAuthHandoff() {
 function consumeAuthNonce(nonce) {
   const armed = armedAuthNonce
   const expiry = armedAuthExpiry
-  armedAuthNonce = null
-  armedAuthExpiry = 0
-  if (!armed || Date.now() > expiry) return false
-  if (typeof nonce !== 'string' || nonce.length !== armed.length) return false
-  try {
-    return crypto.timingSafeEqual(Buffer.from(nonce), Buffer.from(armed))
-  } catch {
+  // Clear only on a MATCH (or a genuine expiry). Clearing first meant any
+  // inbound value disarmed the pending sign-in: click sign-in twice, finish the
+  // first tab, and its now-stale nonce took the second one's arming with it —
+  // so the obvious recovery, going back and finishing the other tab, failed too.
+  if (!armed || Date.now() > expiry) {
+    armedAuthNonce = null
+    armedAuthExpiry = 0
     return false
   }
+  if (typeof nonce !== 'string' || nonce.length !== armed.length) return false
+  let ok = false
+  try {
+    ok = crypto.timingSafeEqual(Buffer.from(nonce), Buffer.from(armed))
+  } catch {
+    ok = false
+  }
+  if (ok) {
+    armedAuthNonce = null
+    armedAuthExpiry = 0
+  }
+  return ok
 }
 
 /** Pull token + companyId + nonce out of a `cumora://auth#token=…` URL. The OS
@@ -465,7 +508,7 @@ function parseAuthDeepLink(rawUrl) {
 function dispatchAuthToken(token, companyId, nonce) {
   if (!consumeAuthNonce(nonce)) {
     console.warn('[auth] dropped inbound token: no matching armed nonce (possible drive-by deep link)')
-    return
+    return false
   }
   if (mainWindow && !mainWindow.isDestroyed()) {
     if (mainWindow.isMinimized()) mainWindow.restore()
@@ -475,6 +518,7 @@ function dispatchAuthToken(token, companyId, nonce) {
   } else {
     pendingAuthToken = { token, companyId }
   }
+  return true
 }
 let pendingAuthToken = null
 
@@ -515,8 +559,15 @@ function startAuthLoopback() {
           }
           const companyId = typeof parsed.companyId === 'string' ? parsed.companyId : null
           const nonce = typeof parsed.nonce === 'string' ? parsed.nonce : null
-          dispatchAuthToken(parsed.token, companyId, nonce)
-          res.statusCode = 204; res.end()
+          // Answer what actually happened. A 204 for a token the app dropped
+          // made the browser page report "Signed in — Cumora has your session"
+          // while nothing had been handed over; the page keys on `r.ok` and its
+          // catch branch is the one that tells the user to open Cumora itself.
+          if (dispatchAuthToken(parsed.token, companyId, nonce)) {
+            res.statusCode = 204; res.end()
+          } else {
+            res.statusCode = 409; res.end('no armed sign-in')
+          }
         } catch {
           res.statusCode = 400; res.end('bad json')
         }
@@ -674,6 +725,14 @@ function getDockUnreadIcon() {
 
 function setDockUnreadDot(visible) {
   dockUnreadDotVisible = !!visible
+  // Mirror to the tray FIRST. The dock is macOS-only, but the tray is the
+  // Windows/Linux surface for this same state — and the darwin early-return
+  // below used to sit in front of this call, so on Win/Linux the tray image
+  // was set once when the tray was created and never again. The dot could not
+  // appear there at all: `dock:set-unread-dot` is the only path that carries a
+  // change, and it returned before reaching this line.
+  // Cheap to call when there is no tray (no-op).
+  setTrayUnreadDot(dockUnreadDotVisible)
   if (process.platform !== 'darwin' || !app.dock) return
   try {
     app.dock.setBadge('')
@@ -681,9 +740,6 @@ function setDockUnreadDot(visible) {
     if (!img.isEmpty()) app.dock.setIcon(img)
   } catch { /* swallow — Dock is macOS-only and not critical path */ }
   scheduleRegularDockRepair()
-  // Mirror to the system tray so menu bar / system tray surfaces stay
-  // in sync with the dock. Cheap to call when there's no tray (no-op).
-  setTrayUnreadDot(dockUnreadDotVisible)
 }
 
 /* ============================ System tray ============================
@@ -1054,16 +1110,18 @@ function attachDisplayListeners() {
 }
 
 function createWindow() {
-  const saved = readWindowState() ?? DEFAULT_WINDOW_STATE
+  const savedState = readWindowState()
+  const saved = savedState ?? DEFAULT_WINDOW_STATE
   const rect = visibleRect(saved)
-  // Cap initial size to fit comfortably inside the primary display's
-  // work area — 90% of work area, with the configured default as the
-  // upper ceiling. Without this, the 1480×920 default would exceed
-  // smaller laptop displays and macOS would clamp on launch, making
-  // every first-run feel "fullscreen".
-  const wa = screen.getPrimaryDisplay().workArea
-  const initW = Math.min(saved.width ?? DEFAULT_WINDOW_STATE.width, Math.round(wa.width * 0.9))
-  const initH = Math.min(saved.height ?? DEFAULT_WINDOW_STATE.height, Math.round(wa.height * 0.9))
+  // The 90% cap is for FIRST RUN — it stops the 1480×920 default exceeding a
+  // small laptop, which macOS would clamp on launch so the app felt like it
+  // opened fullscreen. A size the user chose is not capped, only fitted, and
+  // fitted against the display it is actually landing on rather than the
+  // primary one. See window-size.cjs for what the old expression cost.
+  const wa = (rect ? screen.getDisplayMatching(rect) : screen.getPrimaryDisplay()).workArea
+  const { width: initW, height: initH } = initialWindowSize(
+    saved, DEFAULT_WINDOW_STATE, wa, Boolean(savedState),
+  )
   mainWindow = new BrowserWindow({
     width: initW,
     height: initH,
@@ -1359,6 +1417,22 @@ ipcMain.handle('app:is-focused', () => {
   return !!(mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused())
 })
 
+ipcMain.on('theme:set', (_event, source) => {
+  if (source !== 'system' && source !== 'light' && source !== 'dark') return
+  nativeTheme.themeSource = source
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    const dark = source === 'dark' || (source === 'system' && nativeTheme.shouldUseDarkColors)
+    mainWindow.setBackgroundColor(dark ? '#21252b' : '#E6F3FB')
+  }
+})
+
+nativeTheme.on('updated', () => {
+  if (nativeTheme.themeSource !== 'system') return
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.setBackgroundColor(nativeTheme.shouldUseDarkColors ? '#21252b' : '#E6F3FB')
+  }
+})
+
 // Renderer asks main to open a URL in the user's default browser
 // (used for OAuth — embedded webviews are banned by Google and the
 // experience is better in a familiar browser anyway). Restricted to
@@ -1441,9 +1515,11 @@ app.on('second-instance', (_event, argv) => {
 }
 
 app.whenReady().then(() => {
-  if (process.platform === 'darwin') {
-    nativeTheme.themeSource = 'light'
-  }
+  // Follow the OS so `prefers-color-scheme` in the renderer is honest.
+  // The renderer sends `theme:set` when the user pins light or dark.
+  // Previously this was forced to light on Darwin because the UI had
+  // no dark palette.
+  nativeTheme.themeSource = 'system'
 
   // Wire the app:// protocol handler. protocol.handle is the modern
   // API (Electron 25+) — gives us a streaming Response back so the

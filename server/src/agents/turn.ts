@@ -20,6 +20,8 @@
 import type { ResponseInputItem, ResponseStreamEvent } from 'openai/resources/responses/responses'
 import { env } from '../env.js'
 import { redis } from '../redis.js'
+import { readLocalMessageAttachment } from '../local-attachment-files.js'
+import { messageAttachmentStorageKey } from '../storage-keys.js'
 import { classifyInboxTriage, gateSyntheticWake } from './inbox-triage.js'
 import { GLANCE_YIELD_RULES } from './glance-protocol.js'
 import { TOOL_DEFS_RESPONSES, executePodTool } from './runtime/pod-tools.js'
@@ -112,6 +114,13 @@ interface InboxRow {
   quoted: QuotedSummary | null
 }
 
+import {
+  classifyWake,
+  describeWakeBackgroundBrief,
+  renderBriefedManualWakeContext,
+} from './turn-wake.js'
+import { mentionedAgentIds } from './scheduler.js'
+
 export interface AgentTurnOptions {
   /** Why this turn was started. Message-driven turns remain the default. */
   trigger?: 'message.new' | 'idle' | 'manual' | 'background_scan' | 'poll.updated'
@@ -156,10 +165,11 @@ async function loadMemory(
 
 async function loadContext(
   agentId: string,
+  companyId: string,
   conversationIds: string[],
   rc: AgentRuntimeClient = runtime,
 ): Promise<ContextRow[]> {
-  return rc.loadContext(agentId, conversationIds)
+  return rc.loadContext(agentId, companyId, conversationIds)
 }
 
 async function loadClimate(
@@ -388,17 +398,25 @@ function publicUrlFor(url: string): string {
   return base.replace(/\/+$/, '') + url
 }
 
-/** Re-sign an attachment URL just-in-time for the agent's wake — the URL
- *  stored in messages.attachment.url could be hours/days old. With HMAC
- *  signing on, an expired URL would 403 when the agent (or OpenAI vision)
- *  tries to fetch. We resolve via the storage layer at the moment of use. */
-async function freshAttachmentUrl(att: InboxAttachment): Promise<string> {
-  if (!att.key) return att.url
+interface TrustedAttachmentSource {
+  key: string
+  url: string
+  mode: 'local' | 'r2'
+}
+
+/** Resolve message content exclusively from Cumora storage. The persisted URL
+ *  is presentation data and must never select a server-side fetch target;
+ *  regenerate it from the validated key and fail closed for legacy/external
+ *  references. External image links remain visible in text context, but are
+ *  deliberately not downloaded by this process. */
+async function trustedAttachmentSource(att: InboxAttachment): Promise<TrustedAttachmentSource | null> {
+  const key = messageAttachmentStorageKey(att, env.R2_PUBLIC_BASE)
+  if (!key) return null
   try {
     const { storage } = await import('../storage.js')
-    return await storage.publicUrl(att.key)
+    return { key, url: await storage.publicUrl(key), mode: storage.mode }
   } catch {
-    return att.url
+    return null
   }
 }
 
@@ -619,6 +637,18 @@ function renderContext(
       // quote target keep treating it as a general group message and
       // chime in unprompted; this puts the address signal in the
       // glance-zone of the wake prompt.
+      // An exact @-mention of the viewer is the strongest "this one is yours"
+      // signal a room carries, and it was only ever visible as raw text inside
+      // the body. Surface it in the same glance-zone as the quote tag below.
+      //
+      // Only the POSITIVE case is tagged. The mirror ("addressed to X — not
+      // you") would need the conversation's member list to tell a real
+      // participant from a stray @token, and the two errors are not
+      // symmetric: a wrong "not you" can silence the whole room, while a wrong
+      // "YOU" only costs one extra reply.
+      if (viewerAgentId && !m.is_self && mentionedAgentIds(m.body ?? '', [viewerAgentId]).length > 0) {
+        line += `  ↦ @-mentioned YOU`
+      }
       if (m.quoted_message_id && m.quoted && !m.is_self) {
         if (viewerAgentId && m.quoted.authorId === viewerAgentId) {
           line += `  ↦ addressed to YOU (quote-reply)`
@@ -704,27 +734,23 @@ async function readTextAttachment(att: InboxAttachment): Promise<TextExcerpt | n
   const looksTextual = mime.startsWith('text/') || TEXT_LIKE_MIMES.has(mime)
   if (!looksTextual) return null
 
+  const source = await trustedAttachmentSource(att)
+  if (!source) return null
   let buf: Buffer | null = null
-  if (att.url.startsWith('/uploads/')) {
+  if (source.mode === 'local') {
     // Local-mode file — read straight from disk to avoid a needless HTTP hop.
-    try {
-      const { readFile } = await import('node:fs/promises')
-      const { join } = await import('node:path')
-      const { UPLOAD_DIR } = await import('../storage.js')
-      const rel = att.url.replace(/^\/uploads\//, '')
-      const data = await readFile(join(UPLOAD_DIR, rel))
-      buf = Buffer.from(data)
-    } catch {
-      return null
-    }
+    // The helper resolves physical paths so an in-root symlink cannot escape.
+    const { UPLOAD_DIR } = await import('../storage.js')
+    buf = await readLocalMessageAttachment(UPLOAD_DIR, source.key)
   } else {
-    // R2 / external URL — re-sign just-in-time so an old persisted URL
-    // doesn't 403 at the Worker, then fetch with a short timeout so a
-    // flaky bucket can't stall the wake.
-    const fresh = await freshAttachmentUrl(att)
-    if (!/^https?:\/\//.test(fresh)) return null
+    // R2 URL was minted from the validated key above. Reject redirects so a
+    // compromised/misconfigured storage edge cannot pivot to a private host.
+    if (!/^https?:\/\//.test(source.url)) return null
     try {
-      const r = await fetch(fresh, { signal: AbortSignal.timeout(5000) })
+      const r = await fetch(source.url, {
+        signal: AbortSignal.timeout(5000),
+        redirect: 'error',
+      })
       if (!r.ok) return null
       buf = Buffer.from(await r.arrayBuffer())
     } catch {
@@ -765,8 +791,9 @@ async function collectImageAttachments(items: InboxRow[]): Promise<Array<{ messa
   for (const m of items) {
     const a = m.attachment
     if (!a || a.kind !== 'img' || !a.url) continue
-    const fresh = await freshAttachmentUrl(a)
-    const url = publicUrlFor(fresh)
+    const source = await trustedAttachmentSource(a)
+    if (!source) continue
+    const url = publicUrlFor(source.url)
     // Only ship images OpenAI can actually fetch. Local /uploads paths without
     // a PUBLIC_HOST get textually mentioned but not vision-fed.
     if (!/^https?:\/\//.test(url)) continue
@@ -782,8 +809,8 @@ async function collectImageAttachments(items: InboxRow[]): Promise<Array<{ messa
  * Skips participants without an AI-generated portrait, and skips local URLs
  * when no PUBLIC_HOST is configured (OpenAI can't fetch localhost).
  */
-async function loadFaces(participantIds: string[]): Promise<Array<{ id: string; name: string; role: string | null; url: string }>> {
-  const rows = await runtime.loadFaces(participantIds)
+async function loadFaces(companyId: string, participantIds: string[]): Promise<Array<{ id: string; name: string; role: string | null; url: string }>> {
+  const rows = await runtime.loadFaces(companyId, participantIds)
   const out: Array<{ id: string; name: string; role: string | null; url: string }> = []
   for (const r of rows) {
     if (!r.avatar_url) continue
@@ -1546,10 +1573,13 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
   if (!persona) return
 
   const inbox = await loadInbox(agentId)
-  const isIdleWake = options.trigger === 'idle' && inbox.length === 0
-  const isBackgroundScanWake = options.trigger === 'background_scan' && Boolean(options.backgroundBrief)
-  const isPollUpdateWake = options.trigger === 'poll.updated' && Boolean(options.pollBrief)
-  if (inbox.length === 0 && !isIdleWake && !isBackgroundScanWake && !isPollUpdateWake) return
+  const wake = classifyWake(options, inbox.length)
+  const isIdleWake = wake.idle
+  const isBackgroundScanWake = wake.backgroundScan
+  const isPollUpdateWake = wake.pollUpdate
+  const isBriefedManualWake = wake.briefedManual
+  const wakeBriefMetadata = describeWakeBackgroundBrief(options)
+  if (inbox.length === 0 && !wake.survivesEmptyInbox) return
 
   const fingerprint = isIdleWake
     ? `idle:${new Date().toISOString()}`
@@ -1557,6 +1587,8 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
       ? `background_scan:${options.backgroundBrief?.source ?? 'scanner'}:${new Date().toISOString()}`
     : isPollUpdateWake
       ? `poll:${options.pollBrief?.messageId}:${options.pollBrief?.phase}:${options.pollBrief?.totalVotes ?? 0}:${new Date().toISOString()}`
+    : isBriefedManualWake
+      ? `manual:${options.backgroundBrief?.source ?? 'brief'}:${new Date().toISOString()}`
     : inbox.map((m) => m.id).join(',')
   const convoIds = [...new Set([
     ...inbox.map((m) => m.conversation_id),
@@ -1588,12 +1620,7 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
       source: options.trigger ?? 'scheduler',
       conversationIds: convoIds,
       idle: isIdleWake ? { reason: options.idleReason ?? 'idle heartbeat' } : undefined,
-      backgroundScan: isBackgroundScanWake
-        ? {
-            source: options.backgroundBrief?.source ?? 'scanner',
-            title: options.backgroundBrief?.title ?? 'Background scan',
-          }
-        : undefined,
+      backgroundScan: wakeBriefMetadata,
       pollUpdate: isPollUpdateWake && options.pollBrief
         ? {
             messageId: options.pollBrief.messageId,
@@ -1696,8 +1723,36 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
     if (failureNoticePosted || inbox.length === 0) return
     failureNoticePosted = true
     const uniqueConvoIds = [...new Set(inbox.map((m) => m.conversation_id))]
+    // "No result was produced" has to be true where it is posted. A turn can
+    // answer in hop 3 and then die at MAX_HOPS or the token ceiling in hop 40;
+    // the room already has the reply, and a red failure line directly under it
+    // says the opposite of what the user can see.
+    //
+    // Fix the SENTENCE, not the notice. Suppressing it outright would silence
+    // the announce-then-die case, which is drawn from the same population: the
+    // rules mandate an intent message before long work (see the operating rules
+    // below), and long multi-hop turns are exactly the ones that reach MAX_HOPS
+    // or the token ceiling. There the room would get "Drafting the summary now."
+    // and then nothing — and nothing wakes an agent on an unread inbox alone,
+    // so no one retries it either. The failure line is the only thing telling
+    // the user to re-ask.
+    //
+    // `message.posted` specifically, not "any visible side effect": leave,
+    // invite, kick, topic_updated and renamed all report visibleToUser too, and
+    // an agent that renamed the room in hop 2 has not answered anybody.
+    // Per conversation, because one turn can span several and only some of them
+    // may have been answered.
+    const deliveredConvoIds = new Set(
+      cliSideEffectsThisTurn
+        .filter((e) => e.event === 'message.posted' && e.visibleToUser !== false)
+        .map((e) => e.conversationId)
+        .filter((id): id is string => typeof id === 'string'),
+    )
     const reason = agentTurnFailureNoticeReason(summary, err)
-    const noticeText = `Agent run failed before it could finish (${reason}). No result was produced.`
+    const failedText = `Agent run failed before it could finish (${reason}).`
+    const noticeTextFor = (convoId: string): string => (
+      deliveredConvoIds.has(convoId) ? failedText : `${failedText} No result was produced.`
+    )
     const withNoticeTimeout = async <T>(promise: Promise<T>, label: string): Promise<T> => {
       const timeoutMs = 5_000
       let timer: ReturnType<typeof setTimeout> | null = null
@@ -1771,7 +1826,7 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
           companyId: convoCompanyId,
           agentId,
           noticeKind: 'agent_turn_failed',
-          text: noticeText,
+          text: noticeTextFor(convoId),
           dedupeKey: `agent_turn_failed:${convoId}:${inputKey}`,
           dedupeTtlSec: 6 * 3600,
         }), `postSystemNotice(${convoId})`)
@@ -1785,6 +1840,7 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
             reason,
             inputMessageIds: convoInbox.map((m) => m.id),
             noticePosted: res.posted,
+            resultDelivered: deliveredConvoIds.has(convoId),
           },
           stage: 'failed',
         }).catch(() => { /* observability best-effort */ })
@@ -1831,10 +1887,9 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
         messageIds: inbox.map((m) => m.id),
         messages: inbox.map(traceInboxMessage),
         idleReason: isIdleWake ? options.idleReason ?? 'idle heartbeat' : undefined,
-        backgroundBrief: isBackgroundScanWake
+        backgroundBrief: wakeBriefMetadata
           ? {
-              source: options.backgroundBrief?.source ?? 'scanner',
-              title: options.backgroundBrief?.title ?? 'Background scan',
+              ...wakeBriefMetadata,
               body: traceText(options.backgroundBrief?.body ?? ''),
             }
           : undefined,
@@ -1864,7 +1919,7 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
       (options.trigger === undefined || options.trigger === 'message.new') &&
       !triageNote
     if (shouldRunInboxTriage) {
-      preloadedContext = await loadContext(agentId, convoIds)
+      preloadedContext = await loadContext(agentId, persona.companyId, convoIds)
       const verdict = await classifyInboxTriage({
         agentId,
         companyId: runCompanyId,
@@ -1920,7 +1975,7 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
   // agent up. For message wakes, use newest unread bodies. For idle
   // synthetic wakes, retrieve broad self/team memories without inventing
   // a fake message.
-  const memoryQuery = (isBackgroundScanWake
+  const memoryQuery = ((isBackgroundScanWake || isBriefedManualWake)
     ? [
         options.backgroundBrief?.title ?? 'background scan',
         options.backgroundBrief?.body ?? '',
@@ -1945,7 +2000,7 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
   ).slice(0, 4000)
 
   const [context, memory, climate, textExcerpts, skillsIndex] = await Promise.all([
-    preloadedContext ? Promise.resolve(preloadedContext) : loadContext(agentId, convoIds),
+    preloadedContext ? Promise.resolve(preloadedContext) : loadContext(agentId, persona.companyId, convoIds),
     loadMemory(agentId, memoryQuery, {}, runtime, { conversationIds: convoIds }),
     loadClimate(agentId),
     loadTextExcerpts(inbox),
@@ -2098,6 +2153,8 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
   const renderedConversationContext = renderContext(context, inbox.length, convoIds.length, textExcerpts, agentId)
   const wakeContext = isPollUpdateWake && options.pollBrief
     ? renderPollUpdateWakeContext(options.pollBrief, renderedConversationContext)
+    : isBriefedManualWake && options.backgroundBrief
+    ? renderBriefedManualWakeContext(options.backgroundBrief, renderedConversationContext, inbox.length)
     : isBackgroundScanWake
     ? `You just got an internal background scan brief. This is not a user chat message, and there is no obligation to interrupt anyone.
 
@@ -2184,7 +2241,7 @@ Now decide — like a real teammate would. World actions use bash(); turn state 
   bash("cumora skills read <name>")                      — load a skill's full SKILL.md when a task calls for it
   bash("cumora skills create <name> '<description>'")    — scaffold a new skill (then edit the SKILL.md to flesh out instructions / examples / edge cases)
   bash("cumora skills search '<query>'")                 — search SkillHub for a skill that solves the task at hand
-  bash("cumora skills install <id_or_url>")              — install a skill from SkillHub (or any URL returning a compatible manifest)
+  bash("cumora skills install <id>")                     — install a skill from the operator-configured SkillHub
   bash("cumora calendar create '<title>' --at <iso> --assignee ${agentId} --prompt '<what future-you should do>' [--private]")
                                                           — SCHEDULE YOURSELF (or someone else). At <iso>, the assignee gets woken with <prompt> as their brief. Add \`--every daily|weekly|monthly|yearly\` (optionally \`--interval N\`, \`--byweekday 0,1,2\`, \`--until <iso>\`, \`--count N\`) to make it RECURRING. Use this whenever you'd otherwise say "I'll do X later / tomorrow / next Monday / every morning / every Friday at 5pm" — instead of telling the user you'll come back, schedule the wake so future-you actually comes back. Add \`--private\` for internal scratch reminders you don't want to clutter the shared workspace calendar — only you (and the workspace owner) will see it. Examples:
                                                             cumora calendar create 'Daily standup digest' --at 2026-05-24T09:00:00Z --assignee ${agentId} --prompt 'Summarize yesterday's group activity and post into <convo_id>' --every daily
@@ -2224,7 +2281,7 @@ Mechanics:
     agentId,
     ...context.map((m) => m.author_id),
   ])]
-  const faces = await loadFaces(distinctSpeakers)
+  const faces = await loadFaces(persona.companyId, distinctSpeakers)
 
   // Build structured input — text wake prompt plus any image attachments as
   // input_image content items so vision-capable models can actually see them.
@@ -2900,6 +2957,7 @@ Mechanics:
       }).catch(() => { /* observability best-effort */ })
       try {
         const result = await executePodTool({
+          runId,
           agentId, name: tc.name, argsJson: tc.arguments, ns: namespace,
           signal: batchAbortController.signal,
         })
@@ -3203,12 +3261,54 @@ Mechanics:
         },
         stage: 'auto_relay',
       })
+      // `--continue` bypasses cmdReply's anti-monologue gate, and the relay is
+      // the one caller that must have it.
+      //
+      // The operating rules above REQUIRE an intent message before any work
+      // that keeps the asker waiting ("Drafting the email now"), posted as a
+      // SEPARATE `cumora reply`. In a group of three or more that intent
+      // message is then the room's last message and less than ten minutes old,
+      // which is exactly what the gate refuses — so the relay of the actual
+      // answer failed, `finalStatus` went to 'failed', and the room got
+      // "Agent run failed before it could finish. No result was produced."
+      // in place of the work the agent had just done.
+      //
+      // The gate exists to stop the agent DECIDING to speak again: "each
+      // wake-up is a fresh 'should I respond?' decision with no global
+      // stop-signal" (see cmdReply). The relay is not a decision. It is the
+      // runtime delivering text the model already composed and explicitly
+      // declared as this turn's reply, at most once per turn — the deliberate
+      // commitment `--continue` was documented for.
+      //
+      // The flag goes LAST on purpose. parseArgs reads `--continue <token>` as
+      // a value flag, so placing it before the body would consume the body and
+      // post an empty message.
       const relay = await executePodTool({
+        runId,
         agentId, name: 'bash',
-        argsJson: JSON.stringify({ command: `cumora reply ${target.conversationId} ${escaped}` }),
+        argsJson: JSON.stringify({ command: `cumora reply ${target.conversationId} ${escaped} --continue` }),
         ns: namespace,
       })
-      if (!relay.ok) {
+      // Exit 2 is HELD: cmdReply deliberately declined the write because a peer
+      // already delivered this. Nothing failed — the coordination system did
+      // its job and the room already has the answer. Reporting that as a failed
+      // run puts "Agent run failed … No result was produced" under a result
+      // that a teammate produced seconds earlier. `skipped` is the status this
+      // file already uses for a turn that intentionally does nothing.
+      const relayExit = (relay.output as { exitCode?: unknown } | null)?.exitCode
+      const relayHeld = !relay.ok && relayExit === 2
+      if (relayHeld) {
+        finalStatus = 'skipped'
+        finalSummary ||= 'Auto-relay held — a peer already delivered this'
+        await runtime.recordEvent({
+          runId, agentId, companyId: convoCompanyId,
+          kind: 'turn.auto_relay_held',
+          level: 'info',
+          title: 'Auto-relay held by a peer delivery',
+          data: { conversationId: target.conversationId, output: relay.output },
+          stage: 'auto_relay_held',
+        })
+      } else if (!relay.ok) {
         finalStatus = 'failed'
         finalError = `Auto-relay reply failed: ${relay.error ?? 'unknown error'}`
         await runtime.recordEvent({
@@ -3460,7 +3560,25 @@ Mechanics:
     // agent would re-process them. Per-conversation: take the
     // latest message id we drained (markConversationRead picks the
     // max created_at via GREATEST(...) so out-of-order is fine).
-    if (steeredMessageIds.size > 0) {
+    //
+    // ONLY on a completed turn. This is a `finally`, so it used to run on
+    // 'failed' and 'skipped' too — and there the advance is not an
+    // optimization, it is a deletion. A steer arrived DURING the turn, so its
+    // (created_at, id) is later than every message the turn was answering, and
+    // loadInbox compares one cursor per conversation:
+    //
+    //   AND ROW(mm.created_at, mm.id) > ROW(co.lr_at, co.lr_id)
+    //
+    // so advancing to the steer buries the turn's own unanswered inbox with
+    // it. Ask a question, add a follow-up while the agent works, let the turn
+    // die at MAX_HOPS or on a 429: the room gets a failure notice and BOTH
+    // messages are gone from every future inbox. Nothing retries them.
+    //
+    // That also contradicted the fingerprint contract twenty lines up:
+    // "Failed turns do not update the fingerprint, so they remain retryable
+    // instead of disappearing into a silent skip." Retryable work needs its
+    // inbox rows to still be there.
+    if (steeredMessageIds.size > 0 && finalStatus === 'completed') {
       // Group by conversation so we only do one upsert per convo.
       const byConvo = new Map<string, string>()
       for (const [messageId, conversationId] of steeredMessageIds) {

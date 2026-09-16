@@ -90,6 +90,7 @@ export function ConveneView() {
             {t('convene.ctaSub', { title: c.title })}
           </div>
           <button
+            type="button"
             onClick={startConvene}
             className="py-3 px-5 rounded-full text-white text-[13.5px] font-semibold inline-flex items-center gap-2"
             style={{ background: 'linear-gradient(135deg, var(--skype), var(--skype-deep))', boxShadow: '0 6px 16px -4px rgba(0, 168, 240, 0.5)' }}>
@@ -185,7 +186,7 @@ export function ConveneView() {
       </main>
 
       <aside className="border-l border-ink-100 overflow-y-auto"
-        style={{ background: 'linear-gradient(180deg, #FBFDFE, #F4F8FC)' }}>
+        style={{ background: 'var(--chrome-pane)' }}>
         <div className="py-3.5 px-[18px] pb-2.5 border-b border-ink-100">
           <h4 className="font-display font-medium text-[16px] tracking-tight mb-1">
             {t('convene.transcriptTitle')} <em className="italic text-skype-deep" style={{ fontWeight: 400 }}>{t('convene.transcriptEm')}</em>

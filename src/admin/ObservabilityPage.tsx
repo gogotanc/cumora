@@ -356,6 +356,7 @@ export function ObservabilityPage() {
           <div className="obs-pills" role="tablist" aria-label={t('adminobs.rangeAria')}>
             {RANGES.map((r) => (
               <button
+                type="button"
                 key={r.days}
                 role="tab"
                 aria-selected={sinceDays === r.days}
@@ -367,6 +368,7 @@ export function ObservabilityPage() {
           <div className="obs-pills" role="tablist" aria-label={t('adminobs.sourceAria')}>
             {SOURCE_FILTERS.map((s) => (
               <button
+                type="button"
                 key={s.key}
                 role="tab"
                 aria-selected={sourceFilter === s.key}
@@ -380,6 +382,7 @@ export function ObservabilityPage() {
           <div className="obs-pills" role="tablist" aria-label={t('adminobs.unitAria')}>
             {UNITS.map((u) => (
               <button
+                type="button"
                 key={u.key}
                 role="tab"
                 aria-selected={unit === u.key}
@@ -981,6 +984,10 @@ function CachePurposeBar({ purpose, hitRate, savableUsd, costUsd, uncachedIn, ca
         <div
           className={`obs-cache-bar-fill ${cacheToneClass(hitRate)}`}
           style={{ width: `${ratePct}%` }}
+          role="progressbar"
+          aria-valuenow={Math.round(ratePct)}
+          aria-valuemin={0}
+          aria-valuemax={100}
           aria-label={`${ratePct.toFixed(0)}%`}
         />
         <span className="obs-cache-bar-rate">{hitRate != null ? fmtPct(hitRate, 0) : '—'}</span>

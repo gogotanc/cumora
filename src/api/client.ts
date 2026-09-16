@@ -1,37 +1,20 @@
+import { getActiveCompanyId, getAuthToken, useAuth } from '@/stores/auth'
 import type {
-  Message, Status,
-  BoardSummary, BoardSnapshot, BoardCardComment, BoardCardLookup,
-  CalendarEvent, CalendarEventKind, CalendarEventStatus, CalendarDispatch, RecurrenceRule,
-  CalendarReminderChannel,ComputerStatus, ComputerKind, EngineId,
+  BoardCardComment, BoardCardLookup, BoardSnapshot, BoardSummary,
+  CalendarDispatch, CalendarEvent, CalendarEventKind, CalendarEventStatus,
+  CalendarReminderChannel, ComputerKind, ComputerStatus, DetectedEngine,
+  EngineDefaultsMap, EngineId, Message, RecurrenceRule, Status,
 } from '@/types'
-import { getAuthToken, getActiveCompanyId, useAuth } from '@/stores/auth'
 
 const DEVTOOLS_KEY = 'cumora.devtools.enabled'
 const SERVER_URL_KEY = 'cumora.serverUrl'
-const COMPUTER_SERVER_ORIGIN = (import.meta.env.VITE_CUMORA_COMPUTER_SERVER as string | undefined)
-  ?.trim()
-  .replace(/\/+$/, '') ?? ''
-
-/** The Lazycat runtime injects the app's publicly reachable origin into the
- *  served HTML (see server/src/index.ts). This is the authoritative origin an
- *  external BYOA daemon must use — the internal `.lzcapp` service address is
- *  app-to-app only and never resolves on a device logged into the Lazycat
- *  client. */
+/** 懒猫运行时把应用对外的公网源注入到 HTML 里（见 server/src/index.ts）。
+ *  外部 BYOA daemon 只能用这个公网 HTTPS 源：内部 `.lzcapp` 服务地址只在
+ *  应用容器之间可达，登录了懒猫客户端的设备解析不了。 */
 function injectedPublicOrigin(): string {
   if (typeof window === 'undefined') return ''
   const v = (window as unknown as { __CUMORA_PUBLIC_ORIGIN?: string }).__CUMORA_PUBLIC_ORIGIN
   return v?.trim().replace(/\/+$/, '') ?? ''
-}
-
-/** True for the Lazycat-only internal service domain (`.lzcapp`), which a
- *  daemon running outside the microserver container network cannot reach. */
-function isInternalLzcappOrigin(value: string): boolean {
-  try {
-    const host = new URL(value).hostname
-    return host === 'lzcapp' || host.endsWith('.lzcapp')
-  } catch {
-    return value.includes('.lzcapp')
-  }
 }
 
 // Vite's relative proxy keeps browser requests same-origin, but the pairing
@@ -71,49 +54,19 @@ const API = `${SERVER_ORIGIN}/api`
  *  client are built against. Empty string means "relative URLs, going
  *  through the Vite proxy or same-origin." */
 export function getServerOrigin(): string {
-  if (SERVER_ORIGIN) return SERVER_ORIGIN
-  if (typeof window !== 'undefined' && window.location?.origin) {
-    return window.location.origin
-  }
-  return ''
-}
-
-/** Endpoint printed in BYOA pairing commands. Self-hosted distributions may
- * expose the browser through SSO while the daemon uses a private service
- * address, so this can intentionally differ from the page's API origin. */
-export function getComputerServerOrigin(): string {
-  // 1. Server-declared public origin (Lazycat injects this). The external BYOA
-  //    daemon must reach the app over the public HTTPS domain, so this always
-  //    wins when the runtime provides it.
-  const injected = injectedPublicOrigin()
-  if (injected) return injected
-  // 2. Baked build-time override. Keep it only when it points at a reachable
-  //    public origin; never surface an internal-only `.lzcapp` address to a
-  //    daemon that runs on a device logged into the Lazycat client.
-  if (COMPUTER_SERVER_ORIGIN && !isInternalLzcappOrigin(COMPUTER_SERVER_ORIGIN)) {
-    return COMPUTER_SERVER_ORIGIN
-  }
-  // 3. Fallback: the same-origin public URL the browser is served from.
-  return getPairingServerOrigin()
-}
-
-/** Internal app-to-app `.lzcapp` service origin, present only in a Lazycat
- *  distribution. The pairing UI surfaces this as the on-box (same LightOS
- *  device) alternative; it is never the default because an external BYOA
- *  daemon cannot resolve it. Returns '' when the distribution has no such
- *  address (e.g. the original Cumora cloud). */
-export function getInternalComputerOrigin(): string {
-  return COMPUTER_SERVER_ORIGIN && isInternalLzcappOrigin(COMPUTER_SERVER_ORIGIN)
-    ? COMPUTER_SERVER_ORIGIN
-    : ''
+  return SERVER_ORIGIN
 }
 
 /** Origin to embed in a local computer pairing command.
  * In Vite dev the browser uses a relative proxy, so SERVER_ORIGIN is empty;
- * the daemon still needs the API target rather than the renderer origin. */
+ * the daemon still needs the API target rather than the renderer origin.
+ *
+ * 懒猫：服务端注入的公网源优先（server/src/index.ts）。外部 BYOA daemon 只能
+ * 走公网 HTTPS 域名，所以它是唯一可信来源；没有注入时退回上游原有取值。 */
 export function getPairingServerOrigin(): string {
-  return SERVER_ORIGIN || DEV_API_TARGET ||
-    (typeof window !== 'undefined' && window.location?.origin ? window.location.origin : '')
+  const injected = injectedPublicOrigin()
+  if (injected) return injected
+  return SERVER_ORIGIN || DEV_API_TARGET || ''
 }
 
 /** Persist a new server origin override and clear the existing session.
@@ -284,6 +237,8 @@ export interface ApiParticipant {
   departedAt?: string | null
   computerId?: string | null
   engine?: string | null
+  engineInherit?: boolean | null
+  providerProfile?: string | null
   fastModel?: string | null
 }
 
@@ -295,6 +250,8 @@ export interface ApiComputer {
   name: string
   kind: ComputerKind
   available_engines: EngineId[]
+  detected_engines?: DetectedEngine[]
+  engines_detected_at?: string | null
   status: ComputerStatus
   last_seen_at: string | null
   paired_at: string | null
@@ -308,6 +265,8 @@ export interface ApiComputer {
   latest_daemon_version?: string | null
   /** True when this BYOA daemon is behind the latest version → show upgrade banner. */
   daemon_outdated?: boolean
+  /** Per-engine default model settings. */
+  engine_defaults?: EngineDefaultsMap
 }
 
 /** Universal-search response. The backend ranks results inside each bucket;
@@ -366,6 +325,16 @@ export interface AgentInput {
   /** per-agent small-brain (fast) model override; null clears it */
   fastModel?: string | null
   tools?: string[]
+}
+
+export interface AgentCreateInput extends AgentInput {
+  providerProfile?: string | null
+  /** Stable for the lifetime of one create form so ambiguous retries replay. */
+  requestId: string
+  /** Initial host placement is committed atomically with the Agent row. */
+  computerId?: string | null
+  engine?: EngineId
+  inherit?: boolean
 }
 
 export interface ApiAttachment {
@@ -461,7 +430,7 @@ export interface ApiAgentRun {
 }
 
 // ── Triage cost-effectiveness ledger ──
-export type ApiTriageSource = 'cloud' | 'byoa-claude' | 'byoa-codex' | 'byoa-grok' | 'byoa-cursor'
+export type ApiTriageSource = 'cloud' | 'byoa-claude' | 'byoa-codex' | 'byoa-grok' | 'byoa-cursor' | 'byoa-opencode' | 'byoa-pi' | 'byoa-gemini' | 'byoa-qwen' | 'byoa-antigravity' | 'byoa-zcode'
 
 export interface ApiTriageAgentRow {
   agentId: string
@@ -511,6 +480,36 @@ export interface ApiTriagePriceRow {
   cacheWritePer1M: number
   outPer1M: number
   estimated: boolean
+}
+
+/** One row of `GET /agents/observability/wakes`. Group and direct are kept
+ *  apart deliberately: a DM legitimately answers far more often, so averaging
+ *  the two hides the number that matters. */
+export interface ApiSilentWakeBucket {
+  conversationKind: string
+  runs: number
+  silentRuns: number
+  silentRate: number
+  silentSpendUsd: number
+}
+
+export interface ApiTurnsPerMessageBucket {
+  conversationKind: string
+  messages: number
+  turns: number
+  avgTurns: number
+  medianTurns: number
+  hist: { turns: string; messages: number }[]
+}
+
+export interface ApiWakeEconomics {
+  sinceHours: number
+  buckets: ApiSilentWakeBucket[]
+  /** The RATIOS are measured either way; only the dollar column is modelled. */
+  costEstimated: boolean
+  /** Fan-out width per human message. Room-wide: not scoped by the agentId
+   *  filter, because width is a property of the room, not of one agent. */
+  turnsPerMessage: ApiTurnsPerMessageBucket[]
 }
 
 export interface ApiTriageEconomics {
@@ -656,6 +655,17 @@ export interface ApiInvitationEmailDelivery {
    *  'no_email_config' (EMAIL_DOMAIN unset). Distinct from `error` so
    *  the UI can show a different message. */
   skipped: 'no_email_config' | null
+}
+
+export type WorkspaceRole = 'owner' | 'admin' | 'member'
+
+export interface ApiWorkspaceMember {
+  id: string
+  name: string
+  email: string
+  avatarUrl: string | null
+  role: WorkspaceRole
+  joinedAt: string
 }
 
 export type ApiInvitationPreviewStatus =
@@ -822,7 +832,7 @@ export const api = {
    *  `window.location.assign(api.authStartUrl('google'))` rather than
    *  fetch — the browser needs to do the actual navigation so the
    *  callback can land back on AUTH_DONE_URL with the session token. */
-  authStartUrl: (provider: 'google' | 'github', opts?: { inviteToken?: string | null; returnUrl?: string | null }) => {
+  authStartUrl: (provider: 'google' | 'github' | 'gitlab', opts?: { inviteToken?: string | null; returnUrl?: string | null }) => {
     const params = new URLSearchParams()
     if (opts?.returnUrl) params.set('return', opts.returnUrl)
     if (opts?.inviteToken) params.set('invite', opts.inviteToken)
@@ -847,12 +857,11 @@ export const api = {
    *  from the iOS-native ASAuthorization flow. Server verifies the JWT
    *  against Apple's JWKS, find-or-creates the user, and returns a
    *  fresh session token. */
-  authAppleNative: (input: { identityToken: string; email?: string | null; name?: string | null; inviteToken?: string | null }) =>
+  authAppleNative: (input: { identityToken: string; name?: string | null; inviteToken?: string | null }) =>
     http<{ token: string; user: { id: string; email: string; displayName: string }; companyId: string | null }>('/auth/apple/native', {
       method: 'POST',
       body: JSON.stringify({
         identityToken: input.identityToken,
-        email: input.email ?? null,
         name: input.name ?? null,
         inviteToken: input.inviteToken ?? null,
       }),
@@ -925,6 +934,22 @@ export const api = {
     http<{ id: string; name: string; slug: string; role: string }>('/companies', {
       method: 'POST', body: JSON.stringify({ name }),
     }),
+  listWorkspaceMembers: (companyId: string) =>
+    http<ApiWorkspaceMember[]>(`/companies/${encodeURIComponent(companyId)}/members`),
+  updateWorkspaceMemberRole: (companyId: string, userId: string, role: 'member' | 'admin') =>
+    http<{ ok: true; member: ApiWorkspaceMember }>(
+      `/companies/${encodeURIComponent(companyId)}/members/${encodeURIComponent(userId)}`,
+      { method: 'PATCH', body: JSON.stringify({ role }) },
+    ),
+  removeWorkspaceMember: (companyId: string, userId: string) =>
+    http<{ ok: true }>(
+      `/companies/${encodeURIComponent(companyId)}/members/${encodeURIComponent(userId)}`,
+      { method: 'DELETE' },
+    ),
+  deleteCompany: (companyId: string, confirmation: string) =>
+    http<{ ok: true; nextCompanyId: string }>(`/companies/${encodeURIComponent(companyId)}`, {
+      method: 'DELETE', body: JSON.stringify({ confirmation }),
+    }),
   /** Owner/admin-only: list every invitation (active + historical) for a
    *  company so the management UI can show recent activity. */
   listInvitations: (companyId: string) =>
@@ -985,13 +1010,40 @@ export const api = {
   repairComputer: (id: string) =>
     http<{ code: string; expiresInSeconds: number | null }>(
       `/computers/${encodeURIComponent(id)}/repair`, { method: 'POST', body: '{}' }),
+  /** Ask a paired computer to re-probe its local engine inventory + versions. */
+  requestComputerEngineDetect: (id: string) =>
+    http<{ ok: boolean }>(
+      `/computers/${encodeURIComponent(id)}/detect`, { method: 'POST', body: '{}' }),
+  /** Read per-engine default model settings for a computer. */
+  getEngineDefaults: (id: string) =>
+    http<{ defaults: EngineDefaultsMap }>(
+      `/computers/${encodeURIComponent(id)}/engine-defaults`),
+  /** Update per-engine default model settings for a computer. */
+  updateEngineDefaults: (id: string, defaults: EngineDefaultsMap) =>
+    http<{ ok: boolean; defaults: EngineDefaultsMap }>(
+      `/computers/${encodeURIComponent(id)}/engine-defaults`,
+      { method: 'PUT', body: JSON.stringify({ defaults }) }),
   /** Move an agent to a computer, choosing its engine (Cumora Cloud = managed). */
-  assignAgentComputer: (agentId: string, computerId: string, engine?: EngineId) =>
-    http<{ ok: boolean; kind: ComputerKind; engine: EngineId }>(
+  assignAgentComputer: (
+    agentId: string,
+    computerId: string,
+    engine?: EngineId,
+    inherit?: boolean,
+    model?: string | null,
+    fastModel?: string | null,
+    providerProfile?: string | null,
+  ) =>
+    http<{ ok: boolean; kind: ComputerKind; engine: EngineId; inherit?: boolean }>(
       `/agents/${encodeURIComponent(agentId)}/computer`,
-      { method: 'POST', body: JSON.stringify({ computerId, engine }) }),
-  createAgent: (input: AgentInput) =>
-    http<{ id: string }>('/agents', { method: 'POST', body: JSON.stringify(input) }),
+      { method: 'POST', body: JSON.stringify({ computerId, engine, inherit, model, fastModel, providerProfile }) }),
+  createAgent: (input: AgentCreateInput) =>
+    http<{
+      id: string
+      replayed: boolean
+      kind?: ComputerKind
+      engine?: EngineId
+      inherit?: boolean
+    }>('/agents', { method: 'POST', body: JSON.stringify(input) }),
   updateAgent: (id: string, input: AgentInput) =>
     http<{ ok: boolean }>(`/agents/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify(input) }),
   /** Soft-delete: marks the agent as off-boarded. Memory + log preserved. */
@@ -1300,6 +1352,9 @@ export const api = {
     http<ApiConveneSession | null>(`/conversations/${encodeURIComponent(conversationId)}/convene`),
   getConveneTranscript: (sessionId: string) =>
     http<ApiConveneTranscript[]>(`/convene/${encodeURIComponent(sessionId)}/transcript`),
+  /** Browser sign-in providers this deployment has credentials for. Used to
+   *  avoid rendering a button that can only 503. */
+  authProviders: () => http<{ providers: string[] }>('/auth/providers'),
   getPreferences: () => http<Record<string, unknown>>('/me/preferences'),
   putPreferences: (prefs: Record<string, unknown>) =>
     http<{ ok: boolean }>('/me/preferences', { method: 'PUT', body: JSON.stringify(prefs) }),
@@ -1326,6 +1381,13 @@ export const api = {
     const suffix = q.toString() ? `?${q.toString()}` : ''
     return http<ApiTriageEconomics>(`/agents/observability/triage${suffix}`)
   },
+  getWakeEconomics: (filters?: { agentId?: string | null; sinceHours?: number }) => {
+    const q = new URLSearchParams()
+    if (filters?.agentId) q.set('agentId', filters.agentId)
+    if (filters?.sinceHours) q.set('sinceHours', String(filters.sinceHours))
+    const suffix = q.toString() ? `?${q.toString()}` : ''
+    return http<ApiWakeEconomics>(`/agents/observability/wakes${suffix}`)
+  },
   getDevtoolsCapabilities: () => http<ApiDevtoolsCapabilities>('/devtools/capabilities'),
   listAgentWorkspace: (agentId: string) =>
     http<ApiAgentWorkspaceFile[]>(`/devtools/agent-workspace?agentId=${encodeURIComponent(agentId)}`),
@@ -1340,8 +1402,8 @@ export const api = {
   listBoards: () => http<BoardSummary[]>('/boards'),
   getBoard: (id: string) => http<BoardSnapshot>(`/boards/${encodeURIComponent(id)}`),
   getBoardCard: (id: string) => http<BoardCardLookup>(`/cards/${encodeURIComponent(id)}`),
-  createBoard: (input: { title: string; description?: string }) =>
-    http<{ id: string }>('/boards', { method: 'POST', body: JSON.stringify(input) }),
+  createBoard: (input: { title: string; description?: string; requestId?: string }) =>
+    http<{ id: string; replayed: boolean }>('/boards', { method: 'POST', body: JSON.stringify(input) }),
   updateBoard: (id: string, input: { title?: string; description?: string }) =>
     http<{ ok: boolean }>(`/boards/${encodeURIComponent(id)}`, {
       method: 'PATCH', body: JSON.stringify(input),
@@ -1413,7 +1475,7 @@ export const api = {
   getCalendarEvent: (id: string) =>
     http<{ event: CalendarEvent }>(`/calendar/events/${encodeURIComponent(id)}`),
   createCalendarEvent: (input: CalendarEventInput) =>
-    http<{ event: CalendarEvent }>('/calendar/events', {
+    http<{ event: CalendarEvent; replayed: boolean }>('/calendar/events', {
       method: 'POST',
       body: JSON.stringify(input),
     }),
@@ -1436,7 +1498,7 @@ export const api = {
   /* ============== Collaborative documents (CRDT) ============== */
   listDocuments: () =>
     http<{ documents: ApiDocument[] }>('/documents'),
-  createDocument: (input: { title?: string; conversationId?: string | null } = {}) =>
+  createDocument: (input: { title?: string; conversationId?: string | null; requestId?: string } = {}) =>
     http<ApiDocument>('/documents', { method: 'POST', body: JSON.stringify(input) }),
   getDocument: (id: string) =>
     http<ApiDocument>(`/documents/${encodeURIComponent(id)}`),
@@ -1477,6 +1539,8 @@ export interface CalendarEventInput {
    *  (and the workspace owner, if the row involves an agent). Default
    *  false = same shared-workspace behavior as before. */
   isPrivate?: boolean
+  /** Stable across retries after an ambiguous network failure. */
+  requestId?: string
 }
 
 /* ============== WebSocket bridge ============== */
@@ -1489,7 +1553,7 @@ export type WsEvent =
   | { type: 'participants.status'; participantId: string; status: Status; statusUpdatedAt?: string }
   | { type: 'participants.avatar'; participantId: string; avatarUrl: string }
   | { type: 'computers.status'; computerId: string; status: ComputerStatus }
-  | { type: 'participants.added'; conversationId?: string; participant: {
+  | { type: 'participants.added'; companyId?: string; conversationId?: string; participant: {
       id: string; kind: 'human' | 'agent'; name: string; role: string | null;
       initial: string; avatarBg: string; avatarUrl: string | null;
       status: Status; statusUpdatedAt: string | null;
@@ -1540,6 +1604,15 @@ export type WsEvent =
       poll: import('../types.js').PollPayload
       tallies: import('../types.js').PollTally[]
       actorId: string | null
+    }
+  | {
+      type: 'workspace.membership'
+      kind: 'role_changed' | 'removed' | 'workspace_deleted'
+      companyId: string
+      recipientUserIds: string[]
+      actorId: string
+      userId?: string
+      role?: 'admin' | 'member'
     }
 
 type Listener = (e: WsEvent) => void

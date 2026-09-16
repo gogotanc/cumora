@@ -14,14 +14,14 @@
  * subsume).
  */
 import { createHmac, randomUUID } from 'node:crypto'
-import { pool } from '../db/pool.js'
 import { ensureSchema } from '../db/migrate.js'
+import { pool } from '../db/pool.js'
 import { env } from '../env.js'
 
 let schemaReady: Promise<void> | null = null
 
-/** Run the schema migrator exactly once per test process. Idempotent —
- *  ensureSchema is itself `IF NOT EXISTS` throughout. */
+/** Run the versioned schema migrator exactly once per test process. Applied
+ * ledger entries are immutable and are never replayed. */
 export function ensureSchemaOnce(): Promise<void> {
   if (!schemaReady) schemaReady = ensureSchema()
   return schemaReady
@@ -31,6 +31,12 @@ export function ensureSchemaOnce(): Promise<void> {
  *  constraints; CASCADE on the parents handles it but listing explicitly
  *  keeps the intent visible + lets us spot-check leakage. */
 const TABLES_TO_WIPE: readonly string[] = [
+  'workspace_cleanup_jobs',
+  'realtime_outbox',
+  'audit_events',
+  'llm_calls_rollup',
+  'llm_calls',
+  'agent_triages',
   'shipping_events',
   'shipping_regressions',
   'shipping_friction_reports',
@@ -53,19 +59,33 @@ const TABLES_TO_WIPE: readonly string[] = [
   'email_attachments',
   'email_messages',
   'email_contacts',
+  'poll_votes',
   'message_reactions',
+  'tool_calls',
+  'conversation_mutes',
   'conversation_reads',
+  'convene_transcript',
+  'convene_sessions',
+  'convening_info',
   'conversation_counters',
   'messages',
+  'conversation_members',
   'conversations',
   'agent_climate',
+  'agent_autonomy',
   'agent_workspace',
+  'agent_memory',
   'agent_runs',
   'agent_events',
   'agent_tasks',
+  'agent_routing_claims',
   'agent_log',
+  'user_preferences',
+  'company_invitations',
+  'projects',
   'company_members',
   'participants',
+  'computers',
   'users',
   'companies',
 ]
@@ -142,7 +162,6 @@ export async function buildApiTestApp(userId: string): Promise<import('express')
   const expressMod = await import('express')
   const express = expressMod.default
   const app = express()
-  app.use(express.json({ limit: '34mb' }))
   // Fake auth middleware: stamp authUserId from the test's choice. Real
   // requireAuth() just reads this field, so handlers can't distinguish.
   app.use((req, _res, next) => {
@@ -197,6 +216,10 @@ export async function teardownAll(server?: import('node:http').Server): Promise<
   if (server && server.listening) {
     await new Promise<void>((resolve) => server.close(() => resolve()))
   }
+  try {
+    const { stopRealtimeOutboxWorker } = await import('../realtime-outbox.js')
+    stopRealtimeOutboxWorker()
+  } catch { /* ignore */ }
   // Pool + redis are module-level singletons; ending them is fine because
   // the process is about to exit anyway. Catch swallows reentrant-end
   // errors when multiple test files share the singleton.

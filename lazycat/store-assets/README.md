@@ -13,10 +13,10 @@ Cumora 将对话、智能体团队与 Computer 节点集中在一个工作台中
 **Usage**
 
 1. 打开 Cumora，在 Computers 页面新增 Computer 并复制配对命令。
-2. 在同一台懒猫微服的 LightOS 终端中运行该命令。
+2. 在要作为 Computer 的设备上运行该命令（LightOS 终端，或任意已登录懒猫客户端的设备）。
 3. 确认 Computer 在线后，即可在 Cumora 中与智能体团队协作。
 
-Cumora 当前使用懒猫微服内部 `.lzcapp` 地址连接 LightOS，不需要开放公网 API。
+配对命令里嵌入的服务地址是应用对外的公网 HTTPS 域名，Computer 上的 daemon 从设备侧直连它。浏览器访问仍由懒猫 SSO 保护，只有配对、心跳等必要接口位于 `public_path` 白名单内。
 
 ## Screenshots
 
@@ -29,4 +29,4 @@ All screenshots are 1440x900 PNG files and contain no pairing code, token, or pr
 
 ## Release note
 
-Cumora 0.1.2：首个懒猫微服版本，支持 LightOS BYOA、持久化 PostgreSQL/Redis 与 pgvector。
+Cumora 0.1.6：同步上游 v0.18.4。支持 LightOS BYOA、持久化 PostgreSQL/Redis 与 pgvector，界面含完整简体中文。

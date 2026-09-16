@@ -7,6 +7,7 @@ import {
   type ApiAgentWorkspaceFile,
   type ApiAgentWorkspaceFileContent,
   type ApiTriageEconomics,
+  type ApiWakeEconomics,
 } from '@/api/client'
 import { Checkbox } from '@/components/Checkbox'
 import { Select } from '@/components/Select'
@@ -18,9 +19,9 @@ import { useT, type MessageKey } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 
 type StatusFilter = ApiAgentRunStatus | 'all'
-type DevPanel = 'traces' | 'workspace' | 'triage'
-const DEV_PANELS: DevPanel[] = ['traces', 'workspace', 'triage']
-const PANEL_LABEL_KEY: Record<DevPanel, MessageKey> = { traces: 'obs.panelTraces', workspace: 'obs.panelWorkspace', triage: 'obs.panelTriage' }
+type DevPanel = 'traces' | 'workspace' | 'triage' | 'wakes'
+const DEV_PANELS: DevPanel[] = ['traces', 'workspace', 'triage', 'wakes']
+const PANEL_LABEL_KEY: Record<DevPanel, MessageKey> = { traces: 'obs.panelTraces', workspace: 'obs.panelWorkspace', triage: 'obs.panelTriage', wakes: 'obs.panelWakes' }
 const TRIAGE_WINDOWS: { hours: number; key: MessageKey }[] = [
   { hours: 6, key: 'obs.window6h' }, { hours: 24, key: 'obs.window24h' }, { hours: 72, key: 'obs.window3d' }, { hours: 168, key: 'obs.window7d' },
 ]
@@ -283,9 +284,31 @@ function bytes(size: number): string {
   return `${Math.round(size / 1024 / 102.4) / 10} MB`
 }
 
+/** Neutral styling for a status this build has no entry for. `agent_runs.status`
+ *  is plain TEXT with no CHECK constraint, so a value outside the five known
+ *  ones is reachable — a newer server writing a status an older desktop build
+ *  does not know yet is the realistic case. Without a fallback,
+ *  `STATUS_STYLE[status].cls` threw and took the ENTIRE Observability view to
+ *  the error boundary: one unrecognised row, and the operator loses the traces,
+ *  the workspace browser and both economics panels. */
+const UNKNOWN_STATUS_STYLE = {
+  cls: 'bg-ink-100 text-ink-600 border-ink-100',
+  dot: 'var(--ink-400)',
+} as const
+
 function StatusPill({ status }: { status: ApiAgentRunStatus }) {
   const t = useT()
   const tone = STATUS_STYLE[status]
+  // Show the raw value rather than guessing at a label for it — mislabelling a
+  // status the build does not understand is worse than admitting it.
+  if (!tone) {
+    return (
+      <span className={cn('inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10.5px] font-bold', UNKNOWN_STATUS_STYLE.cls)}>
+        <span className="h-1.5 w-1.5 rounded-full" style={{ background: UNKNOWN_STATUS_STYLE.dot }} />
+        {String(status)}
+      </span>
+    )
+  }
   return (
     <span className={cn('inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10.5px] font-bold', tone.cls)}>
       <span className="h-1.5 w-1.5 rounded-full" style={{ background: tone.dot }} />
@@ -298,14 +321,16 @@ function RefreshButton({ loading, onClick }: { loading: boolean; onClick: () => 
   const t = useT()
   return (
     <button
+      type="button"
       onClick={onClick}
       className={cn(
-        'inline-flex h-[46px] min-w-[96px] items-center justify-center gap-2 rounded-[13px] border border-ink-100 bg-cloud px-4 text-[12.5px] font-semibold text-skype-deep transition',
-        'shadow-[0_1px_0_rgba(255,255,255,0.95)_inset,0_12px_28px_-24px_rgba(26,78,120,0.58)]',
+        'inline-flex h-11 min-w-[96px] items-center justify-center gap-2 rounded-[14px] border border-ink-100 bg-cloud px-4 text-[12.5px] font-semibold text-skype-deep transition',
+        'shadow-[var(--select-shadow)]',
         'hover:border-sky2-200 hover:bg-sky2-50/70 active:scale-[0.985]',
         'focus:outline-none focus:ring-4 focus:ring-sky2-100',
         loading && 'text-skype-deep/75',
       )}
+      style={{ backgroundImage: 'var(--select-face)' }}
       aria-busy={loading}
     >
       <span
@@ -314,7 +339,7 @@ function RefreshButton({ loading, onClick }: { loading: boolean; onClick: () => 
           'grid h-4 w-4 place-items-center rounded-full border transition',
           loading
             ? 'animate-spin border-sky2-200 border-t-skype'
-            : 'border-sky2-200 bg-sky2-50 shadow-[inset_0_0_0_4px_rgba(255,255,255,0.72)]',
+            : 'border-sky2-200 bg-sky2-50',
         )}
       />
       <span>{t('obs.refresh')}</span>
@@ -341,6 +366,7 @@ function RunRow({ run, active, onClick }: { run: ApiAgentRun; active: boolean; o
   const t = useT()
   return (
     <button
+      type="button"
       onClick={onClick}
       className={cn(
         'w-full rounded-[12px] border p-3 text-left transition',
@@ -478,6 +504,7 @@ function FolderRow({ node, depth, expanded, onToggle }: {
 }) {
   return (
     <button
+      type="button"
       onClick={onToggle}
       className="flex w-full items-center gap-1.5 rounded-[7px] px-1.5 py-1 text-left transition hover:bg-cloud/80"
       style={{ paddingLeft: 6 + depth * 14 }}
@@ -527,6 +554,7 @@ function FileRow({ node, depth, active, onClick }: {
   const tint = FILE_TYPE_TINT[ext] ?? { bg: 'var(--ink-100)', fg: 'var(--ink-500)' }
   return (
     <button
+      type="button"
       onClick={onClick}
       className={cn(
         'flex w-full items-center gap-2 rounded-[7px] py-1 pr-1.5 text-left transition',
@@ -646,8 +674,8 @@ function PriceMenuTable({ rows }: { rows: { model: string; inPer1M: number; cach
   const t = useT()
   if (rows.length === 0) return null
   // Fixed cerebellum aliases: claude→haiku, codex→gpt-5.4-mini,
-  // grok→grok-4.5. Cursor has no fixed cheap alias and reports the model its
-  // account selected, so it is classified by that model id.
+  // grok→grok-4.5. Cursor/OpenCode have no fixed cheap alias and report the
+  // configured model, so they are classified by that model id.
   const isSmall = (m: string) => /haiku|mini|grok-4\.5/i.test(m)
   return (
     <div className="rounded-[10px] border border-ink-100 bg-paper px-3.5 py-3">
@@ -687,6 +715,236 @@ function PriceMenuTable({ rows }: { rows: { model: string; inPer1M: number; cach
 /** The triage cost-effectiveness ledger — a self-contained full-width panel.
  *  Answers the user's question: is the small-brain gate actually saving money,
  *  given triage is always cold (uncached) while big-brain turns are cache-warm? */
+/** How often a wake produced nothing.
+ *
+ *  The triage panel answers "was the cheap brain worth it". This one answers
+ *  the question behind #70: a group message wakes every member, each pays the
+ *  big brain to read the same room, and most conclude it was not theirs. The
+ *  server has measured that since #93; until now the number had no surface, so
+ *  "did the routing change help" was an argument rather than a reading.
+ *
+ *  Group and direct are never averaged — a DM legitimately answers far more
+ *  often, and blending the two hides the only rate worth acting on. */
+function WakeEconomicsPanel(props: {
+  panel: DevPanel
+  setPanel: (p: DevPanel) => void
+  agents: { id: string; name: string }[]
+  agentId: string
+  setAgentId: (v: string) => void
+  hours: number
+  setHours: (n: number) => void
+  data: ApiWakeEconomics | null
+  loading: boolean
+  err: string | null
+  onRefresh: () => void
+}) {
+  const t = useT()
+  const { data } = props
+  const buckets = data?.buckets ?? []
+  const totals = buckets.reduce(
+    (acc, b) => ({
+      runs: acc.runs + b.runs,
+      silentRuns: acc.silentRuns + b.silentRuns,
+      spend: acc.spend + b.silentSpendUsd,
+    }),
+    { runs: 0, silentRuns: 0, spend: 0 },
+  )
+  const group = buckets.find((b) => b.conversationKind === 'group')
+  return (
+    <main className="flex h-full min-h-0 flex-col overflow-hidden bg-paper">
+      <div className="border-b border-ink-100 px-6 py-4">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h1 className="font-display text-[25px] font-medium tracking-tight text-ink-900">{t('obs.wakesTitle')}</h1>
+            <div className="mt-1 text-[12px] text-ink-500">{t('obs.wakesSubtitle')}</div>
+          </div>
+          <RefreshButton loading={props.loading} onClick={props.onRefresh} />
+        </div>
+        <div className="mt-4 flex flex-wrap items-end gap-3">
+          <div className="grid grid-cols-4 gap-1 rounded-[11px] border border-ink-100 bg-cloud p-1">
+            {DEV_PANELS.map((item) => (
+              <button
+                type="button"
+                key={item}
+                onClick={() => props.setPanel(item)}
+                className={cn(
+                  'rounded-[8px] px-3 py-2 text-[12px] font-semibold transition',
+                  props.panel === item ? 'bg-sky2-50 text-skype-deep shadow-soft' : 'text-ink-500 hover:text-ink-700',
+                )}
+              >
+                {t(PANEL_LABEL_KEY[item])}
+              </button>
+            ))}
+          </div>
+          <label className="text-[10.5px] font-bold uppercase tracking-[0.12em] text-ink-400">
+            {t('obs.agent')}
+            <Select
+              value={props.agentId}
+              onValueChange={props.setAgentId}
+              options={[{ value: 'all', label: t('obs.allAgents') }, ...props.agents.map((a) => ({ value: a.id, label: a.name }))]}
+              className="mt-1 w-44 normal-case tracking-normal"
+            />
+          </label>
+          <label className="text-[10.5px] font-bold uppercase tracking-[0.12em] text-ink-400">
+            {t('obs.window')}
+            <Select<string>
+              value={String(props.hours)}
+              onValueChange={(v) => props.setHours(Number(v))}
+              options={TRIAGE_WINDOWS.map((w) => ({ value: String(w.hours), label: t(w.key) }))}
+              className="mt-1 w-24 normal-case tracking-normal"
+            />
+          </label>
+        </div>
+      </div>
+
+      {props.err && (
+        <div className="mx-6 mt-4 rounded-[10px] bg-coral-soft px-3 py-2 text-[12px] text-coral-deep">{props.err}</div>
+      )}
+
+      <div className="min-h-0 flex-1 overflow-auto px-6 py-5">
+        {!data ? (
+          <div className="grid h-full place-items-center text-[13px] text-ink-400">{props.loading ? t('common.loading') : t('common.noData')}</div>
+        ) : totals.runs === 0 ? (
+          <div className="mx-auto max-w-[1100px] rounded-[10px] border border-ink-100 bg-cloud px-3.5 py-3 text-[12px] leading-[1.6] text-ink-500">
+            {t('obs.wakesNoData')}
+          </div>
+        ) : (
+          <div className="mx-auto max-w-[1100px] space-y-5">
+            {/* Only the dollars are modelled; the rates come from stored token
+                counts and real message timings. Say which is which. */}
+            {data.costEstimated && (
+              <div className="rounded-[10px] border border-coral-soft bg-coral-soft px-3.5 py-2.5 text-[11.5px] leading-[1.6] text-coral-deep">
+                {t('obs.wakesEstimateWarn')}
+              </div>
+            )}
+
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+              <StatCard
+                label={t('obs.statSilentRate')}
+                value={totals.runs > 0 ? fmtPct(totals.silentRuns / totals.runs) : '—'}
+                tone={totals.silentRuns / Math.max(1, totals.runs) > 0.3 ? 'warn' : undefined}
+                sub={t('obs.statSilentRateSub', { silent: totals.silentRuns, runs: totals.runs })}
+              />
+              <StatCard
+                label={t('obs.statSilentGroup')}
+                value={group && group.runs > 0 ? fmtPct(group.silentRate) : '—'}
+                tone={group && group.silentRate > 0.3 ? 'warn' : undefined}
+                sub={t('obs.statSilentGroupSub', { runs: group?.runs ?? 0 })}
+              />
+              <StatCard
+                label={t('obs.statSilentSpend')}
+                value={fmtUsd(totals.spend)}
+                tone={totals.spend > 0 ? 'neg' : undefined}
+                sub={t('obs.statSilentSpendSub')}
+              />
+              <StatCard
+                label={t('obs.statWakeRuns')}
+                value={String(totals.runs)}
+                sub={t('obs.statWakeRunsSub', { hours: data.sinceHours })}
+              />
+            </div>
+
+            <div className="rounded-[10px] border border-ink-100 bg-paper px-3.5 py-3">
+              <div className="text-[9.5px] font-bold uppercase tracking-[0.12em] text-ink-300">{t('obs.wakesByKind')}</div>
+              <table className="mt-2 w-full text-[11.5px]">
+                <thead className="text-[9px] font-bold uppercase tracking-[0.1em] text-ink-400">
+                  <tr>
+                    <th className="py-1 text-left">{t('obs.colKind')}</th>
+                    <th className="py-1 text-right">{t('obs.colWakes')}</th>
+                    <th className="py-1 text-right">{t('obs.colSilent')}</th>
+                    <th className="py-1 text-right">{t('obs.colSilentRate')}</th>
+                    <th className="py-1 text-right">{t('obs.colSilentSpend')}</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-ink-100">
+                  {buckets.map((b) => (
+                    <tr key={b.conversationKind}>
+                      <td className="py-1">
+                        <span className={cn(
+                          'rounded-full px-1.5 py-0.5 text-[9px] font-bold uppercase',
+                          b.conversationKind === 'group' ? 'bg-sky2-50 text-skype-deep' : 'bg-ink-100 text-ink-600',
+                        )}>
+                          {b.conversationKind === 'group' ? t('obs.kindGroup') : t('obs.kindDirect')}
+                        </span>
+                      </td>
+                      <td className="py-1 text-right tabular-nums text-ink-600">{b.runs}</td>
+                      <td className="py-1 text-right tabular-nums text-ink-600">{b.silentRuns}</td>
+                      <td className="py-1 text-right tabular-nums text-ink-700">{fmtPct(b.silentRate)}</td>
+                      <td className="py-1 text-right tabular-nums text-ink-600">{fmtUsd(b.silentSpendUsd)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <div className="mt-2.5 text-[11px] leading-[1.6] text-ink-500">{t('obs.wakesFootnote')}</div>
+            </div>
+
+            {/* Fan-out width — the other half of the #70 ledger. Where the
+                silent rate says "of the turns that fired, how many said
+                nothing", this says how many turns fired per message in the
+                first place. Room-wide by construction, so when an agent
+                filter is active, say so instead of silently mixing scopes. */}
+            {(data.turnsPerMessage?.length ?? 0) > 0 && (
+              <div className="rounded-[10px] border border-ink-100 bg-paper px-3.5 py-3">
+                <div className="flex items-baseline justify-between gap-2">
+                  <div className="text-[9.5px] font-bold uppercase tracking-[0.12em] text-ink-300">{t('obs.fanoutTitle')}</div>
+                  {props.agentId !== 'all' && <div className="text-[9.5px] text-ink-400">{t('obs.fanoutRoomWide')}</div>}
+                </div>
+                <table className="mt-2 w-full text-[11.5px]">
+                  <thead className="text-[9px] font-bold uppercase tracking-[0.1em] text-ink-400">
+                    <tr>
+                      <th className="py-1 text-left">{t('obs.colKind')}</th>
+                      <th className="py-1 text-right">{t('obs.colMessages')}</th>
+                      <th className="py-1 text-right">{t('obs.colTurns')}</th>
+                      <th className="py-1 text-right">{t('obs.colAvg')}</th>
+                      <th className="py-1 text-right">{t('obs.colMedian')}</th>
+                      <th className="py-1 text-right">{t('obs.colDist')}</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-ink-100">
+                    {data.turnsPerMessage.map((b) => (
+                      <tr key={b.conversationKind}>
+                        <td className="py-1">
+                          <span className={cn(
+                            'rounded-full px-1.5 py-0.5 text-[9px] font-bold uppercase',
+                            b.conversationKind === 'group' ? 'bg-sky2-50 text-skype-deep' : 'bg-ink-100 text-ink-600',
+                          )}>
+                            {b.conversationKind === 'group' ? t('obs.kindGroup') : t('obs.kindDirect')}
+                          </span>
+                        </td>
+                        <td className="py-1 text-right tabular-nums text-ink-600">{b.messages}</td>
+                        <td className="py-1 text-right tabular-nums text-ink-600">{b.turns}</td>
+                        <td className="py-1 text-right tabular-nums text-ink-700">{b.avgTurns.toFixed(1)}</td>
+                        <td className="py-1 text-right tabular-nums text-ink-700">{b.medianTurns.toFixed(1)}</td>
+                        <td className="py-1">
+                          <div className="flex h-2 w-40 overflow-hidden rounded-full bg-ink-100">
+                            {b.hist.map((h, i) => (
+                              <div
+                                key={h.turns}
+                                title={`${h.turns} turns: ${h.messages}`}
+                                className="h-full"
+                                style={{
+                                  width: `${(h.messages / Math.max(1, b.messages)) * 100}%`,
+                                  background: 'var(--skype)',
+                                  opacity: 0.18 + i * 0.2,
+                                }}
+                              />
+                            ))}
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <div className="mt-2.5 text-[11px] leading-[1.6] text-ink-500">{t('obs.fanoutFootnote')}</div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </main>
+  )
+}
+
 function TriageEconomicsPanel(props: {
   panel: DevPanel
   setPanel: (p: DevPanel) => void
@@ -716,9 +974,10 @@ function TriageEconomicsPanel(props: {
           <RefreshButton loading={props.loading} onClick={props.onRefresh} />
         </div>
         <div className="mt-4 flex flex-wrap items-end gap-3">
-          <div className="grid grid-cols-3 gap-1 rounded-[11px] border border-ink-100 bg-cloud p-1">
+          <div className="grid grid-cols-4 gap-1 rounded-[11px] border border-ink-100 bg-cloud p-1">
             {DEV_PANELS.map((item) => (
               <button
+                type="button"
                 key={item}
                 onClick={() => props.setPanel(item)}
                 className={cn(
@@ -932,9 +1191,12 @@ export function ObservabilityView() {
   const [workspaceLoading, setWorkspaceLoading] = useState(false)
   const [workspaceErr, setWorkspaceErr] = useState<string | null>(null)
   const [triage, setTriage] = useState<ApiTriageEconomics | null>(null)
+  const [wakes, setWakes] = useState<ApiWakeEconomics | null>(null)
   const [triageHours, setTriageHours] = useState(24)
   const [triageLoading, setTriageLoading] = useState(false)
   const [triageErr, setTriageErr] = useState<string | null>(null)
+  const [wakesLoading, setWakesLoading] = useState(false)
+  const [wakesErr, setWakesErr] = useState<string | null>(null)
   // Tree state: which folder paths are expanded. New file lists default to
   // every folder open (most agents have <20 files, flat-feeling is right).
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set())
@@ -1034,6 +1296,22 @@ export function ObservabilityView() {
     if (panel === 'workspace') void loadWorkspaceFiles()
   }, [loadWorkspaceFiles, panel])
 
+  const loadWakes = useCallback(async () => {
+    setWakesLoading(true)
+    setWakesErr(null)
+    try {
+      setWakes(await api.getWakeEconomics({ agentId: agentId === 'all' ? null : agentId, sinceHours: triageHours }))
+    } catch (e) {
+      setWakesErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setWakesLoading(false)
+    }
+  }, [agentId, triageHours])
+
+  useEffect(() => {
+    if (panel === 'wakes') void loadWakes()
+  }, [panel, loadWakes])
+
   const loadTriage = useCallback(async () => {
     setTriageLoading(true)
     setTriageErr(null)
@@ -1072,6 +1350,24 @@ export function ObservabilityView() {
     [runs, selectedId],
   )
 
+  if (panel === 'wakes') {
+    return (
+      <WakeEconomicsPanel
+        panel={panel}
+        setPanel={setPanel}
+        agents={agents}
+        agentId={agentId}
+        setAgentId={setAgentId}
+        hours={triageHours}
+        setHours={setTriageHours}
+        data={wakes}
+        loading={wakesLoading}
+        err={wakesErr}
+        onRefresh={() => void loadWakes()}
+      />
+    )
+  }
+
   if (panel === 'triage') {
     return (
       <TriageEconomicsPanel
@@ -1108,9 +1404,10 @@ export function ObservabilityView() {
             />
           </div>
 
-          <div className="mt-4 grid grid-cols-3 gap-1 rounded-[11px] border border-ink-100 bg-cloud p-1">
+          <div className="mt-4 grid grid-cols-4 gap-1 rounded-[11px] border border-ink-100 bg-cloud p-1">
             {DEV_PANELS.map((item) => (
               <button
+                type="button"
                 key={item}
                 onClick={() => setPanel(item)}
                 className={cn(

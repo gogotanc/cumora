@@ -127,6 +127,7 @@ export function DocumentEditor({ documentId, variant = 'full', onClose, onOpenFu
   const sessionRef = useRef<YDocSession | null>(null)
   const [session, setSession] = useState<YDocSession | null>(null)
   const [synced, setSynced] = useState(false)
+  const [syncError, setSyncError] = useState(false)
   const [titleDraft, setTitleDraft] = useState(doc?.title ?? '')
 
   useEffect(() => { setTitleDraft(doc?.title ?? '') }, [doc?.id, doc?.title])
@@ -136,26 +137,33 @@ export function DocumentEditor({ documentId, variant = 'full', onClose, onOpenFu
     const s = openDocument({
       documentId,
       user: { id: user.id, name: user.name, color: colorForId(user.id) },
+      onSyncState: (error) => {
+        setSyncError(Boolean(error))
+        if (error) setSynced(false)
+        else setSynced(true)
+      },
     })
     sessionRef.current = s
     setSession(s)
     setSynced(false)
+    setSyncError(false)
     void s.synced.then(() => setSynced(true))
     return () => {
       s.destroy()
       sessionRef.current = null
       setSession(null)
       setSynced(false)
+      setSyncError(false)
     }
   }, [documentId, user])
 
   if (!doc) return (
-    <div className="h-full flex items-center justify-center text-stone-400 text-sm">
+    <div className="h-full flex items-center justify-center text-ink-500 text-sm">
       {t('docEdit.notFound')}
     </div>
   )
   if (!user || !session) return (
-    <div className="h-full flex items-center justify-center text-stone-400 text-sm">
+    <div className="h-full flex items-center justify-center text-ink-500 text-sm">
       {t('common.loading')}
     </div>
   )
@@ -172,11 +180,11 @@ export function DocumentEditor({ documentId, variant = 'full', onClose, onOpenFu
   const isPeek = variant === 'peek'
 
   return (
-    <div className="h-full flex flex-col bg-white">
+    <div className="h-full flex flex-col bg-cloud">
       <header
         className={cn(
-          'border-b border-stone-200 flex items-center gap-2.5 min-w-0',
-          isPeek ? 'px-4 py-3 bg-gradient-to-b from-white to-sky2-50/35' : 'px-6 py-3',
+          'border-b border-ink-100 flex items-center gap-2.5 min-w-0',
+          isPeek ? 'px-4 py-3 bg-gradient-to-b from-cloud to-sky2-50/35' : 'px-6 py-3',
         )}
       >
         <input
@@ -185,7 +193,7 @@ export function DocumentEditor({ documentId, variant = 'full', onClose, onOpenFu
           onBlur={commitTitle}
           onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
           className={cn(
-            'flex-1 min-w-0 bg-transparent font-medium text-stone-900 focus:outline-none',
+            'flex-1 min-w-0 bg-transparent font-medium text-ink-900 focus:outline-none',
             isPeek ? 'text-[16px] leading-[1.35]' : 'text-xl',
           )}
           placeholder={t('docEdit.untitledPh')}
@@ -228,7 +236,7 @@ export function DocumentEditor({ documentId, variant = 'full', onClose, onOpenFu
               if (!confirm(t('docEdit.deleteConfirm'))) return
               void remove(doc.id).catch(() => { /* swallow */ })
             }}
-            className="text-xs leading-none text-stone-500 hover:text-red-600 transition-colors"
+            className="text-xs leading-none text-[var(--doc-muted-strong)] hover:text-red-600 transition-colors"
           >
             {t('docEdit.deleteAction')}
           </button>
@@ -237,6 +245,7 @@ export function DocumentEditor({ documentId, variant = 'full', onClose, onOpenFu
       <CollaborativeEditor
         session={session}
         synced={synced}
+        syncError={syncError}
         userName={user.name}
         userColor={colorForId(user.id)}
         documentId={documentId}
@@ -249,13 +258,14 @@ export function DocumentEditor({ documentId, variant = 'full', onClose, onOpenFu
 interface CollaborativeEditorProps {
   session: YDocSession
   synced: boolean
+  syncError: boolean
   userName: string
   userColor: string
   documentId: string
   variant: 'full' | 'peek'
 }
 
-function CollaborativeEditor({ session, synced, userName, userColor, documentId, variant }: CollaborativeEditorProps) {
+function CollaborativeEditor({ session, synced, syncError, userName, userColor, documentId, variant }: CollaborativeEditorProps) {
   const t = useT()
   const refreshingImagesRef = useRef(new Set<string>())
   // Memoize the awareness object reference for the cursor extension —
@@ -396,6 +406,11 @@ function CollaborativeEditor({ session, synced, userName, userColor, documentId,
 
   return (
     <div className="flex-1 min-h-0 flex flex-col">
+      {syncError && (
+        <div role="alert" className="border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-900">
+          {t('docEdit.syncError')}
+        </div>
+      )}
       <Toolbar editor={editor} disabled={!synced} />
       <div className="flex-1 overflow-y-auto">
         <EditorContent editor={editor} className="h-full" />
@@ -411,18 +426,18 @@ interface ToolbarProps { editor: Editor | null; disabled: boolean }
 function Toolbar({ editor, disabled }: ToolbarProps) {
   const t = useT()
   if (!editor) {
-    return <div className="border-b border-stone-100 px-4 py-2 h-[42px] bg-stone-50/60" />
+    return <div className="h-[42px] border-b border-[var(--doc-toolbar-border)] bg-[var(--doc-toolbar)] px-4 py-2" />
   }
   const btn = (active: boolean) => cn(
     'w-8 h-8 grid place-items-center rounded-md transition-colors',
-    disabled ? 'text-stone-300' : (
+    disabled ? 'text-[var(--doc-toolbar-icon-muted)]' : (
       active
         ? 'bg-skype/15 text-skype-deep'
-        : 'text-stone-600 hover:bg-stone-100'
+        : 'text-[var(--doc-toolbar-icon)] hover:bg-[var(--doc-toolbar-hover)]'
     ),
   )
   return (
-    <div className="border-b border-stone-100 px-3 py-1.5 bg-stone-50/60 flex items-center gap-0.5 flex-wrap">
+    <div className="flex flex-wrap items-center gap-0.5 border-b border-[var(--doc-toolbar-border)] bg-[var(--doc-toolbar)] px-3 py-1.5">
       <button
         type="button" className={btn(editor.isActive('bold'))} disabled={disabled}
         onClick={() => editor.chain().focus().toggleBold().run()}
@@ -499,7 +514,7 @@ function Toolbar({ editor, disabled }: ToolbarProps) {
 }
 
 function ToolbarSep() {
-  return <span className="w-px h-5 bg-stone-200 mx-1" />
+  return <span className="mx-1 h-5 w-px bg-[var(--doc-toolbar-rule)]" />
 }
 
 function ImageButton({ editor, disabled }: { editor: Editor; disabled: boolean }) {
@@ -568,10 +583,10 @@ function ImageButton({ editor, disabled }: { editor: Editor; disabled: boolean }
         }}
         className={cn(
           'w-8 h-8 grid place-items-center rounded-md transition-colors',
-          disabled || uploading ? 'text-stone-300' : (
+          disabled || uploading ? 'text-[var(--doc-toolbar-icon-muted)]' : (
             editor.isActive('image')
               ? 'bg-skype/15 text-skype-deep'
-              : 'text-stone-600 hover:bg-stone-100'
+              : 'text-[var(--doc-toolbar-icon)] hover:bg-[var(--doc-toolbar-hover)]'
           ),
         )}
         title={uploading ? t('docEdit.uploadingImage') : t('docEdit.insertImage')}
@@ -602,10 +617,10 @@ function LinkButton({ editor, disabled }: { editor: Editor; disabled: boolean })
       }}
       className={cn(
         'w-8 h-8 grid place-items-center rounded-md transition-colors',
-        disabled ? 'text-stone-300' : (
+        disabled ? 'text-[var(--doc-toolbar-icon-muted)]' : (
           isActive
             ? 'bg-skype/15 text-skype-deep'
-            : 'text-stone-600 hover:bg-stone-100'
+            : 'text-[var(--doc-toolbar-icon)] hover:bg-[var(--doc-toolbar-hover)]'
         ),
       )}
       title={t('docEdit.link')}
@@ -642,22 +657,22 @@ function PresenceStrip({ session, synced }: { session: YDocSession; synced: bool
   // ascent/descent (16.5px for 12px Manrope), not line-height, so it
   // centers on a different baseline than the 12px-tall Delete button.
   // As a block, height = leading-none line-height = 12px = same box.
-  if (!synced) return <span className="block text-xs leading-none text-stone-400">{t('docEdit.syncing')}</span>
-  if (peers.length === 0) return <span className="block text-xs leading-none text-stone-400">{t('docEdit.onlyYou')}</span>
+  if (!synced) return <span className="block text-xs leading-none text-[var(--doc-muted)]">{t('docEdit.syncing')}</span>
+  if (peers.length === 0) return <span className="block text-xs leading-none text-[var(--doc-muted)]">{t('docEdit.onlyYou')}</span>
   return (
     <div className="flex items-center -space-x-1.5">
       {peers.slice(0, 6).map((p) => (
         <div
           key={p.clientId}
           title={p.name}
-          className="w-6 h-6 rounded-full border-2 border-white text-white text-[10px] flex items-center justify-center font-medium"
+          className="w-6 h-6 rounded-full border-2 border-cloud text-white text-[10px] flex items-center justify-center font-medium"
           style={{ background: p.color }}
         >
           {p.name.slice(0, 1).toUpperCase()}
         </div>
       ))}
       {peers.length > 6 && (
-        <div className="w-6 h-6 rounded-full bg-stone-200 text-stone-600 text-[10px] flex items-center justify-center font-medium border-2 border-white">
+        <div className="flex h-6 w-6 items-center justify-center rounded-full border-2 border-cloud bg-[var(--doc-toolbar-rule)] text-[10px] font-medium text-[var(--doc-toolbar-icon)]">
           +{peers.length - 6}
         </div>
       )}

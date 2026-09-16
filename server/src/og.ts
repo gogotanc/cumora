@@ -18,7 +18,9 @@
  */
 import { Buffer } from 'node:buffer'
 import { lookup as dnsLookup } from 'node:dns/promises'
-import { isIP } from 'node:net'
+import { request as httpRequest, type IncomingHttpHeaders } from 'node:http'
+import { type RequestOptions as HttpsRequestOptions, request as httpsRequest } from 'node:https'
+import { BlockList, isIP } from 'node:net'
 import { redis } from './redis.js'
 
 const CACHE_PREFIX = 'cumora:og:'
@@ -34,10 +36,77 @@ const POSITIVE_TTL_S = 7 * 24 * 3600
 const NEGATIVE_TTL_S = 60 * 60
 
 const FETCH_TIMEOUT_MS = 6000
+/** Match fetch's bounded redirect behaviour while keeping each hop under our
+ *  own destination policy. Five hops covers common short-link chains without
+ *  allowing an attacker to keep the server in an unbounded redirect loop. */
+const MAX_REDIRECTS = 5
 /** Cap response size to keep memory bounded — OG meta lives in `<head>`,
  *  so 1 MB is plenty for any sane page. Streamed reader aborts early once
  *  this threshold is crossed. */
 const MAX_BYTES = 1024 * 1024
+
+interface ResolvedAddress {
+  address: string
+  family: 4 | 6
+}
+
+interface ResolvedOgTarget {
+  url: URL
+  hostname: string
+  address: string
+  family: 4 | 6
+}
+
+interface OgHttpResponse {
+  status: number
+  headers: IncomingHttpHeaders
+  body: AsyncIterable<Uint8Array>
+  cancel(): void
+}
+
+interface OgFetchDependencies {
+  lookup(hostname: string): Promise<readonly ResolvedAddress[]>
+  request(target: ResolvedOgTarget, signal: AbortSignal): Promise<OgHttpResponse>
+}
+
+const blockedIpv4 = new BlockList()
+for (const [network, prefix] of [
+  ['0.0.0.0', 8],
+  ['10.0.0.0', 8],
+  ['100.64.0.0', 10],
+  ['127.0.0.0', 8],
+  ['169.254.0.0', 16],
+  ['172.16.0.0', 12],
+  ['192.0.0.0', 24],
+  ['192.0.2.0', 24],
+  ['192.88.99.0', 24],
+  ['192.168.0.0', 16],
+  ['198.18.0.0', 15],
+  ['198.51.100.0', 24],
+  ['203.0.113.0', 24],
+  ['224.0.0.0', 4],
+  ['240.0.0.0', 4],
+] as const) {
+  blockedIpv4.addSubnet(network, prefix, 'ipv4')
+}
+
+const blockedIpv6 = new BlockList()
+for (const [network, prefix] of [
+  ['::', 96],
+  ['::ffff:0:0', 96],
+  ['64:ff9b::', 96],
+  ['64:ff9b:1::', 48],
+  ['100::', 64],
+  ['2001::', 23],
+  ['2001:db8::', 32],
+  ['2002::', 16],
+  ['fc00::', 7],
+  ['fe80::', 10],
+  ['fec0::', 10],
+  ['ff00::', 8],
+] as const) {
+  blockedIpv6.addSubnet(network, prefix, 'ipv6')
+}
 
 export interface OgResult {
   url: string
@@ -59,6 +128,11 @@ export class OgError extends Error {
   }
 }
 
+/** URL-policy failures must reach the route as 4xx responses even when they
+ *  are discovered on a redirect hop. Network/content failures remain a
+ *  negative preview result and retain the existing short cache behaviour. */
+class OgUrlError extends OgError {}
+
 /** Fetch + parse OG metadata for a URL. Returns null when there's nothing
  *  useful to display (no title / og:title fallback path produced anything),
  *  so callers can skip rendering an empty card. Throws `OgError` for
@@ -77,18 +151,14 @@ export async function ogPreview(rawUrl: string): Promise<OgResult | null> {
     try { return JSON.parse(cached) as OgResult } catch { /* corrupt entry, refetch */ }
   }
 
-  // DNS check happens AFTER URL validation but BEFORE fetch — protects
-  // against rebinding / private IP ranges that didn't show in the literal
-  // hostname (e.g. someone resolves to 10.0.0.1).
-  await assertPublicHost(new URL(url).hostname)
-
   let result: OgResult | null = null
   try {
-    result = await fetchAndParse(url)
+    result = await fetchAndParse(url, ogFetchDependenciesOverride ?? productionDependencies)
   } catch (e) {
+    if (e instanceof OgUrlError) throw e
     // Network or parse failure — cache the miss briefly so we don't hammer
     // the upstream. Real protocol errors (bad host, scheme) already threw
-    // before this point.
+    // before this point or were rethrown above for a redirect target.
     console.warn(`[og] fetch failed for ${url}:`, e instanceof Error ? e.message : e)
     result = null
   }
@@ -111,106 +181,250 @@ function validateUrlString(raw: string): string {
   try {
     u = new URL(raw)
   } catch {
-    throw new OgError('invalid url')
+    throw new OgUrlError('invalid url')
   }
   if (u.protocol !== 'http:' && u.protocol !== 'https:') {
-    throw new OgError('only http(s) urls are supported')
+    throw new OgUrlError('only http(s) urls are supported')
   }
+  if (u.username || u.password) throw new OgUrlError('url credentials are not supported')
   // Drop fragment for cache hit-rate (#section doesn't change OG metadata).
   u.hash = ''
   return u.toString()
 }
 
-/** Block private / loopback / link-local IP ranges. Resolves the hostname
- *  first; if the answer is a private address, refuse. Hostname literals
- *  that ARE IPs are checked directly. */
-async function assertPublicHost(host: string): Promise<void> {
-  // Hostname literal is itself an IP — check directly, no DNS.
-  if (isIP(host)) {
-    if (isBlockedIp(host)) throw new OgError('blocked private host', 403)
-    return
-  }
-  if (!host || host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) {
-    throw new OgError('blocked private host', 403)
-  }
-  try {
-    const { address } = await dnsLookup(host)
-    if (isBlockedIp(address)) throw new OgError('blocked private host', 403)
-  } catch (e) {
-    if (e instanceof OgError) throw e
-    throw new OgError('dns lookup failed', 400)
-  }
+function normalizedHostname(url: URL): string {
+  const hostname = url.hostname.startsWith('[') && url.hostname.endsWith(']')
+    ? url.hostname.slice(1, -1)
+    : url.hostname
+  return hostname.toLowerCase().replace(/\.$/, '')
 }
 
 function isBlockedIp(ip: string): boolean {
-  // IPv4
-  if (ip.startsWith('10.') || ip.startsWith('127.') || ip.startsWith('169.254.') ||
-      ip.startsWith('192.168.') || ip === '0.0.0.0' ||
-      /^172\.(1[6-9]|2\d|3[01])\./.test(ip) ||
-      // GCP / AWS / Azure metadata endpoints
-      ip === '169.254.169.254') {
-    return true
-  }
-  // IPv6
-  if (ip === '::1' || ip === '::' ||
-      ip.toLowerCase().startsWith('fe80:') ||
-      ip.toLowerCase().startsWith('fc') || ip.toLowerCase().startsWith('fd')) {
-    return true
-  }
-  return false
+  const family = isIP(ip)
+  if (family === 4) return blockedIpv4.check(ip, 'ipv4')
+  if (family === 6) return blockedIpv6.check(ip, 'ipv6')
+  return true
 }
 
-async function fetchAndParse(url: string): Promise<OgResult> {
+function isReservedHostname(hostname: string): boolean {
+  return hostname === 'localhost' || hostname.endsWith('.localhost') ||
+    hostname.endsWith('.local') || hostname === 'home.arpa' || hostname.endsWith('.home.arpa')
+}
+
+async function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) throw signal.reason ?? new Error('aborted')
+  return await new Promise<T>((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener('abort', onAbort)
+    const onAbort = () => {
+      cleanup()
+      reject(signal.reason ?? new Error('aborted'))
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    promise.then(
+      value => { cleanup(); resolve(value) },
+      error => { cleanup(); reject(error) },
+    )
+  })
+}
+
+async function resolvePublicTarget(
+  url: URL,
+  signal: AbortSignal,
+  lookup: OgFetchDependencies['lookup'],
+): Promise<ResolvedOgTarget> {
+  const hostname = normalizedHostname(url)
+  if (!hostname || isReservedHostname(hostname)) {
+    throw new OgUrlError('blocked private host', 403)
+  }
+
+  const literalFamily = isIP(hostname)
+  let addresses: readonly ResolvedAddress[]
+  try {
+    addresses = literalFamily
+      ? [{ address: hostname, family: literalFamily as 4 | 6 }]
+      : await abortable(lookup(hostname), signal)
+  } catch (error) {
+    if (signal.aborted) throw signal.reason ?? error
+    if (error instanceof OgUrlError) throw error
+    throw new OgUrlError('dns lookup failed', 400)
+  }
+
+  if (addresses.length === 0) throw new OgUrlError('dns lookup failed', 400)
+  for (const answer of addresses) {
+    if ((answer.family !== 4 && answer.family !== 6) ||
+        isIP(answer.address) !== answer.family || isBlockedIp(answer.address)) {
+      throw new OgUrlError('blocked private host', 403)
+    }
+  }
+
+  const selected = addresses[0]
+  return { url, hostname, address: selected.address, family: selected.family }
+}
+
+function requestPinnedOg(target: ResolvedOgTarget, signal: AbortSignal): Promise<OgHttpResponse> {
+  return new Promise((resolve, reject) => {
+    const options: HttpsRequestOptions = {
+      protocol: target.url.protocol,
+      hostname: target.address,
+      family: target.family,
+      port: target.url.port ? Number(target.url.port) : undefined,
+      path: `${target.url.pathname}${target.url.search}`,
+      method: 'GET',
+      agent: false,
+      signal,
+      headers: {
+        host: target.url.host,
+        'user-agent': 'Mozilla/5.0 (compatible; CumoraBot/1.0; +https://cumora.ai)',
+        accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.5',
+        'accept-language': 'en-US,en;q=0.9',
+      },
+    }
+    if (target.url.protocol === 'https:' && !isIP(target.hostname)) {
+      options.servername = target.hostname
+    }
+
+    const onResponse = (response: import('node:http').IncomingMessage) => {
+      resolve({
+        status: response.statusCode ?? 0,
+        headers: response.headers,
+        body: response,
+        cancel: () => response.destroy(),
+      })
+    }
+    const request = target.url.protocol === 'https:'
+      ? httpsRequest(options, onResponse)
+      : httpRequest(options, onResponse)
+    request.once('error', reject)
+    request.end()
+  })
+}
+
+const productionDependencies: OgFetchDependencies = {
+  lookup: async hostname => {
+    const answers = await dnsLookup(hostname, { all: true, verbatim: true })
+    return answers.map(({ address, family }) => ({ address, family: family as 4 | 6 }))
+  },
+  request: requestPinnedOg,
+}
+
+let ogFetchDependenciesOverride: OgFetchDependencies | null = null
+
+function headerValue(headers: IncomingHttpHeaders, name: string): string | undefined {
+  const value = headers[name]
+  return Array.isArray(value) ? value[0] : value
+}
+
+async function readBodyWithCap(
+  response: OgHttpResponse,
+  signal: AbortSignal,
+): Promise<Buffer | null> {
+  const chunks: Buffer[] = []
+  let total = 0
+  const iterator = response.body[Symbol.asyncIterator]()
+  for (;;) {
+    const { done, value } = await abortable(iterator.next(), signal)
+    if (done) break
+    if (!value) continue
+    const chunk = Buffer.from(value)
+    total += chunk.byteLength
+    if (total > MAX_BYTES) {
+      response.cancel()
+      return null
+    }
+    chunks.push(chunk)
+  }
+  return Buffer.concat(chunks, total)
+}
+
+async function fetchAndParse(url: string, dependencies: OgFetchDependencies): Promise<OgResult> {
   const ac = new AbortController()
   const timer = setTimeout(() => ac.abort(), FETCH_TIMEOUT_MS)
   try {
-    const res = await fetch(url, {
-      signal: ac.signal,
-      redirect: 'follow',
-      headers: {
-        // A descriptive UA + Accept header improves the OG hit rate (some
-        // sites serve a stripped page to bots that look like cURL).
-        'user-agent': 'Mozilla/5.0 (compatible; CumoraBot/1.0; +https://cumora.ai)',
-        'accept': 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.5',
-        'accept-language': 'en-US,en;q=0.9',
-      },
-    })
-    if (!res.ok) throw new OgError(`upstream ${res.status}`, 502)
+    const { response: res, finalUrl } = await fetchWithValidatedRedirects(url, ac.signal, dependencies)
+    if (res.status < 200 || res.status >= 300) {
+      res.cancel()
+      throw new OgError(`upstream ${res.status}`, 502)
+    }
 
-    const ct = (res.headers.get('content-type') ?? '').toLowerCase()
+    const ct = (headerValue(res.headers, 'content-type') ?? '').toLowerCase()
     if (!ct.includes('text/html') && !ct.includes('xhtml')) {
+      res.cancel()
       throw new OgError(`unsupported content-type: ${ct || 'unknown'}`, 415)
     }
 
-    // Size-bounded streamed read. fetch() in Node can run unbounded if the
-    // upstream sends a giant body; we cancel as soon as we've collected
-    // enough to be sure the `<head>` ended.
-    const reader = res.body?.getReader()
-    if (!reader) throw new OgError('no response body', 502)
-    const chunks: Uint8Array[] = []
-    let total = 0
-    while (total < MAX_BYTES) {
-      const { value, done } = await reader.read()
-      if (done) break
-      if (!value) continue
-      chunks.push(value)
-      total += value.length
+    const contentLength = headerValue(res.headers, 'content-length')
+    if (contentLength !== undefined) {
+      const declared = Number(contentLength)
+      if (Number.isFinite(declared) && declared > MAX_BYTES) {
+        res.cancel()
+        throw new OgError('upstream body too large', 413)
+      }
     }
-    await reader.cancel().catch(() => { /* ignore — upstream may already be done */ })
-    const html = Buffer.concat(chunks).toString('utf8')
 
-    const og: OgResult = { url, finalUrl: res.url }
+    let body: Buffer | null
+    try {
+      body = await readBodyWithCap(res, ac.signal)
+    } catch (error) {
+      res.cancel()
+      throw error
+    }
+    if (!body) throw new OgError('upstream body too large', 413)
+    const html = body.toString('utf8')
+
+    const og: OgResult = { url, finalUrl }
     const title = pickMetaContent(html, 'og:title') ?? pickMetaContent(html, 'twitter:title') ?? pickHtmlTitle(html)
     if (title) og.title = decodeEntities(title).trim().slice(0, 280)
     const desc = pickMetaContent(html, 'og:description') ?? pickMetaContent(html, 'twitter:description') ?? pickMetaName(html, 'description')
     if (desc) og.description = decodeEntities(desc).trim().slice(0, 500)
     const image = pickMetaContent(html, 'og:image') ?? pickMetaContent(html, 'twitter:image') ?? pickMetaContent(html, 'twitter:image:src')
-    if (image) og.image = resolveUrl(image, res.url)
+    if (image) og.image = resolveUrl(image, finalUrl)
     const siteName = pickMetaContent(html, 'og:site_name')
     if (siteName) og.siteName = decodeEntities(siteName).trim().slice(0, 80)
     return og
   } finally {
     clearTimeout(timer)
+  }
+}
+
+async function fetchWithValidatedRedirects(
+  url: string,
+  signal: AbortSignal,
+  dependencies: OgFetchDependencies,
+): Promise<{ response: OgHttpResponse; finalUrl: string }> {
+  let currentUrl = url
+
+  for (let redirectCount = 0; ; redirectCount += 1) {
+    const parsedUrl = new URL(currentUrl)
+    const target = await resolvePublicTarget(parsedUrl, signal, dependencies.lookup)
+    const response = await abortable(dependencies.request(target, signal), signal)
+
+    if (!isRedirectStatus(response.status)) return { response, finalUrl: currentUrl }
+
+    const location = headerValue(response.headers, 'location')
+    response.cancel()
+    if (!location) throw new OgError('redirect missing location', 502)
+    if (redirectCount >= MAX_REDIRECTS) throw new OgError('too many redirects', 502)
+
+    const nextUrl = resolveRedirectUrl(location, currentUrl)
+    currentUrl = nextUrl
+  }
+}
+
+/** Test hook for deterministic DNS answers and socket targets. */
+export function __setOgFetchDependenciesForTesting(dependencies: OgFetchDependencies | null): void {
+  ogFetchDependenciesOverride = dependencies
+}
+
+function isRedirectStatus(status: number): boolean {
+  return status === 301 || status === 302 || status === 303 || status === 307 || status === 308
+}
+
+function resolveRedirectUrl(location: string, base: string): string {
+  try {
+    return validateUrlString(new URL(location, base).toString())
+  } catch (e) {
+    if (e instanceof OgUrlError) throw e
+    throw new OgUrlError('invalid redirect url')
   }
 }
 

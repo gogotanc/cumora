@@ -14,9 +14,11 @@
  * The pod-side HttpRuntimeClient (Phase 3) will speak the same shapes
  * over HTTP.
  */
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
+import type { PoolClient } from 'pg'
 import { pool } from '../../db/pool.js'
 import { CH_MESSAGE_NEW, CH_TYPING, publish, redis } from '../../redis.js'
+import { enqueueBroadcast, nudgeRealtimeOutbox } from '../../realtime-outbox.js'
 import { notifyAlert } from '../../alerting.js'
 import { freshenAttachmentUrl, type StoredAttachment } from '../../storage.js'
 
@@ -45,7 +47,6 @@ async function refreshAttachmentUrls(rows: ReadonlyArray<{ attachment?: unknown 
 const inprocBusyHeartbeatFailures = new Map<string, number>()
 const INPROC_BUSY_HEARTBEAT_ALERT_THRESHOLD = 5
 import { companyIdForConversation } from '../../tenant.js'
-import { nextConversationSequence } from '../membership.js'
 import { getPersona } from '../personas.js'
 import {
   setStatus as setStatusImpl,
@@ -135,39 +136,46 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
   }
 
   async loadInbox(agentId: string): Promise<InboxRow[]> {
-    // Resolve the agent's conversations via the members GIN, then pull each one's
-    // unread tail with a LATERAL over idx_messages_convo_created — instead of the
-    // old form that joined ALL messages of every member conversation with a PER-ROW
-    // cursor subquery (an 8s query that, with loadContext, starved the pool).
-    //
-    // Force the members GIN: the planner mis-costs `members @>` and SEQ-SCANS all
-    // conversations (~2s), which starves the pool under load. enable_seqscan=off
-    // makes it use the GIN (~100ms). It is set at SESSION level on a dedicated
-    // client with NO transaction — a single autocommit SELECT only takes ACCESS
-    // SHARE, so (unlike the earlier BEGIN…COMMIT version) it can't deadlock with
-    // DML or a rolling-deploy ALTER TABLE. RESET on the success path; on any error
-    // the connection is DESTROYED (release(true)) so a stray GUC never leaks back
-    // into the pool. Every access in the query is index-backed.
-    const client = await pool.connect()
-    let rows: InboxRow[] = []
-    try {
-      await client.query('SET enable_seqscan = off')
-      const res = await client.query<InboxRow>(
-      `WITH convos AS (
+    // Resolve membership through the normalized participant-led index, then
+    // pull each conversation's unread tail with the message index. This avoids
+    // both the old JSONB seq-scan and its dedicated enable_seqscan=off session.
+    const { rows } = await pool.query<InboxRow>(
+      `WITH requesting_agent AS MATERIALIZED (
+         SELECT company_id
+           FROM participants
+          WHERE id = $1 AND kind = 'agent' AND departed_at IS NULL
+       ),
+       convos AS (
          SELECT c.id, c.company_id,
                 c.title AS conversation_title, c.kind AS conversation_kind, c.topic AS conversation_topic,
                 c.project_id, pr.name AS project_name,
                 COALESCE(cr.last_read_at, '1970-01-01T00:00:00Z'::timestamptz) AS lr_at,
                 COALESCE(cr.last_read_message_id, '') AS lr_id,
+                (current_membership.participant_id IS NOT NULL) AS current_member,
                 EXISTS (
                   SELECT 1 FROM conversation_mutes mu
                    WHERE mu.user_id = $1 AND mu.conversation_id = c.id
                      AND (mu.muted_until IS NULL OR mu.muted_until > NOW())
                 ) AS muted
-           FROM conversations c
+           FROM requesting_agent ra
+           JOIN conversations c ON c.company_id = ra.company_id
+           LEFT JOIN conversation_members current_membership
+             ON current_membership.conversation_id = c.id
+            AND current_membership.company_id = c.company_id
+            AND current_membership.participant_id = $1
            LEFT JOIN conversation_reads cr ON cr.user_id = $1 AND cr.conversation_id = c.id
            LEFT JOIN projects pr ON pr.id = c.project_id
-          WHERE c.members @> to_jsonb(ARRAY[$1::text])
+          WHERE current_membership.participant_id IS NOT NULL
+             OR EXISTS (
+               SELECT 1
+                 FROM messages delivered
+                WHERE delivered.conversation_id = c.id
+                  AND delivered.delivery_recipient_id = $1
+                  AND ROW(delivered.created_at, delivered.id) > ROW(
+                    COALESCE(cr.last_read_at, '1970-01-01T00:00:00Z'::timestamptz),
+                    COALESCE(cr.last_read_message_id, '')
+                  )
+             )
        )
        SELECT
           m.id, m.conversation_id, co.company_id,
@@ -191,10 +199,12 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
            -- last_read_message_id as a tiebreaker for same-instant messages.
            SELECT * FROM messages mm
             WHERE mm.conversation_id = co.id
-              AND mm.author_id <> $1
+              AND (co.current_member OR mm.delivery_recipient_id = $1)
+              AND (mm.author_id <> $1 OR mm.delivery_recipient_id = $1)
               AND ROW(mm.created_at, mm.id) > ROW(co.lr_at, co.lr_id)
               AND (
-                NOT co.muted
+                mm.delivery_recipient_id = $1
+                OR NOT co.muted
                 OR co.conversation_kind = 'direct'
                 OR EXISTS (
                   SELECT 1 FROM regexp_matches(mm.body, '@([[:alnum:]_-]+)', 'g') mention
@@ -213,15 +223,8 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
          LEFT JOIN participants p ON p.id = m.author_id AND p.company_id = co.company_id
         ORDER BY m.created_at ASC, m.id ASC
         LIMIT 200`,
-        [agentId],
-      )
-      await client.query('RESET enable_seqscan')
-      rows = res.rows
-    } catch (err) {
-      client.release(true) // destroy — never return a connection in unknown GUC state
-      throw err
-    }
-    client.release()
+      [agentId],
+    )
     await refreshAttachmentUrls(rows)
     // NOTE: This used to call recordSeen() here to advance the freshness-
     // preflight boundary, but that fired for EVERY caller of loadInbox —
@@ -351,8 +354,11 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
    *  agent's own past replies — real humans don't reason from a stripped
    *  slice, so neither should agents. Reactions get pre-aggregated as a
    *  JSON array so the prompt renderer doesn't need a second roundtrip. */
-  async loadContext(agentId: string, conversationIds: string[]): Promise<ContextRow[]> {
+  async loadContext(agentId: string, companyId: string, conversationIds: string[]): Promise<ContextRow[]> {
     if (conversationIds.length === 0) return []
+    // conversationIds can come directly from an authenticated runtime caller.
+    // They narrow the read but do not authorize it: bind every conversation to
+    // the active agent's tenant and require current conversation membership.
     // Drive from conversations (PK lookup on the given ids) + a LATERAL that pulls
     // each conversation's most-recent 25 messages via idx_messages_convo_created.
     // The old form scanned ALL messages of each conversation (big "allhands" rooms
@@ -391,6 +397,11 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
                WHERE cr.conversation_id = c.id AND hp.kind = 'human'
             ) AS human_last_read_at
            FROM conversations c
+           JOIN participants requesting_agent
+             ON requesting_agent.id = $1
+            AND requesting_agent.company_id = $2
+            AND requesting_agent.kind = 'agent'
+            AND requesting_agent.departed_at IS NULL
            LEFT JOIN projects pr ON pr.id = c.project_id
            JOIN LATERAL (
              SELECT * FROM messages mm
@@ -399,7 +410,14 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
               LIMIT 25
            ) m ON true
            LEFT JOIN participants p ON p.id = m.author_id AND p.company_id = c.company_id
-          WHERE c.id = ANY($2::text[])
+          WHERE c.id = ANY($3::text[])
+            AND c.company_id = $2
+            AND EXISTS (
+              SELECT 1 FROM conversation_members cm
+               WHERE cm.conversation_id = c.id
+                 AND cm.company_id = c.company_id
+                 AND cm.participant_id = $1
+            )
        )
        SELECT id, conversation_id, company_id, conversation_title, conversation_kind, conversation_topic,
               project_name,
@@ -443,7 +461,7 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
               ) AS human_reacted_at
          FROM recent
         ORDER BY conversation_id, created_at ASC`,
-      [agentId, conversationIds],
+      [agentId, companyId, conversationIds],
     )
     await refreshAttachmentUrls(rows)
     return rows
@@ -471,14 +489,15 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
     return loadSkillsIndexImpl(agentId)
   }
 
-  /** Avatar portraits for every participant id passed in. Returns rows
-   *  in arbitrary order; caller filters out missing/local URLs before
-   *  shipping them to the LLM. */
-  async loadFaces(participantIds: string[]): Promise<FaceRow[]> {
+  /** Avatar portraits for selected participants in the authenticated tenant.
+   *  Returns rows in arbitrary order; caller filters out missing/local URLs
+   *  before shipping them to the LLM. */
+  async loadFaces(companyId: string, participantIds: string[]): Promise<FaceRow[]> {
     if (participantIds.length === 0) return []
     const { rows } = await pool.query<FaceRow>(
-      `SELECT id, name, role, avatar_url FROM participants WHERE id = ANY($1::text[])`,
-      [participantIds],
+      `SELECT id, name, role, avatar_url FROM participants
+        WHERE company_id = $1 AND id = ANY($2::text[])`,
+      [companyId, participantIds],
     )
     return rows
   }
@@ -597,25 +616,6 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
     }
   }
 
-  /** Is `agentId` a member of `conversationId`, scoped to `companyId` when
-   *  given? Used to keep JWT-pinned writes (e.g. postSystemNotice) from
-   *  touching conversations the caller isn't in. */
-  async isConversationMember(
-    conversationId: string,
-    agentId: string,
-    companyId?: string | null,
-  ): Promise<boolean> {
-    const { rows } = await pool.query<{ ok: boolean }>(
-      `SELECT 1 AS ok FROM conversations
-        WHERE id = $1
-          AND ($3::text IS NULL OR company_id = $3)
-          AND members @> to_jsonb(ARRAY[$2::text])
-        LIMIT 1`,
-      [conversationId, agentId, companyId ?? null],
-    )
-    return rows.length > 0
-  }
-
   async postSystemNotice(args: {
     conversationId: string
     companyId?: string | null
@@ -624,41 +624,121 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
     text: string
     dedupeKey: string
     dedupeTtlSec: number
-  }): Promise<{ posted: boolean }> {
-    // NX/EX deduplication: first caller to set the key wins and posts the
-    // notice; everyone else gets `posted: false`. The key namespace lives
-    // entirely in Redis so it auto-expires and survives across pods.
-    const lockKey = `notice:${args.dedupeKey}`
-    const acquired = await redis.set(
-      lockKey, args.agentId,
-      'EX', args.dedupeTtlSec,
-      'NX',
-    )
-    if (acquired !== 'OK') return { posted: false }
-
+  }): Promise<{ posted: boolean; authorized: boolean }> {
+    const companyId = args.companyId
+      ?? await companyIdForConversation(args.conversationId)
+    if (!companyId) return { posted: false, authorized: false }
+    const ttlSec = Math.max(1, Math.min(Math.floor(args.dedupeTtlSec), 7 * 24 * 3600))
+    const dedupeFingerprint = createHash('sha256')
+      .update(`${companyId}\0${args.conversationId}\0${args.dedupeKey}`)
+      .digest('hex')
+    const clientId = `runtime-notice:${dedupeFingerprint}`
     const messageId = `m-${randomUUID()}`
-    const sequence = await nextConversationSequence(args.conversationId)
     const body = JSON.stringify({
       kind: 'notice',
       noticeKind: args.noticeKind,
       text: args.text,
     })
-    await pool.query(
-      `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id)
-       VALUES ($1,$2,$3,'system',$4,$5,$6)`,
-      [messageId, args.conversationId, args.agentId, body, sequence, args.companyId ?? null],
-    )
-    await publish(CH_MESSAGE_NEW, {
-      type: 'message.new',
-      conversationId: args.conversationId,
-      companyId: args.companyId ?? undefined,
-      message: {
-        id: messageId, conversationId: args.conversationId, authorId: args.agentId,
-        kind: 'system', body, sequence,
-        at: new Date().toISOString(),
-      },
-    })
-    return { posted: true }
+    let sequence = 0
+    let posted = false
+    const client = await pool.connect()
+    try {
+      await client.query('BEGIN')
+      const participant = await client.query(
+        `SELECT id FROM participants
+          WHERE id = $1 AND company_id = $2
+            AND kind = 'agent' AND departed_at IS NULL
+          FOR SHARE`,
+        [args.agentId, companyId],
+      )
+      if (!participant.rowCount) {
+        await client.query('ROLLBACK')
+        return { posted: false, authorized: false }
+      }
+      const conversation = await client.query(
+        `SELECT c.id FROM conversations c
+          WHERE c.id = $1 AND c.company_id = $2
+            AND EXISTS (
+              SELECT 1 FROM conversation_members cm
+               WHERE cm.conversation_id = c.id
+                 AND cm.company_id = c.company_id
+                 AND cm.participant_id = $3
+            )
+          FOR UPDATE OF c`,
+        [args.conversationId, companyId, args.agentId],
+      )
+      if (!conversation.rowCount) {
+        await client.query('ROLLBACK')
+        return { posted: false, authorized: false }
+      }
+
+      // PostgreSQL is the durable idempotency boundary. The advisory lock
+      // serializes all agents using the same room/key, while client_id lets a
+      // committed notice survive Redis/process failures. Clear only expired
+      // markers so the original rolling TTL semantics remain intact.
+      await client.query(
+        `SELECT pg_advisory_xact_lock(hashtext('runtime-notice'), hashtext($1))`,
+        [dedupeFingerprint],
+      )
+      await client.query(
+        `UPDATE messages SET client_id = NULL
+          WHERE conversation_id = $1 AND client_id = $2
+            AND created_at <= NOW() - make_interval(secs => $3::int)`,
+        [args.conversationId, clientId, ttlSec],
+      )
+      const recent = await client.query(
+        `SELECT 1 FROM messages
+          WHERE conversation_id = $1 AND client_id = $2
+            AND created_at > NOW() - make_interval(secs => $3::int)
+          LIMIT 1`,
+        [args.conversationId, clientId, ttlSec],
+      )
+      if (recent.rowCount) {
+        await client.query('COMMIT')
+        return { posted: false, authorized: true }
+      }
+
+      const seqRes = await client.query<{ seq: number }>(
+        `INSERT INTO conversation_counters (conversation_id, next_sequence)
+         VALUES ($1, 2)
+         ON CONFLICT (conversation_id) DO UPDATE
+           SET next_sequence = conversation_counters.next_sequence + 1
+         RETURNING next_sequence - 1 AS seq`,
+        [args.conversationId],
+      )
+      sequence = seqRes.rows[0]?.seq ?? 1
+      await client.query(
+        `INSERT INTO messages
+          (id, conversation_id, author_id, kind, body, sequence, company_id, client_id)
+         VALUES ($1,$2,$3,'system',$4,$5,$6,$7)`,
+        [messageId, args.conversationId, args.agentId, body, sequence, companyId, clientId],
+      )
+      await client.query(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, [args.conversationId])
+      await enqueueBroadcast(client, CH_MESSAGE_NEW, {
+        type: 'message.new',
+        conversationId: args.conversationId,
+        companyId,
+        message: {
+          id: messageId,
+          conversationId: args.conversationId,
+          authorId: args.agentId,
+          kind: 'system',
+          body,
+          sequence,
+          at: new Date().toISOString(),
+        },
+      })
+      await client.query('COMMIT')
+      nudgeRealtimeOutbox()
+      posted = true
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw error
+    } finally {
+      client.release()
+    }
+
+    return { posted, authorized: true }
   }
 
   // ─── Steering busy heartbeat ──────────────────────────────────────
@@ -967,18 +1047,36 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
 
   async markConversationRead(args: {
     agentId: string
+    companyId?: string | null
     conversationId: string
     upToMessageId: string
-  }): Promise<void> {
+  }, dbClient?: PoolClient): Promise<void> {
     // Monotonic advance via ROW comparison: only update the cursor
     // when the incoming (created_at, message_id) pair lexicographically
     // exceeds the existing pair. This makes the operation idempotent,
     // out-of-order safe, AND collision-safe — two messages with the
     // same created_at are distinguishable by id.
     try {
-      await pool.query(
+      await (dbClient ?? pool).query(
         `WITH msg AS (
-           SELECT created_at, id AS message_id FROM messages WHERE id = $1
+           SELECT m.created_at, m.id AS message_id
+             FROM messages m
+             JOIN conversations c
+               ON c.id = m.conversation_id AND c.company_id = m.company_id
+             JOIN participants p
+               ON p.id = $2 AND p.company_id = c.company_id
+              AND p.kind = 'agent' AND p.departed_at IS NULL
+            WHERE m.id = $1 AND m.conversation_id = $3
+              AND ($4::text IS NULL OR c.company_id = $4)
+              AND (
+                EXISTS (
+                  SELECT 1 FROM conversation_members cm
+                   WHERE cm.conversation_id = c.id
+                     AND cm.company_id = c.company_id
+                     AND cm.participant_id = $2
+                )
+                OR (m.kind = 'system' AND m.delivery_recipient_id = $2)
+              )
          )
          INSERT INTO conversation_reads (user_id, conversation_id, last_read_at, last_read_message_id)
          SELECT $2, $3, msg.created_at, msg.message_id FROM msg
@@ -992,9 +1090,10 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
              WHEN ROW(EXCLUDED.last_read_at, EXCLUDED.last_read_message_id)
                 > ROW(conversation_reads.last_read_at, conversation_reads.last_read_message_id)
              THEN EXCLUDED.last_read_message_id ELSE conversation_reads.last_read_message_id END`,
-        [args.upToMessageId, args.agentId, args.conversationId],
+        [args.upToMessageId, args.agentId, args.conversationId, args.companyId ?? null],
       )
     } catch (err) {
+      if (dbClient) throw err
       console.warn(`[runtime] markConversationRead(${args.agentId}, ${args.conversationId}, ${args.upToMessageId}) failed — dropping`,
         err instanceof Error ? err.message : err)
     }

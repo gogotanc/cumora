@@ -20,13 +20,14 @@
  * Mount at /webhooks/email/inbound (NOT /api/...) so the user-auth
  * middleware doesn't intercept and 401 the worker.
  */
-import express, { Router, type Request, type Response } from 'express'
+import express, { Router, type Request, type Response, type NextFunction } from 'express'
 import { createHmac, timingSafeEqual, randomUUID } from 'node:crypto'
 import { pool } from '../db/pool.js'
 import { env } from '../env.js'
 import { storage } from '../storage.js'
 import { inc } from '../metrics.js'
 import { alertDiscord } from '../alert.js'
+import { publicBodyParserError } from '../body-parser-errors.js'
 import {
   parseAddress,
   formatAddress,
@@ -41,23 +42,59 @@ import {
 
 export const inboundEmailRouter = Router()
 
-/** Capture the raw body bytes so we can HMAC-verify before the global
- *  express.json (in index.ts) gets to it — `verify` runs as part of
- *  body-parser's parse step, perfect spot to stash the raw buffer.
- *  Mount this router BEFORE the generic `express.json` in the app
- *  middleware chain; body-parser sets `req._body = true` after parsing,
- *  so the global parser becomes a no-op for these requests.
- *
- *  25mb mirrors the upload ceiling — same rationale (don't accept emails
- *  bigger than what we'd let a human upload). */
-inboundEmailRouter.use(
-  express.json({
-    limit: '25mb',
-    verify: (req, _res, buf) => {
-      (req as Request & { rawBody?: Buffer }).rawBody = Buffer.from(buf)
-    },
-  }),
-)
+// Reject disabled, missing, or malformed authentication before reading a
+// potentially large request body. A well-formed signature still requires the
+// raw bytes for HMAC, but JSON parsing and object allocation happen only after
+// the constant-time comparison succeeds.
+inboundEmailRouter.use((req, res, next) => {
+  if (!env.EMAIL_INBOUND_HMAC_SECRET) {
+    res.status(503).json({ error: 'inbound email disabled (EMAIL_INBOUND_HMAC_SECRET unset)' })
+    return
+  }
+  const signature = String(req.headers['x-cumora-signature'] ?? '')
+  if (!signature) {
+    res.status(400).json({ error: 'missing signature' })
+    return
+  }
+  if (!normalizeSignature(signature)) {
+    inc('email.inbound.bad_signature')
+    res.status(401).json({ error: 'bad signature' })
+    return
+  }
+  next()
+})
+
+// 25mb mirrors the upload ceiling. `raw` bounds bytes without JSON.parse;
+// the following middleware authenticates those exact bytes first.
+inboundEmailRouter.use(express.raw({ type: 'application/json', limit: '25mb' }))
+inboundEmailRouter.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+  const parserError = publicBodyParserError(err)
+  if (parserError) {
+    res.status(parserError.status).json({ error: parserError.message })
+    return
+  }
+  next(err)
+})
+inboundEmailRouter.use((req, res, next) => {
+  const raw = Buffer.isBuffer(req.body) ? req.body : null
+  if (!raw) {
+    res.status(400).json({ error: 'missing JSON body' })
+    return
+  }
+  const signature = String(req.headers['x-cumora-signature'] ?? '')
+  if (!verifySignature(raw, signature)) {
+    inc('email.inbound.bad_signature')
+    res.status(401).json({ error: 'bad signature' })
+    return
+  }
+  try {
+    req.body = JSON.parse(raw.toString('utf8')) as unknown
+  } catch {
+    res.status(400).json({ error: 'invalid JSON body' })
+    return
+  }
+  next()
+})
 
 interface InboundPayload {
   /** The full RFC 5322 Message-ID, with or without angle brackets. */
@@ -66,6 +103,10 @@ interface InboundPayload {
   references?: string[] | null
   /** Each address is a "Name <addr@host>" or just "addr@host" string. */
   from: string
+  /** The envelope recipient — the address SMTP actually delivered to, which
+   *  the gate already checked is one of ours before admitting the message.
+   *  Optional so a gate deployed before this field still works. */
+  envelopeTo?: string | null
   to?: string[]
   cc?: string[]
   subject?: string
@@ -92,13 +133,18 @@ interface InboundPayload {
 
 /** Verify a hex-encoded HMAC-SHA256 against the raw body bytes. Constant-
  *  time compare so no timing oracle. */
+function normalizeSignature(signature: string): string | null {
+  let normalized = signature.trim().toLowerCase()
+  if (normalized.startsWith('sha256=')) normalized = normalized.slice(7)
+  return /^[a-f0-9]{64}$/.test(normalized) ? normalized : null
+}
+
 function verifySignature(rawBody: Buffer, signature: string): boolean {
   const secret = env.EMAIL_INBOUND_HMAC_SECRET
   if (!secret) return false
   const want = createHmac('sha256', secret).update(rawBody).digest('hex')
-  let got = signature.trim().toLowerCase()
-  if (got.startsWith('sha256=')) got = got.slice(7)
-  if (got.length !== want.length) return false
+  const got = normalizeSignature(signature)
+  if (!got) return false
   try {
     return timingSafeEqual(Buffer.from(want, 'hex'), Buffer.from(got, 'hex'))
   } catch {
@@ -212,23 +258,6 @@ async function resolveSender(args: {
 }
 
 inboundEmailRouter.post('/inbound', async (req: Request, res: Response) => {
-  const raw = (req as Request & { rawBody?: Buffer }).rawBody
-  const sig = String(req.headers['x-cumora-signature'] ?? '')
-  if (!raw || !sig) {
-    res.status(400).json({ error: 'missing signature or body' })
-    return
-  }
-  if (!env.EMAIL_INBOUND_HMAC_SECRET) {
-    // Feature off — refuse so a misconfigured worker can't silently
-    // succeed and have the operator wonder why no mail appears.
-    res.status(503).json({ error: 'inbound email disabled (EMAIL_INBOUND_HMAC_SECRET unset)' })
-    return
-  }
-  if (!verifySignature(raw, sig)) {
-    inc('email.inbound.bad_signature')
-    res.status(401).json({ error: 'bad signature' })
-    return
-  }
   const payload = req.body as InboundPayload
   if (!payload || typeof payload.messageId !== 'string' || typeof payload.from !== 'string') {
     res.status(400).json({ error: 'bad payload — need messageId + from' })
@@ -240,12 +269,29 @@ inboundEmailRouter.post('/inbound', async (req: Request, res: Response) => {
     res.status(400).json({ error: `unparseable from: ${payload.from}` })
     return
   }
-  const recipients = [...(payload.to ?? []), ...(payload.cc ?? [])]
+  // The envelope recipient belongs in this set, not just the headers. A Bcc'd
+  // agent appears in no header at all; so does one reached through an alias, a
+  // list expansion or a forwarding rule. Matching on To/Cc alone resolved
+  // nobody for those, which is a 404 here and `setReject` in the gate — a
+  // permanent 550 telling the sender the address does not exist, for mail the
+  // gate had already confirmed was addressed to us. Dedup below folds it away
+  // in the ordinary case where it is also in To.
+  const rawRecipients = [...(payload.to ?? []), ...(payload.cc ?? []), ...(payload.envelopeTo ? [payload.envelopeTo] : [])]
     .map((s) => parseAddress(s))
     .filter((x): x is { addr: string; name: string | null } => Boolean(x))
-  if (recipients.length === 0) {
+  if (rawRecipients.length === 0) {
     res.status(400).json({ error: 'no recipients' })
     return
+  }
+
+  // De-duplicate recipients by address (e.g. same recipient appearing in both To and Cc).
+  const seenAddrs = new Set<string>()
+  const recipients: Array<{ addr: string; name: string | null }> = []
+  for (const r of rawRecipients) {
+    const key = r.addr.toLowerCase()
+    if (seenAddrs.has(key)) continue
+    seenAddrs.add(key)
+    recipients.push(r)
   }
 
   const subject = (payload.subject ?? '').trim()
@@ -257,22 +303,53 @@ inboundEmailRouter.post('/inbound', async (req: Request, res: Response) => {
     return
   }
 
+  // Group resolved recipients by company up-front.
+  // Cumora is strictly tenant-isolated; recipients across different tenants
+  // receive separate deliveries, while all recipients in the SAME tenant
+  // are grouped onto the same conversation.
+  type ResolvedRecipientInfo = NonNullable<Awaited<ReturnType<typeof resolveRecipient>>> & {
+    addr: string
+    name: string | null
+  }
+  const byCompany = new Map<string, ResolvedRecipientInfo[]>()
+  for (const rcpt of recipients) {
+    const resolved = await resolveRecipient(rcpt.addr)
+    if (!resolved) continue
+    const list = byCompany.get(resolved.companyId) ?? []
+    list.push({ ...resolved, addr: rcpt.addr, name: rcpt.name })
+    byCompany.set(resolved.companyId, list)
+  }
+
+  if (byCompany.size === 0) {
+    // No recognized recipient in any tenant. Reject so the worker can
+    // bounce upstream — better signal than silently dropping.
+    console.log(JSON.stringify({
+      evt: 'email.inbound.no_recipient', smtp_message_id: messageIdNorm,
+      attempted_recipients: recipients.map((r) => r.addr),
+    }))
+    inc('email.inbound.no_recipient')
+    res.status(404).json({ error: 'no recipient resolved to a known agent' })
+    return
+  }
+
   // Idempotency: same Message-ID arriving twice (worker retried, MTA
-  // duplicate, etc.) must not create duplicate threads. The unique index
-  // on email_messages.smtp_message_id already enforces this on insert,
-  // but a pre-check spares us the partial-write rollback on the common
-  // retry path.
-  const dup = await pool.query<{ message_id: string }>(
-    `SELECT message_id FROM email_messages WHERE LOWER(smtp_message_id) = $1 LIMIT 1`,
-    [messageIdNorm],
+  // duplicate, etc.) must not create duplicate threads.
+  // Pre-check whether this Message-ID already exists across all target companies.
+  const targetCompanyIds = Array.from(byCompany.keys())
+  const existingRows = await pool.query<{ company_id: string; message_id: string; conversation_id: string }>(
+    `SELECT company_id, message_id, conversation_id FROM email_messages
+      WHERE LOWER(smtp_message_id) = $1 AND company_id = ANY($2::text[])`,
+    [messageIdNorm, targetCompanyIds],
   )
-  if (dup.rows[0]) {
+  const existingCompanyMap = new Map(existingRows.rows.map((r) => [r.company_id, r]))
+  const allAlreadyDelivered = targetCompanyIds.every((cid) => existingCompanyMap.has(cid))
+  if (allAlreadyDelivered) {
     console.log(JSON.stringify({
       evt: 'email.inbound.dedup', smtp_message_id: messageIdNorm,
-      existing_message_id: dup.rows[0].message_id,
+      existing_message_id: existingRows.rows[0]?.message_id,
     }))
     inc('email.inbound.dedup')
-    res.json({ ok: true, deduplicated: true, messageId: dup.rows[0].message_id })
+    res.json({ ok: true, deduplicated: true, messageId: existingRows.rows[0]?.message_id })
     return
   }
 
@@ -289,17 +366,35 @@ inboundEmailRouter.post('/inbound', async (req: Request, res: Response) => {
   // findOrCreateEmailConversation), so this only fires on the "received
   // a copy of what we just sent" case, not on real replies.
   const fromAddrFull = formatAddress(fromParsed.addr, fromParsed.name)
-  const inboundToJson = JSON.stringify((payload.to ?? []).map((s) => s))
+  const inboundTo = (payload.to ?? []).map((s) => s)
+  // Compare the recipients as a set, not as rendered JSON text. `to_addrs` is
+  // jsonb, and jsonb::text puts a space after every comma while JSON.stringify
+  // does not — so the old `LOWER(to_addrs::text) = LOWER($3)` matched only for
+  // a SINGLE recipient, where the two renderings happen to coincide:
+  //
+  //   1 recipient   jsonb::text ["a@x.com"]              stringify ["a@x.com"]
+  //   2 recipients  jsonb::text ["a@x.com", "b@x.com"]   stringify ["a@x.com","b@x.com"]
+  //
+  // Every boomerang of a mail sent to two or more addresses therefore fell
+  // through to a fresh conversation containing our own message — the exact
+  // thing this pass exists to stop. Sorting also drops the assumption that the
+  // header comes back in the order we sent it.
   const echo = await pool.query<{ message_id: string; conversation_id: string }>(
     `SELECT message_id, conversation_id FROM email_messages
       WHERE direction = 'out'
         AND created_at > NOW() - INTERVAL '10 minutes'
         AND LOWER(subject) = LOWER($1)
         AND LOWER(from_addr) = LOWER($2)
-        AND LOWER(to_addrs::text) = LOWER($3)
+        AND COALESCE(
+              (SELECT array_agg(LOWER(a) ORDER BY LOWER(a))
+                 FROM jsonb_array_elements_text(to_addrs) AS a), '{}'
+            ) = COALESCE(
+              (SELECT array_agg(LOWER(a) ORDER BY LOWER(a))
+                 FROM unnest($3::text[]) AS a), '{}'
+            )
       ORDER BY created_at DESC
       LIMIT 1`,
-    [subject || '(no subject)', fromAddrFull, inboundToJson],
+    [subject || '(no subject)', fromAddrFull, inboundTo],
   )
   if (echo.rows[0]) {
     console.log(JSON.stringify({
@@ -355,27 +450,26 @@ inboundEmailRouter.post('/inbound', async (req: Request, res: Response) => {
     }
   }
 
-  // Fan out to every recipient that resolves to an agent in some tenant.
-  // Cross-tenant deliveries land in each tenant separately; cumora has no
-  // notion of "the same conversation across tenants" because tenants
-  // can't read each other's data anyway.
+  // Fan out to each company that contains recognized recipients.
+  // Cross-tenant deliveries land in each tenant separately.
   const inserts: Array<{ companyId: string; conversationId: string; messageId: string }> = []
-  for (const rcpt of recipients) {
-    const resolved = await resolveRecipient(rcpt.addr)
-    if (!resolved) continue
-    const companyId = resolved.companyId
+  for (const [companyId, companyRecipients] of byCompany.entries()) {
+    const existingDelivery = existingCompanyMap.get(companyId)
+    if (existingDelivery) {
+      inserts.push({
+        companyId,
+        conversationId: existingDelivery.conversation_id,
+        messageId: existingDelivery.message_id,
+      })
+      continue
+    }
+
     const sender = await resolveSender({
       fromAddr: fromParsed.addr,
       fromName: fromParsed.name,
       companyId,
     })
-    const allRecipientParticipantIds: string[] = []
-    // Find every recognized recipient that's in THIS company so they can
-    // all be on the same conversation. Skip non-tenant recipients here.
-    for (const r of recipients) {
-      const rr = await resolveRecipient(r.addr)
-      if (rr && rr.companyId === companyId) allRecipientParticipantIds.push(rr.participantId)
-    }
+    const allRecipientParticipantIds = companyRecipients.map((r) => r.participantId)
     const memberIds = Array.from(new Set([sender.participantId, ...allRecipientParticipantIds]))
 
     const conv = await findOrCreateEmailConversation({
@@ -412,34 +506,58 @@ inboundEmailRouter.post('/inbound', async (req: Request, res: Response) => {
       })
       inserts.push({ companyId, conversationId: conv.conversationId, messageId: persisted.messageId })
     } catch (e) {
-      // The unique index on smtp_message_id can race-trip if two workers
-      // delivered the same message in parallel. Treat as dedup, not error.
+      // If we just created this conversation and persisting the message failed,
+      // clean up the empty conversation so we don't leave a ghost thread behind.
+      if (conv.created) {
+        await pool.query(
+          `DELETE FROM conversations
+            WHERE id = $1 AND company_id = $2
+              AND NOT EXISTS (SELECT 1 FROM messages WHERE conversation_id = $1)`,
+          [conv.conversationId, companyId],
+        ).catch((delErr) => {
+          console.warn(`[email] failed to clean up ghost conversation ${conv.conversationId}`, delErr)
+        })
+      }
+
+      // The unique index on (company_id, LOWER(smtp_message_id)) can race-trip if two
+      // workers delivered the same message in parallel. Treat as dedup, not error.
       const msg = e instanceof Error ? e.message : String(e)
-      if (/uniq_email_messages_smtp_id|duplicate key/i.test(msg)) {
+      if (/uniq_email_messages_company_smtp_id|uniq_email_messages_smtp_id|duplicate key/i.test(msg)) {
         console.log(JSON.stringify({
           evt: 'email.inbound.race_dedup', smtp_message_id: messageIdNorm,
-          recipient: rcpt.addr,
+          company_id: companyId,
         }))
+        const raceWinner = await pool.query<{ message_id: string; conversation_id: string }>(
+          `SELECT message_id, conversation_id FROM email_messages
+            WHERE company_id = $1 AND LOWER(smtp_message_id) = $2
+            LIMIT 1`,
+          [companyId, messageIdNorm],
+        )
+        if (raceWinner.rows[0]) {
+          inserts.push({
+            companyId,
+            conversationId: raceWinner.rows[0].conversation_id,
+            messageId: raceWinner.rows[0].message_id,
+          })
+        }
         continue
       }
       console.error(JSON.stringify({
-        evt: 'email.inbound.persist_error', recipient: rcpt.addr,
+        evt: 'email.inbound.persist_error', company_id: companyId,
         smtp_message_id: messageIdNorm, error: msg,
       }))
     }
   }
 
   if (inserts.length === 0) {
-    // No recognized recipient in any tenant. Reject so the worker can
-    // bounce upstream — better signal than silently dropping.
-    console.log(JSON.stringify({
-      evt: 'email.inbound.no_recipient', smtp_message_id: messageIdNorm,
+    console.error(JSON.stringify({
+      evt: 'email.inbound.persist_failed_all', smtp_message_id: messageIdNorm,
       attempted_recipients: recipients.map((r) => r.addr),
     }))
-    inc('email.inbound.no_recipient')
-    res.status(404).json({ error: 'no recipient resolved to a known agent' })
+    res.status(500).json({ error: 'failed to persist email message' })
     return
   }
+
   console.log(JSON.stringify({
     evt: 'email.inbound.delivered', smtp_message_id: messageIdNorm,
     delivery_count: inserts.length, auto_submitted: Boolean(payload.autoSubmitted),

@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { api, getComputerServerOrigin, type AgentInput } from '@/api/client'
+import { useEffect, useRef, useState } from 'react'
+import { api, getPairingServerOrigin, type AgentInput } from '@/api/client'
 import { isNativePlatform } from '@/lib/native'
 import { useParticipants } from '@/stores/participants'
 import { useComputers } from '@/stores/computers'
@@ -8,8 +8,32 @@ import { useAuth } from '@/stores/auth'
 import { Input } from '@/components/Input'
 import { TextArea } from '@/components/TextArea'
 import { Select } from '@/components/Select'
+import { Combobox, type ComboboxOption } from '@/components/Combobox'
 import type { Participant, EngineId } from '@/types'
 import { useT } from '@/lib/i18n'
+import { engineLabel } from '@/lib/engines'
+
+const INHERIT_ENGINE = '__inherit__'
+
+function newCreateRequestId(): string {
+  return typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `agent-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+}
+
+/** Which engine-dropdown value to show for a saved agent.
+ *  Official production has no `engineInherit`: a stored engine that isn't
+ *  the computer default means the user pinned it. */
+function initialEngineChoice(agent: Participant | null, computer: { kind: string; availableEngines: EngineId[] } | undefined): string {
+  if (!agent || !computer || computer.kind === 'cloud') return INHERIT_ENGINE
+  if (agent.providerProfile) return 'claude'
+  const advertised = computer.availableEngines
+  const engine = agent.engine
+  if (!engine || engine === 'managed' || !advertised.includes(engine)) return INHERIT_ENGINE
+  if (agent.engineInherit === true) return INHERIT_ENGINE
+  if (agent.engineInherit === false) return engine
+  return engine === advertised[0] ? INHERIT_ENGINE : engine
+}
 
 const PALETTE = [
   '#FFB088', '#FFD9D2', '#FFB7AF', '#F4B740',
@@ -21,9 +45,11 @@ interface Props {
   /** if provided, edit mode; otherwise create mode */
   agent: Participant | null
   onClose: () => void
+  /** Called after a successful save, once the modal is already closed. */
+  onSaved?: () => void
 }
 
-export function AgentEditor({ agent, onClose }: Props) {
+export function AgentEditor({ agent, onClose, onSaved }: Props) {
   const t = useT()
   const editing = agent !== null
   const [name, setName] = useState(agent?.name ?? '')
@@ -31,6 +57,7 @@ export function AgentEditor({ agent, onClose }: Props) {
   const [systemPrompt, setSystemPrompt] = useState(agent?.systemPrompt ?? '')
   const [bio, setBio] = useState(agent?.bio ?? '')
   const [avatarBg, setAvatarBg] = useState(agent?.avatarBg ?? PALETTE[0])
+  const [providerProfile, setProviderProfile] = useState(agent?.providerProfile ?? '')
   const [model, setModel] = useState(agent?.model ?? '')
   const [fastModel, setFastModel] = useState(agent?.fastModel ?? '')
   const [busy, setBusy] = useState(false)
@@ -41,6 +68,9 @@ export function AgentEditor({ agent, onClose }: Props) {
   const [repairCode, setRepairCode] = useState<string | null>(null)
   const [repairErr, setRepairErr] = useState<string | null>(null)
   const [repairCopied, setRepairCopied] = useState(false)
+  // Survives an ambiguous network failure and the user's retry click, but a
+  // newly opened editor gets a fresh key. The server binds it to the payload.
+  const createRequestId = useRef(newCreateRequestId())
 
   // "Runs on" — which Computer hosts this agent. Cloud = managed engine.
   // Free tier is BYOA-only: it has no real Cumora Cloud computer; we show a
@@ -54,16 +84,75 @@ export function AgentEditor({ agent, onClose }: Props) {
   const firstByoa = computers.find((c) => c.kind !== 'cloud')
   // Default for a NEW agent: paid → Cumora Cloud; free → first paired computer.
   const [computerId, setComputerId] = useState(agent?.computerId ?? (isFreeTier ? firstByoa?.id : cloud?.id) ?? '')
-  const [engine, setEngine] = useState<EngineId>((agent?.engine as EngineId) ?? 'managed')
+  const [engineChoice, setEngineChoice] = useState(
+    initialEngineChoice(agent, agent?.computerId ? computersById[agent.computerId] : undefined),
+  )
+  const engineTouched = useRef(false)
   const selectedComputer = computerId ? computersById[computerId] : undefined
   const isByoa = !!selectedComputer && selectedComputer.kind !== 'cloud'
+  const selectedEngineId: EngineId = (
+    engineChoice !== INHERIT_ENGINE
+      ? engineChoice
+      : (selectedComputer?.availableEngines[0] ?? 'claude')
+  ) as EngineId
   const selectedComputerOffline = isByoa && selectedComputer.status !== 'online'
-  const origin = getComputerServerOrigin()
+  const detectedEngine = selectedComputer?.detectedEngines?.find((engine) => engine.id === selectedEngineId)
+  const profiles = detectedEngine?.providerProfiles ?? []
+  const selectedProfile = profiles.find((p) => p.id === providerProfile)
+  const modelCatalog = providerProfile ? {
+    models: [], defaultModel: selectedProfile?.model, defaultFastModel: selectedProfile?.fastModel,
+    supportsCustom: true, fastModelScope: 'agent',
+  } : detectedEngine?.modelCatalog
+  // Per-computer engine model defaults (configured on the Computer card).
+  // When the local CLI catalog can't name a default (e.g. custom endpoints),
+  // these Cumora-side settings show as the hint for "follow engine default".
+  // A profile's endpoint owns its own namespace, so the engine-wide default
+  // must not be offered there — the server does not apply it either.
+  const engineDefaults = providerProfile ? undefined : selectedComputer?.engineDefaults?.[selectedEngineId]
+  const engineDefaultModel = engineDefaults?.model ?? undefined
+  const engineDefaultFastModel = engineDefaults?.fastModel ?? undefined
+  const modelOptions: Array<ComboboxOption<string>> = [
+    {
+      value: '',
+      label: t('agent.followEngineDefault'),
+      hint: engineDefaultModel ?? modelCatalog?.defaultModel ?? undefined,
+    },
+    ...(modelCatalog?.models ?? []).map((option) => ({
+      value: option.id,
+      label: option.label,
+      hint: [
+        option.label !== option.id ? option.id : null,
+        option.recommendedFor?.includes('big') ? t('agent.recommended') : null,
+      ].filter(Boolean).join(' · ') || undefined,
+    })),
+  ]
+  const fastModelOptions: Array<ComboboxOption<string>> = [
+    {
+      value: '',
+      label: t('agent.followSmallBrainDefault'),
+      hint: engineDefaultFastModel ?? modelCatalog?.defaultFastModel ?? undefined,
+    },
+    ...(modelCatalog?.models ?? []).map((option) => ({
+      value: option.id,
+      label: option.label,
+      hint: [
+        option.label !== option.id ? option.id : null,
+        option.recommendedFor?.includes('small') ? t('agent.recommended') : null,
+      ].filter(Boolean).join(' · ') || undefined,
+    })),
+  ]
+  const origin = getPairingServerOrigin()
   const repairCommand = repairCode
     ? `npx cumora@latest agent computer --pair ${repairCode}${origin ? ` --server ${origin}` : ''}`
     : ''
 
   useEffect(() => { void useComputers.getState().refresh() }, [])
+  useEffect(() => {
+    if (!agent || engineTouched.current) return
+    const host = agent.computerId ? computersById[agent.computerId] : undefined
+    if (!host) return
+    setEngineChoice(initialEngineChoice(agent, host))
+  }, [agent, computersById])
   useEffect(() => {
     setRepairCopied(false)
     setRepairErr(null)
@@ -87,17 +176,24 @@ export function AgentEditor({ agent, onClose }: Props) {
   // free → the first paired computer (never cloud).
   useEffect(() => {
     if (computerId) return
-    if (isFreeTier && firstByoa) { setComputerId(firstByoa.id); setEngine((firstByoa.availableEngines[0] as EngineId) ?? 'claude') }
-    else if (!isFreeTier && cloud) { setComputerId(cloud.id); setEngine('managed') }
+    if (isFreeTier && firstByoa) { setComputerId(firstByoa.id); setEngineChoice(INHERIT_ENGINE) }
+    else if (!isFreeTier && cloud) { setComputerId(cloud.id); setEngineChoice(INHERIT_ENGINE) }
   }, [cloud, firstByoa, computerId, isFreeTier])
 
+  // Model ids belong to the selected local engine/account. Do not carry a pin
+  // across a host or engine switch where the new CLI may reject it.
+  const clearModelPins = (): void => {
+    setModel('')
+    setFastModel('')
+  }
+
   const changeComputer = (id: string): void => {
+    if (id === computerId) return
+    engineTouched.current = true
     setComputerId(id)
-    const c = computersById[id]
-    if (!c || c.kind === 'cloud') setEngine('managed')
-    else setEngine((agent?.engine as EngineId) && c.availableEngines.includes(agent!.engine as EngineId)
-      ? (agent!.engine as EngineId)
-      : (c.availableEngines[0] ?? 'claude'))
+    setProviderProfile('')
+    setEngineChoice(INHERIT_ENGINE)
+    clearModelPins()
   }
 
   // Esc to close
@@ -111,33 +207,72 @@ export function AgentEditor({ agent, onClose }: Props) {
     setErr(null)
     setBusy(true)
     try {
-      const payload: AgentInput = { name, role, systemPrompt, bio, avatarBg, model: model.trim() || null, fastModel: fastModel.trim() || null }
+      const target = computerId || cloud?.id
+      const current = agent?.computerId ?? cloud?.id
+      const targetComputer = target ? computersById[target] : undefined
+      const isByoaTarget = !!targetComputer && targetComputer.kind !== 'cloud'
+      const inherit = !providerProfile && engineChoice === INHERIT_ENGINE
+      const pinned = providerProfile ? 'claude' : inherit ? undefined : (engineChoice as EngineId)
+      const savedChoice = initialEngineChoice(agent, targetComputer)
+      const inheritChanged = isByoaTarget && inherit !== (savedChoice === INHERIT_ENGINE)
+      const engineChanged = isByoaTarget && !inherit && pinned !== ((agent?.engine as EngineId) ?? null)
+      const assignmentChanged = Boolean(target && (target !== current || inheritChanged || engineChanged || providerProfile !== (agent?.providerProfile ?? '')))
+      const payload: AgentInput = {
+        name, role, systemPrompt, bio, avatarBg,
+        model: model.trim() || null,
+        fastModel: fastModel.trim() || null,
+      }
+      // A host/engine change persists these pins in the assignment's single
+      // SQL UPDATE. Do not clear them earlier if that assignment may fail.
+      const profilePayload = assignmentChanged
+        ? { ...payload, model: undefined, fastModel: undefined }
+        : payload
       let agentId = agent?.id
       if (editing) {
         // Only send avatarUrl on change so we don't clobber it on no-op edits.
-        if ((agent!.avatarUrl ?? null) !== avatarUrl) payload.avatarUrl = avatarUrl
-        await api.updateAgent(agent!.id, payload)
+        if ((agent!.avatarUrl ?? null) !== avatarUrl) profilePayload.avatarUrl = avatarUrl
+        await api.updateAgent(agent!.id, profilePayload)
       } else {
-        // No `id` field on create — server slugifies it from `name`
-        // and guarantees global uniqueness.
-        const created = await api.createAgent(payload)
+        // Creation + initial host/engine assignment is one transaction. The
+        // stable request id makes retry-after-timeout return that same Agent.
+        const created = await api.createAgent({
+          ...payload,
+          requestId: createRequestId.current,
+          computerId: target || null,
+          providerProfile: providerProfile || null,
+          engine: isByoaTarget ? pinned : undefined,
+          inherit: isByoaTarget ? inherit : false,
+        })
         agentId = created.id
+        if (isByoaTarget && pinned && created.engine !== pinned) {
+          throw new Error(t('agent.enginePinRejected', { engine: engineLabel(pinned) }))
+        }
       }
       // Persist the host assignment when the computer OR the engine changed.
       // (Engine lives in the same assign call; gating only on the computer
       // would silently drop a Claude→Codex switch on the same machine.) Still
       // skipped on a plain style edit to avoid the owner/admin-gated call.
-      const target = computerId || cloud?.id
-      const current = agent?.computerId ?? cloud?.id
-      const targetComputer = target ? computersById[target] : undefined
-      const isByoaTarget = !!targetComputer && targetComputer.kind !== 'cloud'
-      const engineChanged = isByoaTarget && engine !== ((agent?.engine as EngineId) ?? null)
-      if (agentId && target && (target !== current || engineChanged)) {
-        await api.assignAgentComputer(agentId, target, isByoaTarget ? engine : undefined)
+      if (editing && agentId && target && assignmentChanged) {
+        const out = await api.assignAgentComputer(
+          agentId,
+          target,
+          isByoaTarget ? pinned : undefined,
+          isByoaTarget ? inherit : false,
+          model.trim() || null,
+          fastModel.trim() || null,
+          providerProfile || null,
+        )
+        if (isByoaTarget && pinned && out.engine !== pinned) {
+          throw new Error(t('agent.enginePinRejected', { engine: engineLabel(pinned) }))
+        }
       }
-      await useParticipants.getState().load()
-      await useConversations.getState().reload()
       onClose()
+      if (onSaved) {
+        onSaved()
+      } else {
+        void useParticipants.getState().refresh()
+        void useConversations.getState().reload()
+      }
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e))
     } finally {
@@ -156,7 +291,7 @@ export function AgentEditor({ agent, onClose }: Props) {
       await api.updateAgent(agent.id, { name, role, systemPrompt, bio, avatarBg })
       const r = await api.generateAgentAvatar(agent.id)
       setAvatarUrl(r.url)
-      await useParticipants.getState().load()
+      await useParticipants.getState().refresh()
     } catch (e) {
       setAvatarErr(e instanceof Error ? e.message : String(e))
     } finally {
@@ -193,6 +328,7 @@ export function AgentEditor({ agent, onClose }: Props) {
             </div>
           </div>
           <button
+            type="button"
             onClick={onClose}
             className="w-8 h-8 rounded-full grid place-items-center text-ink-500 hover:bg-sky2-50 hover:text-ink-900 transition"
             aria-label={t('common.close')}
@@ -238,40 +374,65 @@ export function AgentEditor({ agent, onClose }: Props) {
             />
           </Field>
 
+          {isByoa && selectedEngineId === 'claude' && (profiles.length > 0 || providerProfile) && (
+            <Field label={t('agent.providerLabel')} hint={t('agent.providerHint')}>
+              <Select
+                ariaLabel={t('agent.providerLabel')}
+                value={providerProfile}
+                onValueChange={(value) => {
+                  setProviderProfile(value)
+                  if (value) { engineTouched.current = true; setEngineChoice('claude') }
+                  clearModelPins()
+                }}
+                options={[
+                  { value: '', label: t('agent.providerDefault') },
+                  ...profiles.map((p) => ({ value: p.id, label: p.label })),
+                  ...(providerProfile && !selectedProfile
+                    ? [{ value: providerProfile, label: t('agent.providerMissing', { id: providerProfile }), disabled: true }] : []),
+                ]}
+              />
+            </Field>
+          )}
+
           <Field
             label={isByoa ? t('agent.modelLabelByoa') : t('agent.modelLabel')}
-            hint={isByoa
-              ? `${t('agent.modelHintByoaPrefix')} ${engine === 'codex' ? t('agent.modelHintByoaCodex') : engine === 'grok' ? t('agent.modelHintByoaGrok') : engine === 'cursor' ? t('agent.modelHintByoaCursor') : t('agent.modelHintByoaClaude')} ${t('agent.modelHintByoaSuffix')}`
-              : t('agent.modelHintCloud')}
+            hint={isByoa ? t('agent.modelHintByoaCatalog') : t('agent.modelHintCloud')}
           >
-            <Input
-              type="text"
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              placeholder={t('agent.defaultPh')}
-              className="font-mono"
-              spellCheck={false}
-            />
-          </Field>
-
-          {isByoa && (
-            <Field
-              label={t('agent.fastLabelByoa')}
-              hint={engine === 'codex'
-                ? t('agent.fastHintByoaCodex')
-                : engine === 'grok'
-                  ? t('agent.fastHintByoaGrok')
-                  : engine === 'cursor'
-                    ? t('agent.fastHintByoaCursor')
-                    : t('agent.fastHintByoaClaude')}
-            >
+            {isByoa ? (
+              <Combobox
+                ariaLabel={t('agent.modelLabelByoa')}
+                value={model}
+                onValueChange={setModel}
+                options={modelOptions}
+                searchPlaceholder={t('agent.searchModels')}
+                allowCustom={modelCatalog?.supportsCustom !== false}
+                customLabel={(value) => t('agent.useCustomModel', { model: value })}
+              />
+            ) : (
               <Input
                 type="text"
-                value={fastModel}
-                onChange={(e) => setFastModel(e.target.value)}
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
                 placeholder={t('agent.defaultPh')}
                 className="font-mono"
                 spellCheck={false}
+              />
+            )}
+          </Field>
+
+          {isByoa && (!modelCatalog || modelCatalog.fastModelScope === 'agent') && (
+            <Field
+              label={t('agent.fastLabelByoa')}
+              hint={t('agent.fastHintByoaCatalog')}
+            >
+              <Combobox
+                ariaLabel={t('agent.fastLabelByoa')}
+                value={fastModel}
+                onValueChange={setFastModel}
+                options={fastModelOptions}
+                searchPlaceholder={t('agent.searchModels')}
+                allowCustom={modelCatalog?.supportsCustom !== false}
+                customLabel={(value) => t('agent.useCustomModel', { model: value })}
               />
             </Field>
           )}
@@ -306,13 +467,26 @@ export function AgentEditor({ agent, onClose }: Props) {
               <div className="mt-2">
                 <Select
                   ariaLabel={t('agent.engineLabel')}
-                  value={engine}
-                  onValueChange={(v) => setEngine(v as EngineId)}
-                  options={(selectedComputer.availableEngines.length
-                    ? selectedComputer.availableEngines
-                    : (['claude'] as EngineId[])
-                  ).map((en) => ({ value: en, label: en === 'claude' ? t('agent.engineClaude') : en === 'codex' ? t('agent.engineCodex') : en === 'grok' ? t('agent.engineGrok') : en === 'cursor' ? t('agent.engineCursor') : en }))}
+                  value={engineChoice}
+                  onValueChange={(value) => {
+                    if (value === engineChoice) return
+                    engineTouched.current = true
+                    setEngineChoice(value)
+                    setProviderProfile('')
+                    clearModelPins()
+                  }}
+                  options={(() => {
+                    const advertised = selectedComputer.availableEngines.length
+                      ? selectedComputer.availableEngines
+                      : (['claude'] as EngineId[])
+                    const defaultId = advertised[0]
+                    return [
+                      { value: INHERIT_ENGINE, label: t('agent.engineInherit', { engine: engineLabel(defaultId) }) },
+                      ...advertised.map((en) => ({ value: en, label: engineLabel(en) })),
+                    ]
+                  })()}
                 />
+                <div className="mt-1.5 text-[11.5px] text-ink-400">{t('agent.engineHint')}</div>
               </div>
             )}
             {selectedComputerOffline && (
@@ -487,12 +661,14 @@ export function AgentEditor({ agent, onClose }: Props) {
 
         <div className="px-6 py-4 border-t border-ink-100 flex items-center gap-2 bg-paper shrink-0">
           <button
+            type="button"
             onClick={onClose}
             className="px-4 py-2 rounded-[9px] text-[12.5px] font-semibold text-ink-700 bg-cloud hover:bg-sky2-50 transition"
             style={{ border: '1px solid var(--ink-100)' }}
           >{t('agent.cancelBtn')}</button>
           <div className="flex-1" />
           <button
+            type="button"
             onClick={submit}
             disabled={busy || !name.trim() || !systemPrompt.trim()}
             className="px-5 py-2 rounded-[9px] text-[12.5px] font-semibold text-white transition disabled:opacity-50"

@@ -10,10 +10,13 @@
  */
 
 import { pool } from '../db/pool.js'
+import type { PoolClient } from 'pg'
 import { storage, freshenAttachmentUrl, type StoredAttachment } from '../storage.js'
 import { env } from '../env.js'
 import type { CliResult, CliSideEffect } from './cli-result.js'
+import { fetchImageBytes } from './image-fetcher.js'
 import { stripLoneSurrogates } from './text-safety.js'
+import { dispatchMessagePush } from '../push.js'
 import {
   asMemorySource,
   memoryVisibleInScope,
@@ -21,6 +24,20 @@ import {
   parseMemoryPath,
 } from './memory-scope.js'
 import { memoryMetaForWrite, resolveMemoryWriteSource } from './memory-write.js'
+import { wakeKanbanAgents } from './kanban-wake.js'
+import {
+  enqueueBroadcast,
+  nudgeRealtimeOutbox,
+  withOutboxTransaction,
+} from '../realtime-outbox.js'
+import {
+  CH_BOARDS,
+  CH_CALENDAR_EVENTS,
+  CH_CONVO_UPDATED,
+  CH_DOCS,
+  CH_MESSAGE_NEW,
+  CH_STATUS,
+} from '../redis.js'
 
 // Every CLI result flows through ok()/err(), so scrubbing lone UTF-16 surrogates
 // here means CLI output (read by agents as tool results) can never carry a split
@@ -46,14 +63,97 @@ function err(text: string, code = 1): CliResult {
  *  /agents POST), so id-only lookup returns the single correct row. */
 async function agentCompany(agentId: string): Promise<string | null> {
   const { rows } = await pool.query<{ company_id: string | null }>(
-    `SELECT company_id FROM participants WHERE id = $1 LIMIT 1`, [agentId],
+    `SELECT company_id FROM participants
+      WHERE id = $1 AND kind = 'agent' AND departed_at IS NULL
+      LIMIT 1`,
+    [agentId],
   )
   return rows[0]?.company_id ?? null
+}
+
+/** Keep an active participant's tenant assignment stable for a command whose
+ * work spans multiple SQL statements (or a provider network call). Membership
+ * mutations, offboarding, and tenant moves all take a conflicting participant
+ * row lock, so they serialize before or after this command instead of changing
+ * authorization midway through it. */
+async function withActiveParticipantLock<T>(args: {
+  participantId: string
+  companyId: string
+  kind?: 'agent' | 'human'
+  run: (client: PoolClient) => Promise<T>
+}): Promise<T | null> {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const params: unknown[] = [args.participantId, args.companyId]
+    const kindPredicate = args.kind ? `AND kind = $3` : `AND kind IN ('agent', 'human')`
+    if (args.kind) params.push(args.kind)
+    const active = await client.query(
+      `SELECT id FROM participants
+        WHERE id = $1 AND company_id = $2
+          ${kindPredicate} AND departed_at IS NULL
+        FOR SHARE`,
+      params,
+    )
+    if (!active.rowCount) {
+      await client.query('ROLLBACK')
+      return null
+    }
+    const result = await args.run(client)
+    await client.query('COMMIT')
+    return result
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
+  }
+}
+
+async function withConversationActorLock<T>(args: {
+  participantId: string
+  companyId: string
+  conversationId: string
+  kind?: 'agent' | 'human'
+  conversationKind?: string
+  run: (client: PoolClient) => Promise<T>
+}): Promise<T | null> {
+  return withActiveParticipantLock({
+    participantId: args.participantId,
+    companyId: args.companyId,
+    kind: args.kind,
+    run: async (client) => {
+      const params: unknown[] = [args.conversationId, args.companyId]
+      let kindPredicate = ''
+      if (args.conversationKind) {
+        params.push(args.conversationKind)
+        kindPredicate = `AND c.kind = $3`
+      }
+      const locked = await client.query(
+        `SELECT c.id FROM conversations c
+          WHERE c.id = $1 AND c.company_id = $2
+            ${kindPredicate}
+          FOR UPDATE`,
+        params,
+      )
+      if (!locked.rowCount) return null
+      const authorized = await client.query(
+        `SELECT 1 FROM conversation_members
+          WHERE conversation_id = $1
+            AND company_id = $2
+            AND participant_id = $3`,
+        [args.conversationId, args.companyId, args.participantId],
+      )
+      if (!authorized.rowCount) return null
+      return args.run(client)
+    },
+  })
 }
 
 /* ============== argv parsing ============== */
 
 import { parseArgs, unescapeChat, joinBodyArgs, tokenize, type ParsedArgs } from './cli-parse.js'
+import { claimTargetColumn, type ColumnKind } from './board-columns.js'
 export { tokenize }
 
 // resolveAs lives in ./cli-identity for test-isolation (zero-side-effect
@@ -76,7 +176,10 @@ import { resolveAs } from './cli-identity.js'
  */
 import { inprocClient as worklogClient } from './runtime/inproc-client.js'
 import type { WorkTaskType, WorklogEntry } from './runtime/client.js'
-import { recordSeen, getSeen, recordHold, consumeHold, clearHold } from './seen-boundary.js'
+import {
+  recordSeen, getSeen, recordHold, consumeHold, clearHold,
+  readTurnPost, recordTurnPost, MAX_POSTS_PER_TURN_PER_CONVERSATION,
+} from './seen-boundary.js'
 
 function tenantScopeKey(companyId: string): string {
   return `tenant:${companyId}`
@@ -372,7 +475,7 @@ SKILLS  (progressive-disclosure capability packs in your own workspace):
   skills read <name> [<sub-path>]                  load full SKILL.md (or a bundled file)
   skills create <name> "<description>"             scaffold a new skill
   skills search <query>                            search SkillHub (requires SKILLHUB_URL)
-  skills install <id_or_url>                       install from SkillHub or any compatible URL
+  skills install <id>                              install from the configured SkillHub
   skills delete <name>                             remove a skill
   react <message_id> <emoji>                       toggle an emoji reaction on any message
   palette "<brief>"                                generate a 5-color hex palette
@@ -406,12 +509,17 @@ EXAMPLES:
 
 async function cmdWhoami(parsed: ParsedArgs): Promise<CliResult> {
   const id = resolveAs(parsed)
+  const companyId = await agentCompany(id)
+  if (!companyId) return err(`cannot resolve active company for ${id}`)
   const { rows } = await pool.query<{
     id: string; kind: string; name: string; role: string | null;
     status: string; bio: string | null; tools: string[] | null
   }>(
-    `SELECT id, kind, name, role, status, bio, tools FROM participants WHERE id = $1`,
-    [id],
+    `SELECT id, kind, name, role, status, bio, tools
+       FROM participants
+      WHERE id = $1 AND company_id = $2
+        AND kind = 'agent' AND departed_at IS NULL`,
+    [id, companyId],
   )
   const p = rows[0]
   if (!p) return err(`unknown participant: ${id}`)
@@ -419,9 +527,21 @@ async function cmdWhoami(parsed: ParsedArgs): Promise<CliResult> {
 
   const { rows: convos } = await pool.query<{ id: string; title: string; kind: string }>(
     `SELECT id, title, kind FROM conversations
-      WHERE members @> to_jsonb(ARRAY[$1::text])
+      WHERE company_id = $2
+        AND EXISTS (
+          SELECT 1 FROM conversation_members member
+           WHERE member.conversation_id = conversations.id
+             AND member.participant_id = $1
+        )
+        AND EXISTS (
+          SELECT 1 FROM participants requester
+           WHERE requester.id = $1
+             AND requester.company_id = conversations.company_id
+             AND requester.kind = 'agent'
+             AND requester.departed_at IS NULL
+        )
       ORDER BY updated_at DESC`,
-    [id],
+    [id, companyId],
   )
   const lines = [
     `id:        ${p.id}`,
@@ -471,21 +591,33 @@ async function cmdParticipants(parsed: ParsedArgs): Promise<CliResult> {
 
 async function cmdConversations(parsed: ParsedArgs, kindFilter?: 'group' | 'direct'): Promise<CliResult> {
   const me = resolveAs(parsed)
-  const params: unknown[] = [me]
+  const companyId = await agentCompany(me)
+  if (!companyId) return err(`cannot resolve active company for ${me}`)
+  const params: unknown[] = [me, companyId]
   let kindWhere = ''
   if (kindFilter) {
     params.push(kindFilter)
-    kindWhere = `AND kind = $2`
+    kindWhere = `AND c.kind = $3`
   }
   const { rows } = await pool.query<{
     id: string; kind: string; title: string; subtitle: string | null;
     members: string[]; tag: string | null;
     updated_at: string; pulled_by: { agentId?: string } | null
   }>(
-    `SELECT id, kind, title, subtitle, members, tag, updated_at, pulled_by
-       FROM conversations
-      WHERE members @> to_jsonb(ARRAY[$1::text]) ${kindWhere}
-      ORDER BY updated_at DESC`,
+    `SELECT c.id, c.kind, c.title, c.subtitle, c.members, c.tag, c.updated_at, c.pulled_by
+       FROM conversations c
+       JOIN participants requester
+         ON requester.id = $1
+        AND requester.company_id = c.company_id
+        AND requester.kind = 'agent'
+        AND requester.departed_at IS NULL
+      WHERE c.company_id = $2
+        AND EXISTS (
+          SELECT 1 FROM conversation_members member
+           WHERE member.conversation_id = c.id
+             AND member.participant_id = $1
+        ) ${kindWhere}
+      ORDER BY c.updated_at DESC`,
     params,
   )
   if (parsed.flags.json) return ok(JSON.stringify(rows, null, 2))
@@ -506,19 +638,39 @@ async function cmdConversations(parsed: ParsedArgs, kindFilter?: 'group' | 'dire
 }
 
 async function cmdMembers(parsed: ParsedArgs): Promise<CliResult> {
+  const me = resolveAs(parsed)
+  const companyId = await agentCompany(me)
+  if (!companyId) return err(`cannot resolve active company for ${me}`)
   const id = parsed.positional[0]
   if (!id) return err('usage: members <conversation_id>')
   const { rows } = await pool.query<{ members: string[] }>(
-    `SELECT members FROM conversations WHERE id = $1`,
-    [id],
+    `SELECT ARRAY_AGG(member.participant_id ORDER BY member.ordinal) AS members
+       FROM conversations c
+       JOIN conversation_members member ON member.conversation_id = c.id
+       JOIN participants requester
+         ON requester.id = $2
+        AND requester.company_id = c.company_id
+        AND requester.kind = 'agent'
+        AND requester.departed_at IS NULL
+      WHERE c.id = $1
+        AND c.company_id = $3
+        AND EXISTS (
+          SELECT 1 FROM conversation_members actor
+           WHERE actor.conversation_id = c.id
+             AND actor.participant_id = $2
+        )
+      GROUP BY c.id`,
+    [id, me, companyId],
   )
   if (!rows[0]) return err(`unknown conversation: ${id}`)
   const memberIds = rows[0].members
   const { rows: peeps } = await pool.query<{
     id: string; name: string; kind: string; role: string | null; status: string; avatar_url: string | null
   }>(
-    `SELECT id, name, kind, role, status, avatar_url FROM participants WHERE id = ANY($1::text[])`,
-    [memberIds],
+    `SELECT id, name, kind, role, status, avatar_url
+       FROM participants
+      WHERE id = ANY($1::text[]) AND company_id = $2`,
+    [memberIds, companyId],
   )
   if (parsed.flags.json) return ok(JSON.stringify(peeps, null, 2))
   const memberLines: string[] = []
@@ -535,6 +687,9 @@ async function cmdMembers(parsed: ParsedArgs): Promise<CliResult> {
 }
 
 async function cmdMessages(parsed: ParsedArgs): Promise<CliResult> {
+  const me = resolveAs(parsed)
+  const companyId = await agentCompany(me)
+  if (!companyId) return err(`cannot resolve active company for ${me}`)
   const id = parsed.positional[0]
   if (!id) return err('usage: messages <conversation_id> [--tail N] [--thread <root_id>]')
   const tail = Math.min(200, Math.max(1, Number(parsed.flags.tail ?? 20)))
@@ -542,11 +697,11 @@ async function cmdMessages(parsed: ParsedArgs): Promise<CliResult> {
   // when an agent wants to focus on what's happening in one sub-discussion
   // before deciding how to respond.
   const threadRootId = parsed.flags.thread ? String(parsed.flags.thread) : null
-  const params: unknown[] = [id]
+  const params: unknown[] = [id, me, companyId]
   let whereExtra = ''
   if (threadRootId) {
     params.push(threadRootId)
-    whereExtra = `AND quoted_message_id = $2`
+    whereExtra = `AND m.quoted_message_id = $4`
   }
   params.push(tail)
   const limitParam = `$${params.length}`
@@ -557,9 +712,25 @@ async function cmdMessages(parsed: ParsedArgs): Promise<CliResult> {
     quoted_message_id: string | null;
     quoted: { id: string; authorId: string; authorName: string; body: string } | null;
   }>(
-    `SELECT
-        id, author_id, kind, body, sequence, created_at, attachment, poll,
-        quoted_message_id,
+    `WITH authorized_conversation AS MATERIALIZED (
+       SELECT c.id
+         FROM conversations c
+         JOIN participants requester
+           ON requester.id = $2
+          AND requester.company_id = c.company_id
+          AND requester.kind = 'agent'
+          AND requester.departed_at IS NULL
+        WHERE c.id = $1
+          AND c.company_id = $3
+          AND EXISTS (
+            SELECT 1 FROM conversation_members member
+             WHERE member.conversation_id = c.id
+               AND member.participant_id = $2
+          )
+     )
+     SELECT
+        m.id, m.author_id, m.kind, m.body, m.sequence, m.created_at, m.attachment, m.poll,
+        m.quoted_message_id,
         (
           SELECT jsonb_build_object(
             'id', qm.id,
@@ -568,12 +739,14 @@ async function cmdMessages(parsed: ParsedArgs): Promise<CliResult> {
             'body', LEFT(qm.body, 240)
           )
             FROM messages qm
-           WHERE qm.id = messages.quoted_message_id
-             AND qm.conversation_id = messages.conversation_id
+           WHERE qm.id = m.quoted_message_id
+             AND qm.conversation_id = m.conversation_id
         ) AS quoted
-       FROM messages WHERE conversation_id = $1
+       FROM messages m
+       JOIN authorized_conversation authorized ON authorized.id = m.conversation_id
+      WHERE TRUE
        ${whereExtra}
-       ORDER BY sequence DESC LIMIT ${limitParam}`,
+       ORDER BY m.sequence DESC LIMIT ${limitParam}`,
     params,
   )
   for (const row of rows) await freshenRowAttachment(row)
@@ -584,7 +757,7 @@ async function cmdMessages(parsed: ParsedArgs): Promise<CliResult> {
   // this, the agent's typical flow `messages → reply` would HOLD on the
   // very tail it just fetched. Redis-only, fail-open, monotonic.
   if (inOrder.length > 0) {
-    await recordSeen(resolveAs(parsed), id, inOrder[inOrder.length - 1].sequence)
+    await recordSeen(me, id, inOrder[inOrder.length - 1].sequence)
   }
   if (parsed.flags.json) return ok(JSON.stringify(inOrder, null, 2))
   if (inOrder.length === 0) {
@@ -636,16 +809,32 @@ async function cmdThread(parsed: ParsedArgs): Promise<CliResult> {
 }
 
 async function cmdConvening(parsed: ParsedArgs): Promise<CliResult> {
+  const me = resolveAs(parsed)
+  const companyId = await agentCompany(me)
+  if (!companyId) return err(`cannot resolve active company for ${me}`)
   const id = parsed.positional[0]
   if (!id) return err('usage: convening <conversation_id>')
   const { rows } = await pool.query<{
     pulled_by_id: string; pulled_at: string; headline_lead: string; headline_tail: string;
     subhead: string; who_and_why: unknown; reasoning: unknown; status: string
   }>(
-    `SELECT pulled_by_id, pulled_at, headline_lead, headline_tail, subhead,
-            who_and_why, reasoning, status
-       FROM convening_info WHERE conversation_id = $1`,
-    [id],
+    `SELECT ci.pulled_by_id, ci.pulled_at, ci.headline_lead, ci.headline_tail, ci.subhead,
+            ci.who_and_why, ci.reasoning, ci.status
+       FROM convening_info ci
+       JOIN conversations c ON c.id = ci.conversation_id
+       JOIN participants requester
+         ON requester.id = $2
+        AND requester.company_id = c.company_id
+        AND requester.kind = 'agent'
+        AND requester.departed_at IS NULL
+      WHERE ci.conversation_id = $1
+        AND c.company_id = $3
+        AND EXISTS (
+          SELECT 1 FROM conversation_members member
+           WHERE member.conversation_id = c.id
+             AND member.participant_id = $2
+        )`,
+    [id, me, companyId],
   )
   const c = rows[0]
   if (!c) return err(`no convening info for ${id}`)
@@ -670,15 +859,18 @@ async function cmdConvening(parsed: ParsedArgs): Promise<CliResult> {
 }
 
 async function cmdSearch(parsed: ParsedArgs): Promise<CliResult> {
+  const me = resolveAs(parsed)
+  const companyId = await agentCompany(me)
+  if (!companyId) return err(`cannot resolve active company for ${me}`)
   const query = parsed.positional[0]
   if (!query) return err('usage: search <query> [--in <convo_id>] [--limit N]')
   const inConvo = parsed.flags.in ? String(parsed.flags.in) : null
   const limit = Math.min(50, Math.max(1, Number(parsed.flags.limit ?? 10)))
-  const params: unknown[] = [`%${query}%`]
+  const params: unknown[] = [me, companyId, `%${query}%`]
   let whereExtra = ''
   if (inConvo) {
     params.push(inConvo)
-    whereExtra = `AND m.conversation_id = $2`
+    whereExtra = `AND m.conversation_id = $4`
   }
   params.push(limit)
   const limitParam = `$${params.length}`
@@ -688,7 +880,19 @@ async function cmdSearch(parsed: ParsedArgs): Promise<CliResult> {
   }>(
     `SELECT m.id, m.conversation_id, m.author_id, m.body, m.created_at, m.attachment
        FROM messages m
-      WHERE m.body ILIKE $1 ${whereExtra}
+       JOIN conversations c ON c.id = m.conversation_id
+       JOIN participants requester
+         ON requester.id = $1
+        AND requester.company_id = c.company_id
+        AND requester.kind = 'agent'
+        AND requester.departed_at IS NULL
+      WHERE c.company_id = $2
+        AND EXISTS (
+          SELECT 1 FROM conversation_members member
+           WHERE member.conversation_id = c.id
+             AND member.participant_id = $1
+        )
+        AND m.body ILIKE $3 ${whereExtra}
       ORDER BY m.created_at DESC LIMIT ${limitParam}`,
     params,
   )
@@ -708,11 +912,14 @@ async function cmdSearch(parsed: ParsedArgs): Promise<CliResult> {
 }
 
 async function cmdToolsLog(parsed: ParsedArgs): Promise<CliResult> {
+  const me = resolveAs(parsed)
+  const companyId = await agentCompany(me)
+  if (!companyId) return err(`cannot resolve active company for ${me}`)
   const agent = parsed.flags.agent ? String(parsed.flags.agent) : null
   const limit = Math.min(50, Math.max(1, Number(parsed.flags.limit ?? 15)))
-  const params: unknown[] = []
-  let where = ''
-  if (agent) { params.push(agent); where = `WHERE agent_id = $1` }
+  const params: unknown[] = [companyId]
+  let where = 'WHERE company_id = $1'
+  if (agent) { params.push(agent); where += ` AND agent_id = $2` }
   params.push(limit)
   const limitParam = `$${params.length}`
   const { rows } = await pool.query<{
@@ -855,15 +1062,25 @@ async function loadInbox(agentId: string): Promise<InboxItem[]> {
         ) AS quoted
        FROM messages m
        JOIN conversations c ON c.id = m.conversation_id
+       JOIN participants requesting_agent
+         ON requesting_agent.id = $1
+        AND requesting_agent.company_id = c.company_id
+        AND requesting_agent.kind = 'agent'
+        AND requesting_agent.departed_at IS NULL
        LEFT JOIN participants p ON p.id = m.author_id AND p.company_id = c.company_id
-      WHERE c.members @> to_jsonb(ARRAY[$1::text])
-        AND m.author_id <> $1
+      WHERE (EXISTS (
+               SELECT 1 FROM conversation_members member
+                WHERE member.conversation_id = c.id
+                  AND member.participant_id = $1
+             ) OR m.delivery_recipient_id = $1)
+        AND (m.author_id <> $1 OR m.delivery_recipient_id = $1)
         AND m.created_at > COALESCE(
           (SELECT last_read_at FROM conversation_reads
             WHERE user_id = $1 AND conversation_id = c.id),
           '1970-01-01T00:00:00Z'::timestamptz)
         AND (
-          c.kind = 'direct'
+          m.delivery_recipient_id = $1
+          OR c.kind = 'direct'
           OR NOT EXISTS (
             SELECT 1 FROM conversation_mutes mu
              WHERE mu.user_id = $1 AND mu.conversation_id = c.id
@@ -949,6 +1166,8 @@ async function cmdInbox(parsed: ParsedArgs): Promise<CliResult> {
  *  on it, pick a different angle) instead of blurting the same thing. */
 async function cmdGlance(parsed: ParsedArgs): Promise<CliResult> {
   const me = resolveAs(parsed)
+  const companyId = await agentCompany(me)
+  if (!companyId) return err(`cannot resolve active company for ${me}`)
   const convoId = (typeof parsed.flags['conversation'] === 'string' ? parsed.flags['conversation'] : null)
     ?? parsed.positional[0]
   if (!convoId) return err('usage: glance --conversation <id>  (or: glance <id>)')
@@ -967,11 +1186,22 @@ async function cmdGlance(parsed: ParsedArgs): Promise<CliResult> {
             m.kind, m.body, m.created_at, m.sequence
        FROM messages m
        JOIN conversations c ON c.id = m.conversation_id
+       JOIN participants requester
+         ON requester.id = $2
+        AND requester.company_id = c.company_id
+        AND requester.kind = 'agent'
+        AND requester.departed_at IS NULL
        LEFT JOIN participants p ON p.id = m.author_id AND p.company_id = c.company_id
       WHERE m.conversation_id = $1
+        AND c.company_id = $3
+        AND EXISTS (
+          SELECT 1 FROM conversation_members member
+           WHERE member.conversation_id = c.id
+             AND member.participant_id = $2
+        )
       ORDER BY m.created_at DESC
       LIMIT 12`,
-    [convoId],
+    [convoId, me, companyId],
   )
   const recent = rows.reverse()
 
@@ -1039,12 +1269,27 @@ async function cmdAck(parsed: ParsedArgs): Promise<CliResult> {
   }
   const convoId = parsed.positional[0]
   if (!convoId) return err('usage: ack <conversation_id>  OR  ack --all')
-  await pool.query(
+  const activeAgentCompanyId = await agentCompany(me)
+  const { rowCount } = await pool.query(
     `INSERT INTO conversation_reads (user_id, conversation_id, last_read_at)
-     VALUES ($1, $2, NOW())
+     SELECT $1, c.id, NOW()
+       FROM conversations c
+       JOIN participants requester
+         ON requester.id = $1
+        AND requester.company_id = c.company_id
+        AND requester.kind IN ('agent', 'human')
+        AND requester.departed_at IS NULL
+      WHERE c.id = $2
+        AND ($3::text IS NULL OR c.company_id = $3)
+        AND EXISTS (
+          SELECT 1 FROM conversation_members member
+           WHERE member.conversation_id = c.id
+             AND member.participant_id = $1
+        )
      ON CONFLICT (user_id, conversation_id) DO UPDATE SET last_read_at = NOW()`,
-    [me, convoId],
+    [me, convoId, activeAgentCompanyId],
   )
+  if (!rowCount) return err(`conversation ${convoId} not found or no longer authorized`)
   // Standing down — see the --all branch above.
   void clearHold(me, `reply:${convoId}`)
   return ok(`acked ${convoId}`)
@@ -1091,39 +1336,46 @@ async function cmdMute(parsed: ParsedArgs): Promise<CliResult> {
   if (!conversationId) return err('usage: mute <conversation_id> [--for 30m|2h|1d|1w] [--until <iso>]  OR  mute list')
   let until: Date | null
   try { until = parseMuteUntil(parsed) } catch (error) { return err(error instanceof Error ? error.message : String(error)) }
-  const { rows } = await pool.query<{ kind: string; title: string; members: string[] }>(
-    `SELECT kind, title, members FROM conversations WHERE id = $1 AND company_id = $2`,
-    [conversationId, companyId],
+  const { rows } = await pool.query<{ kind: string; title: string; actor_is_member: boolean }>(
+    `SELECT c.kind, c.title,
+            EXISTS (
+              SELECT 1 FROM conversation_members member
+               WHERE member.conversation_id = c.id
+                 AND member.participant_id = $3
+            ) AS actor_is_member
+       FROM conversations c
+      WHERE c.id = $1 AND c.company_id = $2`,
+    [conversationId, companyId, me],
   )
   const conversation = rows[0]
   if (!conversation) return err(`conversation not found: ${conversationId}`)
-  if (!conversation.members.includes(me)) return err(`you are not a member of ${conversationId}`)
+  if (!conversation.actor_is_member) return err(`you are not a member of ${conversationId}`)
   if (conversation.kind === 'direct') return err('direct conversations always deliver; mute a group instead')
-  const client = await pool.connect()
-  try {
-    await client.query('BEGIN')
-    await client.query(
+  const muted = await withConversationActorLock({
+    participantId: me,
+    companyId,
+    conversationId,
+    kind: 'agent',
+    run: async (client) => {
+      await client.query(
       `INSERT INTO conversation_mutes (user_id, conversation_id, muted_at, muted_until)
        VALUES ($1, $2, NOW(), $3)
        ON CONFLICT (user_id, conversation_id)
        DO UPDATE SET muted_at = NOW(), muted_until = EXCLUDED.muted_until`,
-      [me, conversationId, until],
-    )
-    // Muting is a deliberate stand-down. Seal the current unread tail so
-    // following later resumes from that point instead of replaying a backlog.
-    await client.query(
-      `INSERT INTO conversation_reads (user_id, conversation_id, last_read_at)
-       VALUES ($1, $2, NOW())
-       ON CONFLICT (user_id, conversation_id) DO UPDATE SET last_read_at = NOW()`,
-      [me, conversationId],
-    )
-    await client.query('COMMIT')
-  } catch (error) {
-    await client.query('ROLLBACK').catch(() => {})
-    throw error
-  } finally {
-    client.release()
-  }
+        [me, conversationId, until],
+      )
+      // Muting is a deliberate stand-down. Seal the current unread tail so
+      // following later resumes from that point instead of replaying a backlog.
+      await client.query(
+        `INSERT INTO conversation_reads (user_id, conversation_id, last_read_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (user_id, conversation_id) DO UPDATE SET last_read_at = NOW()`,
+        [me, conversationId],
+      )
+      return true
+    },
+  })
+  if (!muted) return err(`conversation ${conversationId} is no longer authorized`)
   void clearHold(me, `reply:${conversationId}`)
   const expiry = until ? ` until ${until.toISOString()}` : ' until you follow it again'
   return ok(
@@ -1139,12 +1391,19 @@ async function cmdFollow(parsed: ParsedArgs): Promise<CliResult> {
   if (!conversationId) return err('usage: follow <conversation_id>')
   const companyId = await agentCompany(me)
   if (!companyId) return err(`unknown agent ${me} (no company)`)
-  const { rowCount } = await pool.query(
-    `DELETE FROM conversation_mutes mu USING conversations c
-      WHERE mu.user_id = $1 AND mu.conversation_id = $2
-        AND c.id = mu.conversation_id AND c.company_id = $3`,
-    [me, conversationId, companyId],
-  )
+  const followed = await withConversationActorLock({
+    participantId: me,
+    companyId,
+    conversationId,
+    kind: 'agent',
+    run: (client) => client.query(
+      `DELETE FROM conversation_mutes
+        WHERE user_id = $1 AND conversation_id = $2`,
+      [me, conversationId],
+    ),
+  })
+  if (!followed) return err(`conversation ${conversationId} is no longer authorized`)
+  const rowCount = followed.rowCount
   return ok(rowCount
     ? `Following ${conversationId} again. New messages will resume normal inbox delivery.`
     : `${conversationId} was not muted; normal delivery is already active.`)
@@ -1337,7 +1596,7 @@ async function cmdShip(parsed: ParsedArgs): Promise<CliResult> {
 // `agents/membership.ts` so the HTTP endpoints (POST /members,
 // POST /leave) and the agent CLI share one implementation. Importing
 // here re-exposes the names this file already used.
-import { postMembershipSystemMessage } from './membership.js'
+import { addConversationMember, removeConversationMember } from './membership.js'
 
 async function cmdLeave(parsed: ParsedArgs): Promise<CliResult> {
   const me = resolveAs(parsed)
@@ -1345,35 +1604,38 @@ async function cmdLeave(parsed: ParsedArgs): Promise<CliResult> {
   if (!convoId) return err('usage: leave <conversation_id>')
 
   const { rows } = await pool.query<{
-    kind: string; title: string; members: string[]; company_id: string | null
+    kind: string; title: string; company_id: string | null; actor_is_member: boolean
   }>(
-    `SELECT kind, title, members, company_id FROM conversations WHERE id = $1`,
-    [convoId],
+    `SELECT c.kind, c.title, c.company_id,
+            EXISTS (
+              SELECT 1 FROM conversation_members member
+               WHERE member.conversation_id = c.id
+                 AND member.participant_id = $2
+            ) AS actor_is_member
+       FROM conversations c WHERE c.id = $1`,
+    [convoId, me],
   )
   const c = rows[0]
   if (!c) return err(`unknown conversation ${convoId}`)
+  if (!c.company_id) return err(`conversation ${convoId} is not attached to a workspace`)
   if (c.kind === 'direct') {
     return err('cannot leave a direct conversation — use `cumora ack` to mute it from your inbox instead')
   }
-  if (!c.members.includes(me)) return err(`${me} is not a member of ${convoId}`)
+  if (!c.actor_is_member) return err(`${me} is not a member of ${convoId}`)
 
-  // Post the system message BEFORE updating members so the leaving
-  // agent's inbox (filtered by c.members @> [me]) still surfaces this
-  // final row in their next wake — that's how they "perceive" their own
-  // departure cleanly.
-  const systemMessage = await postMembershipSystemMessage({
+  // Bind authorization to the write itself. If another member revoked us
+  // after the SELECT above, this must fail closed and must not emit a false
+  // departure event.
+  const mutation = await removeConversationMember({
     conversationId: convoId,
-    companyId: c.company_id,
+    memberId: me,
     actorId: me,
+    companyId: c.company_id,
+    allowSoleMember: true,
     kind: 'left',
-    participantId: me,
   })
-
-  const next = c.members.filter((m) => m !== me)
-  await pool.query(
-    `UPDATE conversations SET members = $2::jsonb, updated_at = NOW() WHERE id = $1`,
-    [convoId, JSON.stringify(next)],
-  )
+  if (!mutation) return err(`${me} is no longer a member of ${convoId}`)
+  const next = mutation.members
 
   return ok(`left "${c.title}" (${convoId}); ${next.length} member(s) remain`, [{
     event: 'conversation.membership_changed',
@@ -1383,7 +1645,7 @@ async function cmdLeave(parsed: ParsedArgs): Promise<CliResult> {
     actorId: me,
     participantId: me,
     companyId: c.company_id ?? undefined,
-    systemMessageId: systemMessage.messageId,
+    systemMessageId: mutation.systemMessageId,
     memberCount: next.length,
     visibleToUser: true,
   }])
@@ -1397,18 +1659,31 @@ async function cmdInvite(parsed: ParsedArgs): Promise<CliResult> {
   if (target === me) return err(`${me} is already the one inviting`)
 
   const { rows } = await pool.query<{
-    kind: string; title: string; members: string[]; company_id: string | null
+    kind: string; title: string; company_id: string | null;
+    actor_is_member: boolean; target_is_member: boolean
   }>(
-    `SELECT kind, title, members, company_id FROM conversations WHERE id = $1`,
-    [convoId],
+    `SELECT c.kind, c.title, c.company_id,
+            EXISTS (
+              SELECT 1 FROM conversation_members member
+               WHERE member.conversation_id = c.id
+                 AND member.participant_id = $2
+            ) AS actor_is_member,
+            EXISTS (
+              SELECT 1 FROM conversation_members member
+               WHERE member.conversation_id = c.id
+                 AND member.participant_id = $3
+            ) AS target_is_member
+       FROM conversations c WHERE c.id = $1`,
+    [convoId, me, target],
   )
   const c = rows[0]
   if (!c) return err(`unknown conversation ${convoId}`)
+  if (!c.company_id) return err(`conversation ${convoId} is not attached to a workspace`)
   if (c.kind === 'direct') {
     return err('cannot invite into a direct conversation — use `cumora pull-group` to start a fresh thread')
   }
-  if (!c.members.includes(me)) return err(`${me} is not a member of ${convoId} — can't invite into a group you're not in`)
-  if (c.members.includes(target)) return ok(`${target} is already a member of ${convoId}`)
+  if (!c.actor_is_member) return err(`${me} is not a member of ${convoId} — can't invite into a group you're not in`)
+  if (c.target_is_member) return ok(`${target} is already a member of ${convoId}`)
 
   // Verify the invitee exists in this tenant.
   const tenant = c.company_id
@@ -1420,19 +1695,14 @@ async function cmdInvite(parsed: ParsedArgs): Promise<CliResult> {
     if (!pp[0]) return err(`${target} is not a participant in this workspace`)
   }
 
-  const next = [...c.members, target]
-  await pool.query(
-    `UPDATE conversations SET members = $2::jsonb, updated_at = NOW() WHERE id = $1`,
-    [convoId, JSON.stringify(next)],
-  )
-
-  const systemMessage = await postMembershipSystemMessage({
+  const mutation = await addConversationMember({
     conversationId: convoId,
-    companyId: c.company_id,
+    memberId: target,
     actorId: me,
-    kind: 'joined',
-    participantId: target,
+    companyId: c.company_id,
   })
+  if (!mutation) return err(`${me} is no longer a member of ${convoId} — invite cancelled`)
+  const next = mutation.members
 
   return ok(`invited ${target} into "${c.title}" (${convoId}); ${next.length} member(s) total`, [{
     event: 'conversation.membership_changed',
@@ -1442,7 +1712,7 @@ async function cmdInvite(parsed: ParsedArgs): Promise<CliResult> {
     actorId: me,
     participantId: target,
     companyId: c.company_id ?? undefined,
-    systemMessageId: systemMessage.messageId,
+    systemMessageId: mutation.systemMessageId,
     memberCount: next.length,
     visibleToUser: true,
   }])
@@ -1456,46 +1726,62 @@ async function cmdKick(parsed: ParsedArgs): Promise<CliResult> {
   if (target === me) return err('use `cumora leave <convo_id>` to leave a group yourself')
 
   const { rows } = await pool.query<{
-    kind: string; title: string; members: string[]; company_id: string | null
+    kind: string; title: string; company_id: string | null; member_count: number;
+    actor_is_member: boolean; target_is_member: boolean
   }>(
-    `SELECT kind, title, members, company_id FROM conversations WHERE id = $1`,
-    [convoId],
+    `SELECT c.kind, c.title, c.company_id,
+            (SELECT COUNT(*)::int FROM conversation_members member
+              WHERE member.conversation_id = c.id) AS member_count,
+            EXISTS (
+              SELECT 1 FROM conversation_members member
+               WHERE member.conversation_id = c.id
+                 AND member.participant_id = $2
+            ) AS actor_is_member,
+            EXISTS (
+              SELECT 1 FROM conversation_members member
+               WHERE member.conversation_id = c.id
+                 AND member.participant_id = $3
+            ) AS target_is_member
+       FROM conversations c WHERE c.id = $1`,
+    [convoId, me, target],
   )
   const c = rows[0]
   if (!c) return err(`unknown conversation ${convoId}`)
+  if (!c.company_id) return err(`conversation ${convoId} is not attached to a workspace`)
   if (c.kind === 'direct') return err('cannot kick from a direct conversation')
-  if (!c.members.includes(me)) return err(`${me} is not a member of ${convoId} — can't kick from a group you're not in`)
-  if (!c.members.includes(target)) return err(`${target} is not a member of ${convoId}`)
+  if (!c.actor_is_member) return err(`${me} is not a member of ${convoId} — can't kick from a group you're not in`)
+  if (!c.target_is_member) return err(`${target} is not a member of ${convoId}`)
 
-  const next = c.members.filter((m) => m !== target)
+  const nextCount = c.member_count - 1
   // Refuse to leave a group with just one member as a side-effect of kick —
   // if there'd only be the actor left, that's "everyone else gone", which
   // is fine, but require explicit confirmation via --confirm-empty for the
   // case where the kick removes the LAST other member. Cheap guard against
   // accidental group-clearing.
-  if (next.length === 1 && !parsed.flags['confirm-empty']) {
+  if (nextCount === 1 && !parsed.flags['confirm-empty']) {
     return err(`kicking ${target} would leave only ${me} in this group; pass --confirm-empty if that's intended`)
   }
 
-  // Post BEFORE removing the target from members. The mailbox query
-  // filters by current `c.members @> [agentId]`, so if we updated first
-  // the kicked agent would never see the row that explains why their
-  // inbox went quiet on this conversation. Posting first means the
-  // target gets one last wake with this exact message.
-  const systemMessage = await postMembershipSystemMessage({
+  // Report what the row actually holds now, not the array we predicted from a
+  // read taken before the guards above. The actor predicate is part of this
+  // UPDATE, so a concurrent revocation cannot leave this stale kick authorized.
+  const confirmedEmpty = Boolean(parsed.flags['confirm-empty'])
+  const mutation = await removeConversationMember({
     conversationId: convoId,
-    companyId: c.company_id,
+    memberId: target,
     actorId: me,
+    companyId: c.company_id,
+    allowSoleMember: confirmedEmpty,
     kind: 'kicked',
-    participantId: target,
   })
+  if (!mutation) {
+    return err(confirmedEmpty
+      ? `membership changed or ${me} is no longer authorized in ${convoId} — kick cancelled`
+      : `membership changed, the kick is no longer authorized, or it would leave only ${me}; retry with --confirm-empty if intended`)
+  }
+  const remaining = mutation.members
 
-  await pool.query(
-    `UPDATE conversations SET members = $2::jsonb, updated_at = NOW() WHERE id = $1`,
-    [convoId, JSON.stringify(next)],
-  )
-
-  return ok(`kicked ${target} from "${c.title}" (${convoId}); ${next.length} member(s) remain`, [{
+  return ok(`kicked ${target} from "${c.title}" (${convoId}); ${remaining.length} member(s) remain`, [{
     event: 'conversation.membership_changed',
     command: 'kick',
     action: 'kicked',
@@ -1503,8 +1789,8 @@ async function cmdKick(parsed: ParsedArgs): Promise<CliResult> {
     actorId: me,
     participantId: target,
     companyId: c.company_id ?? undefined,
-    systemMessageId: systemMessage.messageId,
-    memberCount: next.length,
+    systemMessageId: mutation.systemMessageId,
+    memberCount: remaining.length,
     visibleToUser: true,
   }])
 }
@@ -1532,21 +1818,38 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
     return err('usage: reply <convo_id> "<body>" [--quote <msg_id>] [--attach <url> | --generate-image "<prompt>" [--size square|wide|tall] | --attach-text "<filename>" "<content>" | --attach-bytes "<filename>" --bytes-b64 "<base64>" [--bytes-mime "<mime>"]]')
   }
 
-  // Verify the participant is a member of the conversation.
+  // Agent ids are globally unique, so pin their current tenant here. Human
+  // callers can belong to several companies; for them the conversation id +
+  // active participant membership below selects the tenant instead.
+  const activeAgentCompanyId = await agentCompany(me)
+
+  // Friendly preflight only. The final INSERT transaction repeats this
+  // authorization while holding both the active participant row and the
+  // conversation row, so a concurrent kick, offboarding, or tenant move
+  // cannot leave this snapshot authorized at the write boundary.
   const { rows: cv } = await pool.query<{
-    members: string[]; company_id: string; kind: string; actor_is_agent: boolean
+    member_count: number; company_id: string; kind: string; actor_is_agent: boolean
   }>(
-    `SELECT c.members, c.company_id, c.kind,
-            EXISTS (
-              SELECT 1 FROM participants p
-               WHERE p.id = $2 AND p.company_id = c.company_id
-                 AND p.kind = 'agent' AND p.departed_at IS NULL
-            ) AS actor_is_agent
-       FROM conversations c WHERE c.id = $1`,
-    [convoId, me],
+    `SELECT (SELECT COUNT(*)::int FROM conversation_members member
+              WHERE member.conversation_id = c.id) AS member_count,
+            c.company_id, c.kind,
+            (requester.kind = 'agent') AS actor_is_agent
+       FROM conversations c
+       JOIN participants requester
+         ON requester.id = $2
+        AND requester.company_id = c.company_id
+        AND requester.kind IN ('agent', 'human')
+        AND requester.departed_at IS NULL
+      WHERE c.id = $1
+        AND ($3::text IS NULL OR c.company_id = $3)
+        AND EXISTS (
+          SELECT 1 FROM conversation_members member
+           WHERE member.conversation_id = c.id
+             AND member.participant_id = $2
+        )`,
+    [convoId, me, activeAgentCompanyId],
   )
-  if (!cv[0]) return err(`unknown conversation ${convoId}`)
-  if (!cv[0].members.includes(me)) return err(`${me} is not a member of ${convoId}`)
+  if (!cv[0]) return err(`conversation ${convoId} not found or no longer authorized`)
   const companyId = cv[0].company_id
 
   // ─── Anti-monologue gate ──────────────────────────────────────────
@@ -1572,7 +1875,32 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
   // forces the agent to commit deliberately rather than absent-
   // mindedly continuing to monologue.
   const monologueBypass = Boolean(parsed.flags.continue || parsed.flags.also)
-  if (!monologueBypass && cv[0].actor_is_agent && cv[0].members.length > 2) {
+  // Announce-then-deliver. The operating rules REQUIRE an intent message
+  // before long work ("Drafting the email now"), posted as a SEPARATE
+  // `cumora reply`, then the result in the SAME turn. In a group of three or
+  // more that intent message is the room's last message and seconds old,
+  // which is exactly what the gate below refuses — so the flow the product
+  // mandates was the flow it rejected, and the answer was lost.
+  //
+  // A second post from the SAME run is that delivery. A post from a LATER run
+  // is the agent waking up and deciding to talk again, which is what the gate
+  // was built to stop ("each wake-up is a fresh 'should I respond?' decision
+  // with no global stop-signal"). The run id is the only thing that tells them
+  // apart, so it now reaches this process as CUMORA_RUN_ID.
+  //
+  // Capped at two posts per turn per conversation: announce + deliver. A third
+  // is monologuing again and still needs --continue.
+  //
+  // Deliberately NOT folded into `monologueBypass`: that flag also disables
+  // the freshness preflight further down, and a continuation must still be
+  // checked against a room that moved while we were working.
+  const turnRunId = (process.env.CUMORA_RUN_ID ?? '').trim()
+  const sameTurnDelivery = !monologueBypass && turnRunId && cv[0].actor_is_agent
+    ? await readTurnPost(me, convoId).then(
+        (rec) => Boolean(rec && rec.runId === turnRunId && rec.posts < MAX_POSTS_PER_TURN_PER_CONVERSATION),
+      )
+    : false
+  if (!monologueBypass && !sameTurnDelivery && cv[0].actor_is_agent && cv[0].member_count > 2) {
     const { rows: lastMsg } = await pool.query<{ author_id: string; created_at: string }>(
       `SELECT author_id, created_at FROM messages
          WHERE conversation_id = $1
@@ -1604,6 +1932,8 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
   // sendViaProvider path. autoSubmitted=true because every CLI reply is
   // agent-driven by construction.
   if (cv[0].kind === 'email') {
+    const attachmentError = rejectsEmailAttachmentFlags(parsed)
+    if (attachmentError) return attachmentError
     if (!body) {
       return err('email replies require a non-empty body')
     }
@@ -1674,7 +2004,7 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
   // the agent a HELD envelope for this conversation.
   const sendAnywayFlag = Boolean(parsed.flags['send-anyway'])
   const replyHoldScope = `reply:${convoId}`
-  const preflightApplies = !monologueBypass && cv[0].members.length > 2
+  const preflightApplies = !monologueBypass && cv[0].member_count > 2
   const heldAck = sendAnywayFlag
     ? await consumeHold(me, replyHoldScope)
     : { armed: false, heldUpToSeq: null }
@@ -1956,6 +2286,34 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
   const txClient = await pool.connect()
   try {
     await txClient.query('BEGIN')
+    const activeActor = await txClient.query(
+      `SELECT id FROM participants
+        WHERE id = $1 AND company_id = $2
+          AND kind IN ('agent', 'human') AND departed_at IS NULL
+        FOR SHARE`,
+      [me, companyId],
+    )
+    const lockedConversation = activeActor.rowCount
+      ? await txClient.query(
+        `SELECT c.id FROM conversations c
+          WHERE c.id = $1 AND c.company_id = $2
+          FOR SHARE OF c`,
+        [convoId, companyId],
+      )
+      : null
+    const { rows: authorizedRows } = lockedConversation?.rowCount
+      ? await txClient.query<{ member_count: number }>(
+        `SELECT COUNT(*)::int AS member_count
+           FROM conversation_members
+          WHERE conversation_id = $1 AND company_id = $2
+         HAVING BOOL_OR(participant_id = $3)`,
+        [convoId, companyId, me],
+      )
+      : { rows: [] as Array<{ member_count: number }> }
+    if (!authorizedRows[0]) {
+      await txClient.query('ROLLBACK')
+      return err(`conversation ${convoId} no longer authorized; reply cancelled`)
+    }
     const { rows: seqRow } = await txClient.query<{ seq: number }>(
       `INSERT INTO conversation_counters (conversation_id, next_sequence)
        VALUES ($1, 2)
@@ -1987,7 +2345,7 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
     // contradicting this check's own "verbatim-dup is a hard no, the server enforces"
     // contract.) The peer-only query below already exempts genuine self-monologue: a
     // real follow-up isn't verbatim-identical to a recent PEER post, so it still passes.
-    if (cv[0].members.length > 2) {
+    if (authorizedRows[0].member_count > 2) {
       const draftBodyTrimmed = body.trim()
       if (draftBodyTrimmed.length > 0) {
         const { rows: lastPeer } = await txClient.query<{ sequence: number; author_id: string; body: string }>(
@@ -2014,29 +2372,72 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
        VALUES ($1,$2,$3,'text',$4,$5,$6::jsonb,$7,$8)`,
       [messageId, convoId, me, finalBody, sequence, attachment ? JSON.stringify(attachment) : null, resolvedQuotedId, companyId],
     )
+    await txClient.query(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, [convoId])
+    await txClient.query(
+      `INSERT INTO conversation_reads (user_id, conversation_id, last_read_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (user_id, conversation_id) DO UPDATE SET last_read_at = NOW()`,
+      [me, convoId],
+    )
+    await enqueueBroadcast(txClient, CH_MESSAGE_NEW, {
+      type: 'message.new',
+      conversationId: convoId,
+      companyId,
+      message: {
+        id: messageId,
+        conversationId: convoId,
+        authorId: me,
+        kind: 'text',
+        body: finalBody,
+        sequence,
+        at: new Date().toISOString(),
+        attachment: attachment ?? undefined,
+        quotedMessageId: resolvedQuotedId ?? undefined,
+        quoted: quotedSummary
+          ? {
+              id: quotedSummary.id,
+              authorId: quotedSummary.authorId,
+              authorName: quotedSummary.authorName,
+              kind: 'text',
+              body: quotedSummary.body,
+              sequence: quotedSummary.sequence,
+            }
+          : undefined,
+      },
+    })
     await txClient.query('COMMIT')
+    nudgeRealtimeOutbox()
   } catch (e) {
     await txClient.query('ROLLBACK').catch(() => { /* already failed */ })
     throw e
   } finally {
     txClient.release()
   }
-  await pool.query(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, [convoId])
-
-  // Posting auto-acks me on this conversation (I clearly saw the messages I'm replying to)
-  await pool.query(
-    `INSERT INTO conversation_reads (user_id, conversation_id, last_read_at)
-     VALUES ($1, $2, NOW())
-     ON CONFLICT (user_id, conversation_id) DO UPDATE SET last_read_at = NOW()`,
-    [me, convoId],
-  )
+  // The row is durable now, so the phone can be told. Fire-and-forget for the
+  // same reason the HTTP route's dispatch is: a push must never hold up the
+  // reply. Without this an agent's answer reached the websocket and the desktop
+  // toast and no phone at all — the surface a human is on when they ask a
+  // question and lock the screen.
+  void dispatchMessagePush({
+    conversationId: convoId,
+    authorId: me,
+    messageId,
+    body: finalBody,
+    companyId,
+  })
   // Advance the Redis "seen" boundary to my own just-inserted seq, so the
   // freshness preflight on my NEXT cumora reply compares against the post-
   // insertion state (peer messages with seq <= mine are "things I obviously
   // saw"; only seq > mine would trip a HOLD). Pure Redis side-effect — does
   // NOT touch conversation_reads.last_read_at or anything else loadInbox
   // depends on.
-  await recordSeen(me, convoId, sequence)
+  await recordSeen(me, convoId, sequence).catch((error) => {
+    console.warn(`[reply] message ${messageId} committed but seen-boundary update failed`, error)
+  })
+  // Remember which run posted this, so the announce-then-deliver exemption
+  // above can recognise the delivery that follows an intent message — and
+  // stop recognising it after the second post.
+  if (turnRunId) await recordTurnPost(me, convoId, turnRunId)
   // Drop any lingering hold token: this send committed WITHOUT the
   // override, so a hold acknowledged-but-unused must not arm a later
   // preemptive --send-anyway in this conversation.
@@ -2048,27 +2449,6 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
   // worst case is the counter TTLs naturally in 45min.
   void (await import('./agenda.js')).resetStallNudgeDeclines(convoId)
 
-  // Broadcast — frontend, scheduler, etc. all listen on CH_MESSAGE_NEW
-  const { CH_MESSAGE_NEW, publish } = await import('../redis.js')
-  await publish(CH_MESSAGE_NEW, {
-    type: 'message.new',
-    conversationId: convoId,
-    companyId,
-    message: {
-      id: messageId, conversationId: convoId, authorId: me,
-      kind: 'text', body: finalBody, sequence, at: new Date().toISOString(),
-      attachment: attachment ?? undefined,
-      quotedMessageId: resolvedQuotedId ?? undefined,
-      quoted: quotedSummary ? {
-        id: quotedSummary.id,
-        authorId: quotedSummary.authorId,
-        authorName: quotedSummary.authorName,
-        kind: 'text',
-        body: quotedSummary.body,
-        sequence: quotedSummary.sequence,
-      } : undefined,
-    },
-  })
   const attachmentNote = attachment
     ? ` · attached ${attachment.kind} "${attachment.name}"`
     : ''
@@ -2137,8 +2517,12 @@ async function generateAndUploadImage(opts: {
   if (b64) {
     buf = Buffer.from(b64, 'base64')
   } else if (remoteUrl) {
-    const fetched = await fetch(remoteUrl)
-    buf = Buffer.from(await fetched.arrayBuffer())
+    const fetched = await fetchImageBytes(remoteUrl, {
+      maxBytes: 20 * 1024 * 1024,
+      timeoutMs: 30_000,
+    })
+    if (!fetched.ok) throw new Error(`image API download failed (${fetched.reason})`)
+    buf = fetched.buffer
   } else {
     throw new Error('image API returned no data')
   }
@@ -2300,39 +2684,6 @@ function extToMime(ext: string): string | null {
   }
 }
 
-/** Load a local file for use as an outbound email attachment. Reads the
- *  bytes off the agent's filesystem, uploads them to object storage under
- *  the `email-attachments/` prefix (same prefix the inbound webhook uses
- *  — keeps the renderer's JOIN agnostic to direction), and returns the
- *  combined metadata. The returned `base64` is what we hand to Resend;
- *  the `storageKey` + `publicUrl` are how the recipient's UI downloads
- *  the file after the fact. */
-async function loadEmailAttachmentFromPath(path: string): Promise<{
-  filename: string; mimeType: string; sizeBytes: number;
-  base64: string; storageKey: string; publicUrl: string;
-}> {
-  const fs = await import('node:fs/promises')
-  const nodePath = await import('node:path')
-  const cryptoMod = await import('node:crypto')
-  const MAX_BYTES = 20 * 1024 * 1024  // 20MB — matches Resend's per-attachment ceiling
-  const buf = await fs.readFile(path)
-  if (buf.length === 0) throw new Error(`empty file: ${path}`)
-  if (buf.length > MAX_BYTES) {
-    throw new Error(`file too large: ${buf.length} bytes (max ${MAX_BYTES})`)
-  }
-  const filename = nodePath.basename(path)
-  const ext = filename.includes('.') ? filename.split('.').pop()!.toLowerCase() : 'bin'
-  const mimeType = extToMime(ext) ?? 'application/octet-stream'
-  const id = cryptoMod.randomUUID().replace(/-/g, '')
-  const storageKey = `email-attachments/${id}${ext ? '.' + ext : ''}`
-  const publicUrl = await storage.put(storageKey, buf, mimeType)
-  return {
-    filename, mimeType, sizeBytes: buf.length,
-    base64: buf.toString('base64'),
-    storageKey, publicUrl,
-  }
-}
-
 /** Regenerate the calling agent's portrait via the image API. Composes
  *  the same prompt the HTTP endpoint uses, uploads to storage as
  *  `avatars/avatar-<id>-<rand>.png`, and stamps `participants.avatar_url`.
@@ -2429,7 +2780,7 @@ on demand via \`cumora skills read ${name} references/<file>\`._
     const r = await pool.query(
       `DELETE FROM agent_workspace
         WHERE agent_id = $1 AND (path = $2 OR path LIKE $3)`,
-      [me, `skills/${name}/SKILL.md`, `skills/${name}/%`],
+      [me, `skills/${name}/SKILL.md`, `skills/${likeLiteral(name)}/%`],
     )
     if ((r.rowCount ?? 0) === 0) return err(`no such skill: ${name}`)
     return ok(`deleted skill "${name}" (${r.rowCount} files removed)`, [{
@@ -2455,8 +2806,7 @@ on demand via \`cumora skills read ${name} references/<file>\`._
       // verbatim so the agent can paste/run it without thinking.
       return ok(hits.map((h) => {
         const meta = [h.version && `v${h.version}`, h.author && `by ${h.author}`].filter(Boolean).join(' · ')
-        const tag = h.install_url ?? h.name
-        return `  ${h.name}${meta ? `  (${meta})` : ''}\n    ${h.description}\n    → cumora skills install ${tag}`
+        return `  ${h.name}${meta ? `  (${meta})` : ''}\n    ${h.description}\n    → cumora skills install ${h.name}`
       }).join('\n\n'))
     } catch (e) {
       return err(`skills search failed: ${e instanceof Error ? e.message : String(e)}`)
@@ -2464,12 +2814,12 @@ on demand via \`cumora skills read ${name} references/<file>\`._
   }
 
   if (op === 'install') {
-    const idOrUrl = parsed.positional[1]
-    if (!idOrUrl) return err('usage: skills install <skill_id_or_install_url>')
+    const skillId = parsed.positional[1]
+    if (!skillId) return err('usage: skills install <skill_id>')
     try {
       const { env } = await import('../env.js')
       const { fetchSkillManifest, installSkillFromManifest } = await import('./skills.js')
-      const manifest = await fetchSkillManifest(idOrUrl, env.SKILLHUB_URL)
+      const manifest = await fetchSkillManifest(skillId, env.SKILLHUB_URL)
       const result = await installSkillFromManifest({ agentId: me, manifest })
       return ok(
         `installed skill "${result.name}" (${result.files} file${result.files === 1 ? '' : 's'})\n` +
@@ -2480,7 +2830,7 @@ on demand via \`cumora skills read ${name} references/<file>\`._
           agentId: me,
           skillName: result.name,
           fileCount: result.files,
-          source: idOrUrl,
+          source: skillId,
         }],
       )
     } catch (e) {
@@ -2494,7 +2844,7 @@ on demand via \`cumora skills read ${name} references/<file>\`._
     '  skills read <name> [<sub-path>]             load full SKILL.md (or a bundled file)\n' +
     '  skills create <name> "<description>"        scaffold a new skill\n' +
     '  skills search <query>                       search the configured SkillHub\n' +
-    '  skills install <id_or_url>                  install a skill from SkillHub (or any compatible URL)\n' +
+    '  skills install <id>                         install a skill from the configured SkillHub\n' +
     '  skills delete <name>                        remove a skill and all its files',
   )
 }
@@ -2523,8 +2873,10 @@ async function listEmailContacts(
   companyId: string,
   viewerId: string,
   query?: string,
+  client?: PoolClient,
 ): Promise<EmailContact[]> {
   const out: EmailContact[] = []
+  const db = client ?? pool
   const { computeAgentAddress } = await import('../email.js')
   // Optional fuzzy filter. Applied uniformly across name / id / email so a
   // single query like "wey" matches an agent's id, a human's display
@@ -2543,7 +2895,7 @@ async function listEmailContacts(
   // exposes a deterministic address for un-minted agents, so the CLI
   // contact list should match (otherwise a fresh agent is invisible until
   // someone has emailed them, which is the bootstrap chicken-and-egg).
-  const { rows: agents } = await pool.query<{ id: string; name: string; email: string | null; slug: string; role: string | null }>(
+  const { rows: agents } = await db.query<{ id: string; name: string; email: string | null; slug: string; role: string | null }>(
     `SELECT p.id, p.name, p.email, p.role, c.slug
        FROM participants p
        JOIN companies c ON c.id = p.company_id
@@ -2560,7 +2912,7 @@ async function listEmailContacts(
     if (matches(c)) out.push(c)
   }
   // 2. Workspace humans (auth email).
-  const { rows: humans } = await pool.query<{ id: string; display_name: string; email: string }>(
+  const { rows: humans } = await db.query<{ id: string; display_name: string; email: string }>(
     `SELECT u.id, u.display_name, u.email
        FROM users u
        JOIN company_members cm ON cm.user_id = u.id
@@ -2576,7 +2928,7 @@ async function listEmailContacts(
   // at the 30 most recent; with a filter we widen the net so a search
   // can find older correspondents too (still capped to keep memory bounded).
   const limit = q ? 200 : 30
-  const { rows: ext } = await pool.query<{ address: string; display_name: string | null; message_count: number }>(
+  const { rows: ext } = await db.query<{ address: string; display_name: string | null; message_count: number }>(
     `SELECT address, display_name, message_count FROM email_contacts
       WHERE company_id = $1
       ORDER BY last_seen_at DESC LIMIT $2`,
@@ -2657,19 +3009,24 @@ async function listAgentEmailThreads(args: {
   companyId: string
   unreadOnly: boolean
   limit: number
+  client?: PoolClient
 }): Promise<EmailThreadRow[]> {
   // Threads = email conversations the agent is in. We surface the latest
   // email_messages row per thread for the snippet, and an unread count
   // computed against conversation_reads.last_read_at (same source of
   // truth as the chat inbox uses). Keeps the agent's mental model
   // consistent: "unread" means "you haven't acked this thread since".
-  const { rows } = await pool.query<EmailThreadRow>(
+  const { rows } = await (args.client ?? pool).query<EmailThreadRow>(
     `WITH my_threads AS (
        SELECT c.id, c.title, c.updated_at
          FROM conversations c
         WHERE c.kind = 'email'
           AND c.company_id = $1
-          AND c.members @> to_jsonb(ARRAY[$2::text])
+          AND EXISTS (
+            SELECT 1 FROM conversation_members member
+             WHERE member.conversation_id = c.id
+               AND member.participant_id = $2
+          )
      ),
      last_msg AS (
        SELECT DISTINCT ON (em.conversation_id)
@@ -2830,9 +3187,22 @@ async function cmdPollShow(parsed: ParsedArgs, me: string, companyId: string): P
   const messageId = parsed.positional[1]
   if (!messageId) return err('usage: poll show <message_id>')
   const { rows } = await pool.query<{ poll: { question: string; mode: string; options: Array<{ id: string; text: string }>; expiresAt: string | null; closedAt: string | null } | null; author_id: string }>(
-    `SELECT poll, author_id FROM messages
-      WHERE id = $1 AND company_id = $2 AND kind = 'poll' LIMIT 1`,
-    [messageId, companyId],
+    `SELECT m.poll, m.author_id
+       FROM participants requester
+       JOIN conversations c
+         ON c.company_id = requester.company_id
+        AND EXISTS (
+          SELECT 1 FROM conversation_members member
+           WHERE member.conversation_id = c.id
+             AND member.participant_id = $3
+        )
+       JOIN messages m ON m.conversation_id = c.id AND m.company_id = c.company_id
+      WHERE m.id = $1 AND m.company_id = $2 AND m.kind = 'poll'
+        AND requester.id = $3
+        AND requester.kind = 'agent'
+        AND requester.departed_at IS NULL
+      LIMIT 1`,
+    [messageId, companyId, me],
   )
   const row = rows[0]
   if (!row || !row.poll) return err(`poll ${messageId} not found`)
@@ -2861,8 +3231,8 @@ async function cmdEmail(parsed: ParsedArgs): Promise<CliResult> {
   if (!sub) {
     return err(
       'usage:\n' +
-      '  email send --to <addr|id>[,<addr|id>...] [--cc <...>] --subject "..." --body "..." [--attach <path>[,<path>...]] [--as <id>]\n' +
-      '  email reply <message_id> --body "..." [--cc <addr|id>...] [--attach <path>[,<path>...]] [--as <id>]\n' +
+      '  email send --to <addr|id>[,<addr|id>...] [--cc <...>] --subject "..." --body "..." [--as <id>]\n' +
+      '  email reply <message_id> --body "..." [--cc <addr|id>...] [--as <id>]\n' +
       '  email inbox [--unread] [--limit N] [--as <id>]\n' +
       '  email show <conversation_id> [--tail N] [--as <id>]\n' +
       '  email contacts [<query>] [--as <id>]   (or just: cumora contacts [<query>])\n' +
@@ -2883,6 +3253,21 @@ async function cmdEmail(parsed: ParsedArgs): Promise<CliResult> {
     default:
       return err(`unknown email subcommand: ${sub}`)
   }
+}
+
+const EMAIL_ATTACHMENTS_UNSUPPORTED =
+  'outbound email attachments are not supported; --attach never accepts server filesystem paths'
+
+function rejectsEmailAttachmentFlags(parsed: ParsedArgs): CliResult | null {
+  if (
+    parsed.flags.attach ||
+    parsed.flags['attach-text'] ||
+    parsed.flags['attach-bytes'] ||
+    parsed.flags['generate-image']
+  ) {
+    return err(EMAIL_ATTACHMENTS_UNSUPPORTED)
+  }
+  return null
 }
 
 async function cmdEmailWhoami(me: string): Promise<CliResult> {
@@ -2908,7 +3293,14 @@ async function cmdEmailContacts(
   // — the agent's LLM uses this signal to ask the user for the address
   // instead of silently doing nothing.
   const query = parsed.positional[1]?.trim() ?? ''
-  const list = await listEmailContacts(companyId, me, query)
+  const lockedList = await withActiveParticipantLock({
+    participantId: me,
+    companyId,
+    kind: 'agent',
+    run: (client) => listEmailContacts(companyId, me, query, client),
+  })
+  if (!lockedList) return err(`cannot resolve active company for ${me}`)
+  const list = lockedList
   if (json) return ok(JSON.stringify(list, null, 2))
   if (list.length === 0) {
     const { env } = await import('../env.js')
@@ -2941,7 +3333,14 @@ async function cmdEmailContacts(
 async function cmdEmailInbox(parsed: ParsedArgs, me: string, companyId: string): Promise<CliResult> {
   const unread = Boolean(parsed.flags.unread)
   const limit = Math.min(50, Math.max(1, Number(parsed.flags.limit ?? 20)))
-  const threads = await listAgentEmailThreads({ agentId: me, companyId, unreadOnly: unread, limit })
+  const lockedThreads = await withActiveParticipantLock({
+    participantId: me,
+    companyId,
+    kind: 'agent',
+    run: (client) => listAgentEmailThreads({ agentId: me, companyId, unreadOnly: unread, limit, client }),
+  })
+  if (!lockedThreads) return err(`cannot resolve active company for ${me}`)
+  const threads = lockedThreads
   if (parsed.flags.json) return ok(JSON.stringify(threads, null, 2))
   if (threads.length === 0) {
     // Distinguish "feature not wired" from "feature wired, just empty" so
@@ -2976,49 +3375,55 @@ async function cmdEmailShow(parsed: ParsedArgs, me: string, companyId: string): 
   const convoId = parsed.positional[1]
   if (!convoId) return err('usage: email show <conversation_id> [--tail N]')
   const tail = Math.min(50, Math.max(1, Number(parsed.flags.tail ?? 10)))
-  // Confirm membership — agents can only read threads they're on.
-  const { rows: cv } = await pool.query<{ members: string[]; title: string }>(
-    `SELECT members, title FROM conversations
-      WHERE id = $1 AND company_id = $2 AND kind = 'email' LIMIT 1`,
-    [convoId, companyId],
-  )
-  if (!cv[0]) return err(`unknown email thread ${convoId}`)
-  if (!cv[0].members.includes(me)) return err(`${me} is not a member of ${convoId}`)
-  const { rows: msgs } = await pool.query<{
-    id: string; created_at: string; body: string; from_addr: string;
-    to_addrs: string[]; cc_addrs: string[]; subject: string;
-    smtp_message_id: string | null; in_reply_to: string | null;
-    direction: 'in' | 'out'; transport_status: string;
-  }>(
-    `SELECT m.id, m.created_at::text, m.body,
-            em.from_addr, em.to_addrs, em.cc_addrs, em.subject,
-            em.smtp_message_id, em.in_reply_to, em.direction, em.transport_status
-       FROM messages m
-       JOIN email_messages em ON em.message_id = m.id
-      WHERE m.conversation_id = $1
-      ORDER BY m.sequence DESC
-      LIMIT $2`,
-    [convoId, tail],
-  )
-  msgs.reverse()
-  if (parsed.flags.json) return ok(JSON.stringify({ thread: convoId, title: cv[0].title, messages: msgs }, null, 2))
-  if (msgs.length === 0) return ok(`(thread ${convoId} has no email messages)`)
-  const lines: string[] = [`thread ${convoId}  "${cv[0].title}"`, '']
-  for (const m of msgs) {
-    const at = new Date(m.created_at).toISOString().replace('T', ' ').slice(0, 16)
-    const arrow = m.direction === 'in' ? '↓ in' : '↑ out'
-    lines.push(`────  [${m.id}]  ${arrow}  ${m.transport_status}  ${at}`)
-    lines.push(`from:    ${m.from_addr}`)
-    if (m.to_addrs?.length) lines.push(`to:      ${m.to_addrs.join(', ')}`)
-    if (m.cc_addrs?.length) lines.push(`cc:      ${m.cc_addrs.join(', ')}`)
-    lines.push(`subject: ${m.subject}`)
-    if (m.in_reply_to) lines.push(`in-reply-to: <${m.in_reply_to}>`)
-    lines.push('')
-    lines.push(m.body)
-    lines.push('')
-  }
-  lines.push(`reply with \`cumora email reply ${msgs[msgs.length - 1].id} --body "..."\`.`)
-  return ok(lines.join('\n'))
+  const result = await withConversationActorLock({
+    participantId: me,
+    companyId,
+    conversationId: convoId,
+    kind: 'agent',
+    conversationKind: 'email',
+    run: async (client) => {
+      const { rows: cv } = await client.query<{ title: string }>(
+        `SELECT title FROM conversations WHERE id = $1 AND company_id = $2`,
+        [convoId, companyId],
+      )
+      const { rows: msgs } = await client.query<{
+        id: string; created_at: string; body: string; from_addr: string;
+        to_addrs: string[]; cc_addrs: string[]; subject: string;
+        smtp_message_id: string | null; in_reply_to: string | null;
+        direction: 'in' | 'out'; transport_status: string;
+      }>(
+        `SELECT m.id, m.created_at::text, m.body,
+                em.from_addr, em.to_addrs, em.cc_addrs, em.subject,
+                em.smtp_message_id, em.in_reply_to, em.direction, em.transport_status
+           FROM messages m
+           JOIN email_messages em ON em.message_id = m.id AND em.company_id = $3
+          WHERE m.conversation_id = $1 AND m.company_id = $3
+          ORDER BY m.sequence DESC
+          LIMIT $2`,
+        [convoId, tail, companyId],
+      )
+      msgs.reverse()
+      if (parsed.flags.json) return ok(JSON.stringify({ thread: convoId, title: cv[0].title, messages: msgs }, null, 2))
+      if (msgs.length === 0) return ok(`(thread ${convoId} has no email messages)`)
+      const lines: string[] = [`thread ${convoId}  "${cv[0].title}"`, '']
+      for (const m of msgs) {
+        const at = new Date(m.created_at).toISOString().replace('T', ' ').slice(0, 16)
+        const arrow = m.direction === 'in' ? '↓ in' : '↑ out'
+        lines.push(`────  [${m.id}]  ${arrow}  ${m.transport_status}  ${at}`)
+        lines.push(`from:    ${m.from_addr}`)
+        if (m.to_addrs?.length) lines.push(`to:      ${m.to_addrs.join(', ')}`)
+        if (m.cc_addrs?.length) lines.push(`cc:      ${m.cc_addrs.join(', ')}`)
+        lines.push(`subject: ${m.subject}`)
+        if (m.in_reply_to) lines.push(`in-reply-to: <${m.in_reply_to}>`)
+        lines.push('')
+        lines.push(m.body)
+        lines.push('')
+      }
+      lines.push(`reply with \`cumora email reply ${msgs[msgs.length - 1].id} --body "..."\`.`)
+      return ok(lines.join('\n'))
+    },
+  })
+  return result ?? err(`email thread ${convoId} not found or no longer authorized`)
 }
 
 async function cmdEmailSend(parsed: ParsedArgs, me: string, companyId: string): Promise<CliResult> {
@@ -3035,22 +3440,11 @@ async function cmdEmailSend(parsed: ParsedArgs, me: string, companyId: string): 
   } = await import('../email.js')
   const subject = sanitizeSubject(unescapeChat(String(parsed.flags.subject ?? '')))
   const body = unescapeChat(String(parsed.flags.body ?? '')).trim()
-  // --attach takes a comma-separated list of paths (also accepts the same
-  // flag repeated by the agent — bin/cumora collapses repeats into the
-  // last value, so comma is the supported multi-attach syntax here).
-  const attachRaw = parsed.flags.attach ? String(parsed.flags.attach) : ''
   if (!toRaw || !subject || !body) {
-    return err('usage: email send --to <addr|id>[,...] [--cc <...>] --subject "..." --body "..." [--attach <path>[,<path>...]]')
+    return err('usage: email send --to <addr|id>[,...] [--cc <...>] --subject "..." --body "..."')
   }
-  const attachPaths = attachRaw.split(',').map((s) => s.trim()).filter(Boolean)
-  const loadedAttachments: Awaited<ReturnType<typeof loadEmailAttachmentFromPath>>[] = []
-  for (const p of attachPaths) {
-    try {
-      loadedAttachments.push(await loadEmailAttachmentFromPath(p))
-    } catch (e) {
-      return err(`attachment ${p}: ${e instanceof Error ? e.message : String(e)}`)
-    }
-  }
+  const attachmentError = rejectsEmailAttachmentFlags(parsed)
+  if (attachmentError) return attachmentError
   const sender = await ensureAgentAddress(me)
   if (!sender) return err('agent has no email address (EMAIL_DOMAIN unset or company missing)')
 
@@ -3090,30 +3484,17 @@ async function cmdEmailSend(parsed: ParsedArgs, me: string, companyId: string): 
     memberIds: [...memberIds],
   })
 
-  // Call the provider FIRST so we record sent/failed accurately. If
-  // anything throws we still write a queued/failed row — the agent
-  // shouldn't lose the draft just because Resend hiccuped.
-  const sendRes = await sendViaProvider({
-    from: formatAddress(sender.email, sender.displayName),
-    to: toResolved.map((r) => formatAddress(r.addr, r.name)),
-    cc: ccResolved.length ? ccResolved.map((r) => formatAddress(r.addr, r.name)) : undefined,
-    subject,
-    text: body,
-    messageId,
-    autoSubmitted: 'auto-generated',
-    attachments: loadedAttachments.map((a) => ({
-      filename: a.filename, mimeType: a.mimeType, base64: a.base64,
-    })),
-  })
-
+  // WRITE-FIRST: persist an authorized durable row before the network hop.
+  // persistEmailMessage locks the active author and current conversation
+  // membership in its transaction, so a revoked actor never reaches Resend.
   const persisted = await persistEmailMessage({
     conversationId: conv.conversationId,
     companyId,
     authorId: me,
     direction: 'out',
-    transportStatus: sendRes.ok ? 'sent' : 'failed',
-    transportError: sendRes.error,
-    smtpMessageId: sendRes.smtpMessageId ?? messageId,
+    transportStatus: 'sending',
+    transportError: null,
+    smtpMessageId: messageId,
     inReplyTo: null,
     references: [],
     subject,
@@ -3122,10 +3503,30 @@ async function cmdEmailSend(parsed: ParsedArgs, me: string, companyId: string): 
     ccAddrs: ccResolved.map((r) => formatAddress(r.addr, r.name)),
     body,
     autoSubmitted: true,
-    attachments: loadedAttachments.map((a) => ({
-      filename: a.filename, mimeType: a.mimeType, sizeBytes: a.sizeBytes,
-      storageKey: a.storageKey,
-    })),
+  })
+
+  const sendRes = await sendViaProvider({
+    from: formatAddress(sender.email, sender.displayName),
+    to: toResolved.map((r) => formatAddress(r.addr, r.name)),
+    cc: ccResolved.length ? ccResolved.map((r) => formatAddress(r.addr, r.name)) : undefined,
+    subject,
+    text: body,
+    messageId,
+    autoSubmitted: 'auto-generated',
+  })
+  const finalStatus = sendRes.ok ? 'sent' : 'failed'
+  await pool.query(
+    `UPDATE email_messages
+        SET transport_status = $1, transport_error = $2,
+            smtp_message_id = $3, next_retry_at = $4
+      WHERE message_id = $5 AND company_id = $6`,
+    [
+      finalStatus, sendRes.error, sendRes.smtpMessageId ?? messageId,
+      finalStatus === 'failed' ? new Date(Date.now() + 60_000) : null,
+      persisted.messageId, companyId,
+    ],
+  ).catch((error) => {
+    console.warn(`[email] post-send UPDATE failed for ${persisted.messageId}; retry worker will reconcile`, error)
   })
 
   if (!sendRes.ok) {
@@ -3142,7 +3543,7 @@ async function cmdEmailSend(parsed: ParsedArgs, me: string, companyId: string): 
     subject,
     to: toResolved.map((r) => r.addr),
     cc: ccResolved.map((r) => r.addr),
-    attachmentCount: loadedAttachments.length,
+    attachmentCount: 0,
     transportStatus: 'sent',
     mock: sendRes.mock,
     visibleToUser: true,
@@ -3152,18 +3553,17 @@ async function cmdEmailSend(parsed: ParsedArgs, me: string, companyId: string): 
 async function cmdEmailReply(parsed: ParsedArgs, me: string, companyId: string): Promise<CliResult> {
   const replyTo = parsed.positional[1]
   const body = unescapeChat(String(parsed.flags.body ?? '')).trim()
-  const attachRaw = parsed.flags.attach ? String(parsed.flags.attach) : ''
-  if (!replyTo || !body) return err('usage: email reply <message_id> --body "..." [--cc <addr|id>...] [--attach <path>[,<path>...]]')
-  const attachPaths = attachRaw.split(',').map((s) => s.trim()).filter(Boolean)
-  const loadedAttachments: Awaited<ReturnType<typeof loadEmailAttachmentFromPath>>[] = []
-  for (const p of attachPaths) {
-    try {
-      loadedAttachments.push(await loadEmailAttachmentFromPath(p))
-    } catch (e) {
-      return err(`attachment ${p}: ${e instanceof Error ? e.message : String(e)}`)
-    }
-  }
-  // Pull the original email row and its conversation context.
+  if (!replyTo || !body) return err('usage: email reply <message_id> --body "..." [--cc <addr|id>...]')
+  const attachmentError = rejectsEmailAttachmentFlags(parsed)
+  if (attachmentError) return attachmentError
+  const {
+    ensureAgentAddress, formatAddress,
+    sendViaProvider, persistEmailMessage, mintMessageId, normalizeMessageId,
+    sanitizeSubject, splitReplyAddresses,
+  } = await import('../email.js')
+  const sender = await ensureAgentAddress(me)
+  if (!sender) return err('agent has no email address (EMAIL_DOMAIN unset or company missing)')
+
   const { rows: orig } = await pool.query<{
     conversation_id: string
     smtp_message_id: string | null
@@ -3180,21 +3580,6 @@ async function cmdEmailReply(parsed: ParsedArgs, me: string, companyId: string):
   )
   if (!orig[0]) return err(`unknown email message ${replyTo}`)
   const o = orig[0]
-  // Confirm membership — same gate as `email show`.
-  const { rows: cv } = await pool.query<{ members: string[] }>(
-    `SELECT members FROM conversations WHERE id = $1`, [o.conversation_id],
-  )
-  if (!cv[0] || !cv[0].members.includes(me)) {
-    return err(`${me} is not a member of thread ${o.conversation_id}`)
-  }
-
-  const {
-    ensureAgentAddress, formatAddress,
-    sendViaProvider, persistEmailMessage, mintMessageId, normalizeMessageId,
-    sanitizeSubject, splitReplyAddresses,
-  } = await import('../email.js')
-  const sender = await ensureAgentAddress(me)
-  if (!sender) return err('agent has no email address (EMAIL_DOMAIN unset or company missing)')
 
   // Reply-all split: TO = original From, CC = original To+Cc minus self.
   // Earlier iterations collapsed everyone into TO; that read fine but
@@ -3241,6 +3626,27 @@ async function cmdEmailReply(parsed: ParsedArgs, me: string, companyId: string):
   const inReplyTo = o.smtp_message_id ? normalizeMessageId(o.smtp_message_id) : null
   const messageId = mintMessageId()
 
+  // WRITE-FIRST. This is the authorization boundary: persistEmailMessage
+  // locks the current participant and verifies current conversation
+  // membership before committing the durable outbound row.
+  const persisted = await persistEmailMessage({
+    conversationId: o.conversation_id,
+    companyId,
+    authorId: me,
+    direction: 'out',
+    transportStatus: 'sending',
+    transportError: null,
+    smtpMessageId: messageId,
+    inReplyTo,
+    references: newReferences,
+    subject,
+    fromAddr: formatAddress(sender.email, sender.displayName),
+    toAddrs,
+    ccAddrs: ccCombined,
+    body,
+    autoSubmitted: true,
+  })
+
   const sendRes = await sendViaProvider({
     from: formatAddress(sender.email, sender.displayName),
     to: toAddrs,
@@ -3251,31 +3657,20 @@ async function cmdEmailReply(parsed: ParsedArgs, me: string, companyId: string):
     references: newReferences,
     messageId,
     autoSubmitted: 'auto-replied',
-    attachments: loadedAttachments.map((a) => ({
-      filename: a.filename, mimeType: a.mimeType, base64: a.base64,
-    })),
   })
-
-  const persisted = await persistEmailMessage({
-    conversationId: o.conversation_id,
-    companyId,
-    authorId: me,
-    direction: 'out',
-    transportStatus: sendRes.ok ? 'sent' : 'failed',
-    transportError: sendRes.error,
-    smtpMessageId: sendRes.smtpMessageId ?? messageId,
-    inReplyTo,
-    references: newReferences,
-    subject,
-    fromAddr: formatAddress(sender.email, sender.displayName),
-    toAddrs,
-    ccAddrs: ccCombined,
-    body,
-    autoSubmitted: true,
-    attachments: loadedAttachments.map((a) => ({
-      filename: a.filename, mimeType: a.mimeType, sizeBytes: a.sizeBytes,
-      storageKey: a.storageKey,
-    })),
+  const finalStatus = sendRes.ok ? 'sent' : 'failed'
+  await pool.query(
+    `UPDATE email_messages
+        SET transport_status = $1, transport_error = $2,
+            smtp_message_id = $3, next_retry_at = $4
+      WHERE message_id = $5 AND company_id = $6`,
+    [
+      finalStatus, sendRes.error, sendRes.smtpMessageId ?? messageId,
+      finalStatus === 'failed' ? new Date(Date.now() + 60_000) : null,
+      persisted.messageId, companyId,
+    ],
+  ).catch((error) => {
+    console.warn(`[email] post-send UPDATE failed for ${persisted.messageId}; retry worker will reconcile`, error)
   })
 
   // Auto-ack — replying definitionally means I read the original.
@@ -3299,7 +3694,7 @@ async function cmdEmailReply(parsed: ParsedArgs, me: string, companyId: string):
     subject,
     to: toAddrs,
     cc: ccCombined,
-    attachmentCount: loadedAttachments.length,
+    attachmentCount: 0,
     transportStatus: 'sent',
     mock: sendRes.mock,
     visibleToUser: true,
@@ -3405,13 +3800,20 @@ async function setAgentAvatarFromUrl(args: {
     throw new Error('avatar source must be an http(s) URL')
   }
   const MAX_BYTES = 8 * 1024 * 1024  // 8MB ceiling for portraits
-  const fetched = await fetch(args.sourceUrl, { signal: AbortSignal.timeout(15_000) })
-  if (!fetched.ok) throw new Error(`source URL returned ${fetched.status}`)
-  const mime = (fetched.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase()
-  if (!mime.startsWith('image/')) throw new Error(`source URL is not an image (content-type: ${mime || 'unknown'})`)
-  const buf = Buffer.from(await fetched.arrayBuffer())
+  const fetched = await fetchImageBytes(args.sourceUrl, {
+    maxBytes: MAX_BYTES,
+    timeoutMs: 15_000,
+  })
+  if (!fetched.ok) {
+    if (fetched.reason === 'http') throw new Error(`source URL returned ${fetched.status ?? 'an error'}`)
+    if (fetched.reason === 'bad-type') throw new Error('source URL is not an image')
+    if (fetched.reason === 'too-large') throw new Error(`source image exceeds ${MAX_BYTES} bytes`)
+    if (fetched.reason === 'blocked') throw new Error('source URL is not allowed')
+    if (fetched.reason === 'timeout') throw new Error('source URL timed out')
+    throw new Error('source URL could not be fetched')
+  }
+  const { buffer: buf, mime } = fetched
   if (buf.length === 0) throw new Error('source image is empty')
-  if (buf.length > MAX_BYTES) throw new Error(`source image too large (${buf.length} > ${MAX_BYTES})`)
 
   // Pick a sensible extension from the mime so the stored object has a
   // useful filename and the Worker serves the right content-type.
@@ -3425,19 +3827,20 @@ async function setAgentAvatarFromUrl(args: {
   const key = `avatars/avatar-${args.agentId}-${randomUUID().slice(0, 8)}.${ext}`
   const url = await storage.put(key, buf, mime)
 
-  await pool.query(
-    `UPDATE participants SET avatar_url = $2 WHERE id = $1 AND company_id = $3`,
-    [args.agentId, url, args.tenant],
-  )
+  await withOutboxTransaction(async (client) => {
+    await client.query(
+      `UPDATE participants SET avatar_url = $2 WHERE id = $1 AND company_id = $3`,
+      [args.agentId, url, args.tenant],
+    )
+    await enqueueBroadcast(client, CH_STATUS, {
+      type: 'participants.avatar',
+      participantId: args.agentId,
+      avatarUrl: url,
+      companyId: args.tenant,
+    })
+  })
   const { invalidatePersonaCache } = await import('./personas.js')
   invalidatePersonaCache(args.agentId)
-  const { CH_STATUS, publish } = await import('../redis.js')
-  await publish(CH_STATUS, {
-    type: 'participants.avatar',
-    participantId: args.agentId,
-    avatarUrl: url,
-    companyId: args.tenant,
-  })
   return { url }
 }
 
@@ -3469,12 +3872,28 @@ async function saveTextAttachment(
 }
 
 async function cmdTopicRead(parsed: ParsedArgs): Promise<CliResult> {
+  const me = resolveAs(parsed)
   const convoId = parsed.positional[0]
   if (!convoId) return err('usage: topic <conversation_id>')
+  const activeAgentCompanyId = await agentCompany(me)
   const { rows } = await pool.query<{ topic: string | null; title: string }>(
-    `SELECT topic, title FROM conversations WHERE id = $1`, [convoId],
+    `SELECT c.topic, c.title
+       FROM conversations c
+       JOIN participants requester
+         ON requester.id = $2
+        AND requester.company_id = c.company_id
+        AND requester.kind IN ('agent', 'human')
+        AND requester.departed_at IS NULL
+      WHERE c.id = $1
+        AND ($3::text IS NULL OR c.company_id = $3)
+        AND EXISTS (
+          SELECT 1 FROM conversation_members member
+           WHERE member.conversation_id = c.id
+             AND member.participant_id = $2
+        )`,
+    [convoId, me, activeAgentCompanyId],
   )
-  if (!rows[0]) return err(`unknown conversation ${convoId}`)
+  if (!rows[0]) return err(`conversation ${convoId} not found or no longer authorized`)
   const t = rows[0].topic
   if (!t) return ok(`(no topic set on "${rows[0].title}")`)
   return ok(t)
@@ -3486,30 +3905,56 @@ async function cmdTopicSet(parsed: ParsedArgs): Promise<CliResult> {
   if (!convoId) return err('usage: topic-set <conversation_id> "<text>"  (empty body clears the topic)')
   const raw = unescapeChat(parsed.positional.slice(1).join(' ')).trim()
   const topic = raw.length > 0 ? raw.slice(0, 200) : null
+  const activeAgentCompanyId = await agentCompany(me)
 
-  const { rows } = await pool.query<{ members: string[]; company_id: string }>(
-    `SELECT members, company_id FROM conversations WHERE id = $1`, [convoId],
+  const { rows: preflight } = await pool.query<{ company_id: string }>(
+    `SELECT c.company_id
+       FROM conversations c
+       JOIN participants requester
+         ON requester.id = $2
+        AND requester.company_id = c.company_id
+        AND requester.kind IN ('agent', 'human')
+        AND requester.departed_at IS NULL
+      WHERE c.id = $1
+        AND ($3::text IS NULL OR c.company_id = $3)
+        AND EXISTS (
+          SELECT 1 FROM conversation_members member
+           WHERE member.conversation_id = c.id
+             AND member.participant_id = $2
+        )`,
+    [convoId, me, activeAgentCompanyId],
   )
-  if (!rows[0]) return err(`unknown conversation ${convoId}`)
-  if (!rows[0].members.includes(me)) return err(`${me} is not a member of ${convoId}`)
-
-  await pool.query(
-    `UPDATE conversations SET topic = $2, updated_at = NOW() WHERE id = $1`,
-    [convoId, topic],
-  )
-  const { CH_CONVO_UPDATED, publish } = await import('../redis.js')
-  await publish(CH_CONVO_UPDATED, {
-    type: 'conversation.updated',
+  if (!preflight[0]) return err(`conversation ${convoId} not found or no longer authorized`)
+  const updated = await withConversationActorLock({
+    participantId: me,
+    companyId: preflight[0].company_id,
     conversationId: convoId,
-    companyId: rows[0].company_id,
-    patch: { topic },
+    run: async (client) => {
+      const result = await client.query<{ company_id: string }>(
+        `UPDATE conversations SET topic = $2, updated_at = NOW()
+          WHERE id = $1 AND company_id = $3
+          RETURNING company_id`,
+        [convoId, topic, preflight[0].company_id],
+      )
+      if (result.rows[0]) {
+        await enqueueBroadcast(client, CH_CONVO_UPDATED, {
+          type: 'conversation.updated',
+          conversationId: convoId,
+          companyId: result.rows[0].company_id,
+          patch: { topic },
+        })
+      }
+      return result
+    },
   })
+  const companyId = updated?.rows[0]?.company_id
+  if (!companyId) return err(`conversation ${convoId} not found or no longer authorized`)
   return ok(topic ? `topic set: "${topic}"` : '(topic cleared)', [{
     event: 'conversation.topic_updated',
     command: 'topic-set',
     conversationId: convoId,
     actorId: me,
-    companyId: rows[0].company_id,
+    companyId,
     topic,
     visibleToUser: true,
   }])
@@ -3523,13 +3968,27 @@ async function cmdRename(parsed: ParsedArgs): Promise<CliResult> {
   if (!convoId) return err('usage: rename <conversation_id> "<new title>"')
   const title = unescapeChat(parsed.positional.slice(1).join(' ')).trim().slice(0, 80)
   if (!title) return err('rename requires a non-empty title')
+  const activeAgentCompanyId = await agentCompany(me)
 
   const { rows } = await pool.query<{ members: string[]; kind: string; company_id: string; title: string }>(
-    `SELECT members, kind, company_id, title FROM conversations WHERE id = $1`, [convoId],
+    `SELECT c.members, c.kind, c.company_id, c.title
+       FROM conversations c
+       JOIN participants requester
+         ON requester.id = $2
+        AND requester.company_id = c.company_id
+        AND requester.kind IN ('agent', 'human')
+        AND requester.departed_at IS NULL
+      WHERE c.id = $1
+        AND ($3::text IS NULL OR c.company_id = $3)
+        AND EXISTS (
+          SELECT 1 FROM conversation_members member
+           WHERE member.conversation_id = c.id
+             AND member.participant_id = $2
+        )`,
+    [convoId, me, activeAgentCompanyId],
   )
-  if (!rows[0]) return err(`unknown conversation ${convoId}`)
+  if (!rows[0]) return err(`conversation ${convoId} not found or no longer authorized`)
   if (rows[0].kind !== 'group') return err(`only group chats can be renamed (${convoId} is a ${rows[0].kind})`)
-  if (!rows[0].members.includes(me)) return err(`${me} is not a member of ${convoId}`)
   const currentTitle = rows[0].title
 
   // Optimistic-concurrency: --if-equals "<expected current title>" lets a caller
@@ -3554,17 +4013,30 @@ async function cmdRename(parsed: ParsedArgs): Promise<CliResult> {
     return ok(`(no-op — title was already "${title}")`)
   }
 
-  await pool.query(
-    `UPDATE conversations SET title = $2, updated_at = NOW() WHERE id = $1`,
-    [convoId, title],
-  )
-  const { CH_CONVO_UPDATED, publish } = await import('../redis.js')
-  await publish(CH_CONVO_UPDATED, {
-    type: 'conversation.updated',
-    conversationId: convoId,
+  const updated = await withConversationActorLock({
+    participantId: me,
     companyId: rows[0].company_id,
-    patch: { title },
+    conversationId: convoId,
+    run: async (client) => {
+      const result = await client.query(
+        `UPDATE conversations
+            SET title = $2, updated_at = NOW()
+          WHERE id = $1 AND company_id = $3
+            AND kind = 'group' AND title = $4`,
+        [convoId, title, rows[0].company_id, currentTitle],
+      )
+      if (result.rowCount) {
+        await enqueueBroadcast(client, CH_CONVO_UPDATED, {
+          type: 'conversation.updated',
+          conversationId: convoId,
+          companyId: rows[0].company_id,
+          patch: { title },
+        })
+      }
+      return result
+    },
   })
+  if (!updated?.rowCount) return err(`conversation ${convoId} changed or is no longer authorized; rename cancelled`)
   return ok(`renamed to "${title}" (${convoId})`, [{
     event: 'conversation.renamed',
     command: 'rename',
@@ -3593,6 +4065,22 @@ function normalizeMemoryKind(raw: unknown): MemoryKind {
  *  in the `meta` JSONB column. New writes stamp `source.conversationId` /
  *  `source.projectId` (issue #45); existing `source: null` rows stay GLOBAL
  *  — we never guess-migrate them into a project. See memory-scope.ts. */
+/** Escape LIKE metacharacters in a value that must match LITERALLY.
+ *
+ *  These patterns are built from a positional argument the MODEL supplies, and
+ *  `%` and `_` are wildcards to LIKE. `cumora memory delete %` became
+ *  `path LIKE 'memory/%/%.md'` and removed every memory the agent had, then
+ *  reported "deleted %" — verified against Postgres 16: three rows in, DELETE 3,
+ *  none left. `cumora skills delete %` is the same shape one command over.
+ *
+ *  Postgres's default LIKE escape is a backslash, and the pattern reaches it as
+ *  a bound parameter, so escaping here is sufficient — no ESCAPE clause needed.
+ *  Confirmed: `'…mem-aaa.md' LIKE 'memory/%/\%.md'` is false once escaped, and
+ *  a literal `%` in a name still matches itself. */
+export function likeLiteral(value: string): string {
+  return value.replace(/[\\%_]/g, (ch) => `\\${ch}`)
+}
+
 async function cmdMemory(parsed: ParsedArgs): Promise<CliResult> {
   const op = parsed.positional[0]
   const me = resolveAs(parsed)
@@ -3614,7 +4102,7 @@ async function cmdMemory(parsed: ParsedArgs): Promise<CliResult> {
     const limit = Math.min(100, Math.max(1, Number(parsed.flags.limit ?? 20)))
     // Fetch extra rows so in-memory project filtering can still fill `limit`.
     // `--all` is the only path that skips isolation.
-    const fetchLimit = Boolean(parsed.flags.all) ? limit : Math.min(500, Math.max(limit * 10, 100))
+    const fetchLimit = parsed.flags.all ? limit : Math.min(500, Math.max(limit * 10, 100))
     params.push(fetchLimit)
     const limitParam = `$${params.length}`
     const { rows } = await pool.query<{
@@ -3662,7 +4150,7 @@ async function cmdMemory(parsed: ParsedArgs): Promise<CliResult> {
         const t = new Date(m.created_at).toLocaleDateString()
         const pin = m.pinned ? '★ ' : '  '
         const proj = m.projectId ? ` proj:${m.projectId}` : ' global'
-        return `  ${pin}[${m.id.slice(0, 10)}] ${m.kind.padEnd(11)} ${(m.about ?? '-').padEnd(10)} ${t}${proj}\n      ${m.body.slice(0, 280).replace(/\n/g, ' \\n ')}`
+        return `  ${pin}[${m.id}] ${m.kind.padEnd(11)} ${(m.about ?? '-').padEnd(10)} ${t}${proj}\n      ${m.body.slice(0, 280).replace(/\n/g, ' \\n ')}`
       }),
     ].join('\n'))
   }
@@ -3698,8 +4186,8 @@ async function cmdMemory(parsed: ParsedArgs): Promise<CliResult> {
       )
     }
     await pool.query(
-      `INSERT INTO agent_log (id, agent_id, kind, body, ref) VALUES ($1, $2, 'note', $3, $4::jsonb)`,
-      [`log-${randomUUID().slice(0, 12)}`, me, `noted: ${body.slice(0, 120)}`, JSON.stringify({ memoryId: id, path })],
+      `INSERT INTO agent_log (id, agent_id, company_id, kind, body, ref) VALUES ($1, $2, $3, 'note', $4, $5::jsonb)`,
+      [`log-${randomUUID().slice(0, 12)}`, me, tenant, `noted: ${body.slice(0, 120)}`, JSON.stringify({ memoryId: id, path })],
     )
     return ok(`saved memory ${id}`, [{
       event: 'memory.written',
@@ -3720,7 +4208,7 @@ async function cmdMemory(parsed: ParsedArgs): Promise<CliResult> {
                    || jsonb_build_object('pinned', NOT COALESCE((meta->>'pinned')::boolean, false))
         WHERE agent_id = $1 AND path LIKE $2
         RETURNING meta`,
-      [me, `memory/%/${id}.md`],
+      [me, `memory/%/${likeLiteral(id)}.md`],
     )
     if ((r.rowCount ?? 0) === 0) return err(`no memory ${id} for ${me}`)
     return ok(`pinned: ${r.rows[0].meta?.pinned}`, [{
@@ -3736,7 +4224,7 @@ async function cmdMemory(parsed: ParsedArgs): Promise<CliResult> {
     if (!id) return err('usage: memory delete <id>')
     const r = await pool.query(
       `DELETE FROM agent_workspace WHERE agent_id = $1 AND path LIKE $2`,
-      [me, `memory/%/${id}.md`],
+      [me, `memory/%/${likeLiteral(id)}.md`],
     )
     if ((r.rowCount ?? 0) === 0) return err(`no memory ${id} for ${me}`)
     return ok(`deleted ${id}`, [{
@@ -3819,16 +4307,18 @@ async function cmdClimate(parsed: ParsedArgs): Promise<CliResult> {
       ...prevHistory.slice(-19),
       { at: new Date().toISOString(), affinity: nextAffinity, trust: nextTrust, note: note.slice(0, 400) },
     ]
+    const tenant = (await agentCompany(me)) ?? 'personal'
     await pool.query(
-      `INSERT INTO agent_climate (agent_id, about_id, affinity, trust, last_note, history, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb, NOW())
+      `INSERT INTO agent_climate (agent_id, about_id, company_id, affinity, trust, last_note, history, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, NOW())
        ON CONFLICT (agent_id, about_id) DO UPDATE
-         SET affinity = EXCLUDED.affinity,
+         SET company_id = EXCLUDED.company_id,
+             affinity = EXCLUDED.affinity,
              trust    = EXCLUDED.trust,
              last_note = EXCLUDED.last_note,
              history   = EXCLUDED.history,
              updated_at = NOW()`,
-      [me, aboutId, nextAffinity, nextTrust, note.slice(0, 400), JSON.stringify(newHistory)],
+      [me, aboutId, tenant, nextAffinity, nextTrust, note.slice(0, 400), JSON.stringify(newHistory)],
     )
     return ok(`climate updated: ${me} → ${aboutId}  affinity=${nextAffinity.toFixed(2)}  trust=${nextTrust.toFixed(2)}`, [{
       event: 'climate.updated',
@@ -3866,9 +4356,10 @@ async function cmdLog(parsed: ParsedArgs): Promise<CliResult> {
     const body = parsed.positional[1]
     if (!body) return err('usage: log note <body> [--as id]')
     const id = `log-${randomUUID().slice(0, 12)}`
+    const tenant = await agentCompany(me)
     await pool.query(
-      `INSERT INTO agent_log (id, agent_id, kind, body) VALUES ($1, $2, 'note', $3)`,
-      [id, me, body],
+      `INSERT INTO agent_log (id, agent_id, company_id, kind, body) VALUES ($1, $2, $3, 'note', $4)`,
+      [id, me, tenant, body],
     )
     return ok(`logged ${id}`)
   }
@@ -4044,8 +4535,8 @@ async function cmdTasks(parsed: ParsedArgs): Promise<CliResult> {
     if (!title) return err('usage: tasks add <title> [--as id]')
     const id = `task-${randomUUID().slice(0, 12)}`
     await pool.query(
-      `INSERT INTO agent_tasks (id, agent_id, title) VALUES ($1, $2, $3)`,
-      [id, me, title],
+      `INSERT INTO agent_tasks (id, agent_id, company_id, title) VALUES ($1, $2, $3, $4)`,
+      [id, me, companyId, title],
     )
     return ok(`added task ${id}: ${title}`, [{
       event: 'task.created',
@@ -4090,10 +4581,6 @@ async function cmdTasks(parsed: ParsedArgs): Promise<CliResult> {
  * tasks/email above.
  */
 
-/** Best-effort WS broadcast for a calendar row change initiated by the
- *  agent CLI. Mirrors the REST `publishCalendarChange` helper in
- *  router.ts so the desktop client patches its Calendar view in real
- *  time whether the change came from a human (HTTP) or an agent (CLI). */
 /** Visibility predicate for the agent CLI. Mirrors the REST helper but
  *  with one simplification: agents can't be company owners, so the
  *  owner-override branch never applies — the predicate collapses to the
@@ -4103,14 +4590,14 @@ function cliCalendarVisibilityClause(meIdx: number): string {
   return `(is_private = false OR created_by = $${meIdx} OR assignee_id = $${meIdx})`
 }
 
-async function publishCalendarCli(args: {
+/** Queue the calendar invalidation alongside the CLI mutation. */
+async function enqueueCalendarCli(db: PoolClient, args: {
   companyId: string
   kind: 'event.created' | 'event.updated' | 'event.deleted' | 'event.dispatched'
   eventId: string
   actorId: string
 }): Promise<void> {
-  const { CH_CALENDAR_EVENTS, publish } = await import('../redis.js')
-  await publish(CH_CALENDAR_EVENTS, {
+  await enqueueBroadcast(db, CH_CALENDAR_EVENTS, {
     type: 'calendar.changed',
     companyId: args.companyId,
     kind: args.kind,
@@ -4264,17 +4751,19 @@ async function cmdCalendar(parsed: ParsedArgs): Promise<CliResult> {
         }
       }
       const id = `ce-${randomUUID()}`
-      await pool.query(
-        `INSERT INTO calendar_events
-           (id, company_id, created_by, kind, title, assignee_id,
-            target_conversation_id, agent_prompt, start_at, recurrence,
-            reminder_minutes_before, reminder_channel, status, is_private)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,'active',$13)`,
-        [id, companyId, me, kind, title, assigneeId, targetConvo, agentPrompt, start,
-         recurrence ? JSON.stringify(recurrence) : null,
-         reminderMinutes, reminderChannel, isPrivate],
-      )
-      await publishCalendarCli({ companyId, kind: 'event.created', eventId: id, actorId: me })
+      await withOutboxTransaction(async (client) => {
+        await client.query(
+          `INSERT INTO calendar_events
+             (id, company_id, created_by, kind, title, assignee_id,
+              target_conversation_id, agent_prompt, start_at, recurrence,
+              reminder_minutes_before, reminder_channel, status, is_private)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,'active',$13)`,
+          [id, companyId, me, kind, title, assigneeId, targetConvo, agentPrompt, start,
+           recurrence ? JSON.stringify(recurrence) : null,
+           reminderMinutes, reminderChannel, isPrivate],
+        )
+        await enqueueCalendarCli(client, { companyId, kind: 'event.created', eventId: id, actorId: me })
+      })
       return ok(`scheduled ${id}: "${title}" at ${start.toISOString()}${recurrence ? ` · every ${recurrence.interval} ${recurrence.freq}` : ''}${assigneeId ? ` → @${assigneeId}` : ''}${reminderMinutes != null ? ` · remind ${reminderMinutes}m before (${reminderChannel})` : ''}${isPrivate ? ' · 🔒 private' : ''}`, [{
         event: 'calendar.event_created',
         command: 'calendar create',
@@ -4403,18 +4892,23 @@ async function cmdCalendar(parsed: ParsedArgs): Promise<CliResult> {
     if (sets.length === 0) return err('nothing to update — pass at least one calendar field flag')
     sets.push('updated_at = NOW()')
     params.push(id, companyId)
-    const { rows } = await pool.query<{
-      id: string; title: string; kind: string; status: string;
-      assignee_id: string | null; target_conversation_id: string | null; start_at: Date
-    }>(
-      `UPDATE calendar_events SET ${sets.join(', ')}
-        WHERE id = $${params.length - 1} AND company_id = $${params.length}
-        RETURNING id, title, kind, status, assignee_id, target_conversation_id, start_at`,
-      params,
-    )
+    const rows = await withOutboxTransaction(async (client) => {
+      const updated = await client.query<{
+        id: string; title: string; kind: string; status: string;
+        assignee_id: string | null; target_conversation_id: string | null; start_at: Date
+      }>(
+        `UPDATE calendar_events SET ${sets.join(', ')}
+          WHERE id = $${params.length - 1} AND company_id = $${params.length}
+          RETURNING id, title, kind, status, assignee_id, target_conversation_id, start_at`,
+        params,
+      )
+      if (updated.rows[0]) {
+        await enqueueCalendarCli(client, { companyId, kind: 'event.updated', eventId: id, actorId: me })
+      }
+      return updated.rows
+    })
     const row = rows[0]
     if (!row) return err(`no event ${id}`)
-    await publishCalendarCli({ companyId, kind: 'event.updated', eventId: id, actorId: me })
     return ok(`updated ${id}: "${row.title}" at ${row.start_at.toISOString()} (${row.status})`, [{
       event: 'calendar.event_updated',
       command: `calendar ${op}`,
@@ -4449,7 +4943,10 @@ async function cmdCalendar(parsed: ParsedArgs): Promise<CliResult> {
     if (!rows[0]) return err(`no event ${id}`)
     const { dispatchEvent } = await import('../calendar.js')
     const result = await dispatchEvent(rows[0] as import('../calendar.js').CalendarEventRow, new Date())
-    await publishCalendarCli({ companyId, kind: 'event.dispatched', eventId: id, actorId: me })
+    await withOutboxTransaction((client) => enqueueCalendarCli(
+      client,
+      { companyId, kind: 'event.dispatched', eventId: id, actorId: me },
+    ))
     return ok(`dispatched ${id}: ${JSON.stringify(result)}`, [{
       event: 'calendar.event_dispatched',
       command: 'calendar run-now',
@@ -4494,24 +4991,29 @@ async function cmdCalendar(parsed: ParsedArgs): Promise<CliResult> {
     // to "no event found" regardless of whether the row is missing or
     // privacy-filtered, so we don't leak existence to non-authorized
     // callers.
-    const r = await pool.query(
-      op === 'delete'
-        ? `DELETE FROM calendar_events
-            WHERE id = $1 AND company_id = $2 AND ${cliCalendarVisibilityClause(3)}`
-        : `UPDATE calendar_events SET status = 'cancelled', updated_at = NOW()
-            WHERE id = $1 AND company_id = $2 AND ${cliCalendarVisibilityClause(3)}`,
-      [id, companyId, me],
-    )
+    const r = await withOutboxTransaction(async (client) => {
+      const changed = await client.query(
+        op === 'delete'
+          ? `DELETE FROM calendar_events
+              WHERE id = $1 AND company_id = $2 AND ${cliCalendarVisibilityClause(3)}`
+          : `UPDATE calendar_events SET status = 'cancelled', updated_at = NOW()
+              WHERE id = $1 AND company_id = $2 AND ${cliCalendarVisibilityClause(3)}`,
+        [id, companyId, me],
+      )
+      if ((changed.rowCount ?? 0) > 0) {
+        await enqueueCalendarCli(client, {
+          companyId,
+          kind: op === 'delete' ? 'event.deleted' : 'event.updated',
+          eventId: id,
+          actorId: me,
+        })
+      }
+      return changed
+    })
     if ((r.rowCount ?? 0) === 0) return err(`no event ${id}`)
     // `cancel` flips status → updated; `delete` drops the row → deleted.
     // Clients listening on calendar.changed will refetch (or drop the row
     // from local state) accordingly.
-    await publishCalendarCli({
-      companyId,
-      kind: op === 'delete' ? 'event.deleted' : 'event.updated',
-      eventId: id,
-      actorId: me,
-    })
     return ok(`${op === 'delete' ? 'deleted' : 'cancelled'} ${id}`, [{
       event: op === 'delete' ? 'calendar.event_deleted' : 'calendar.event_cancelled',
       command: `calendar ${op}`,
@@ -4529,7 +5031,7 @@ async function cmdCalendar(parsed: ParsedArgs): Promise<CliResult> {
  *
  * Same shape as the rest of this file: the agent operates as `me` (the
  * --as participant) inside that participant's tenant. All inserts /
- * updates publish on the `boards` channel so the desktop client + every
+ * updates enqueue on the `boards` channel so the desktop client + every
  * other connected member sees the change in real time. */
 
 type KanbanMentionTarget = { id: string; name: string }
@@ -4588,7 +5090,7 @@ async function cliParseMentions(companyId: string, text: string): Promise<string
   return cliParseMentionTargets(text, rows)
 }
 
-async function publishBoardCli(args: {
+async function enqueueBoardCli(db: PoolClient, args: {
   companyId: string
   kind:
     | 'board.created' | 'board.updated' | 'board.deleted'
@@ -4602,8 +5104,7 @@ async function publishBoardCli(args: {
   mentions?: string[]
   actorId: string
 }): Promise<void> {
-  const { CH_BOARDS, publish } = await import('../redis.js')
-  await publish(CH_BOARDS, {
+  await enqueueBroadcast(db, CH_BOARDS, {
     type: 'board.changed',
     companyId: args.companyId,
     kind: args.kind,
@@ -4614,43 +5115,6 @@ async function publishBoardCli(args: {
     mentions: args.mentions,
     actorId: args.actorId,
   })
-}
-
-/** Same shape + intent as the REST helper: wake every agent in
- *  `mentions` who lives in `companyId` and isn't the actor. Best-effort. */
-async function wakeMentionedAgentsCli(args: {
-  companyId: string
-  mentions: string[] | undefined
-  actorId: string
-}): Promise<void> {
-  // This function is invoked as `void wakeMentionedAgentsCli(...)` from
-  // CLI command handlers (kanban/card/doc/calendar). Any throw here
-  // becomes an unhandled rejection on the cumora-server process. Wrap
-  // the whole body so a transient pool.query failure can't crash the
-  // server — the CLI command itself has already succeeded; the wakes
-  // are a best-effort side effect.
-  try {
-    if (!args.mentions || args.mentions.length === 0) return
-    const targets = args.mentions.filter((id) => id !== args.actorId)
-    if (targets.length === 0) return
-    const { rows } = await pool.query<{ id: string }>(
-      `SELECT id FROM participants
-        WHERE kind = 'agent'
-          AND company_id = $1
-          AND id = ANY($2::text[])
-          AND departed_at IS NULL`,
-      [args.companyId, targets],
-    )
-    if (rows.length === 0) return
-    const { wakeAgent } = await import('./scheduler.js')
-    for (const r of rows) {
-      wakeAgent(r.id, 'manual', null).catch((e) => {
-        console.warn(`[kanban-cli] wake ${r.id} failed`, e instanceof Error ? e.message : e)
-      })
-    }
-  } catch (err) {
-    console.warn('[kanban-cli] wakeMentionedAgentsCli failed:', err instanceof Error ? err.message : err)
-  }
 }
 
 async function cmdBoard(parsed: ParsedArgs): Promise<CliResult> {
@@ -4684,8 +5148,8 @@ async function cmdBoard(parsed: ParsedArgs): Promise<CliResult> {
     }>(`SELECT id, title, description, company_id FROM boards WHERE id = $1 LIMIT 1`, [boardId])
     if (b.rows.length === 0 || b.rows[0].company_id !== companyId) return err(`board ${boardId} not found`)
     const cols = await pool.query<{
-      id: string; title: string; position: number
-    }>(`SELECT id, title, position FROM board_columns WHERE board_id = $1 ORDER BY position ASC`, [boardId])
+      id: string; title: string; position: number; kind: string | null
+    }>(`SELECT id, title, position, kind FROM board_columns WHERE board_id = $1 ORDER BY position ASC`, [boardId])
     const cards = await pool.query<{
       id: string; column_id: string; title: string; assignee_id: string | null
       mentions: string[]; position: number
@@ -4708,7 +5172,10 @@ async function cmdBoard(parsed: ParsedArgs): Promise<CliResult> {
     if (b.rows[0].description) lines.push(b.rows[0].description)
     for (const col of cols.rows) {
       const list = cardsByCol.get(col.id) ?? []
-      lines.push('', `## ${col.title}  (${col.id})  · ${list.length} card(s)`)
+      // Name the column's MEANING, not just its title: an agent moving a card
+      // should not have to infer which column counts as done from prose.
+      const meaning = col.kind ? `  [${col.kind}]` : ''
+      lines.push('', `## ${col.title}${meaning}  (${col.id})  · ${list.length} card(s)`)
       for (const c of list) {
         const who = c.assignee_id ? `@${c.assignee_id}` : '(unassigned)'
         const mentions = Array.isArray(c.mentions) && c.mentions.length > 0
@@ -4727,28 +5194,22 @@ async function cmdBoard(parsed: ParsedArgs): Promise<CliResult> {
     const description = typeof parsed.flags.description === 'string'
       ? unescapeChat(parsed.flags.description).slice(0, 4000) : null
     const id = `board-${randomUUID().slice(0, 12)}`
-    const client = await pool.connect()
-    try {
-      await client.query('BEGIN')
+    await withOutboxTransaction(async (client) => {
       await client.query(
         `INSERT INTO boards (id, company_id, title, description, created_by) VALUES ($1, $2, $3, $4, $5)`,
         [id, companyId, title.slice(0, 200), description, me],
       )
-      const seeds = ['Todo', 'Doing', 'Done']
+      // Seed the MEANING alongside the title, so an agent asked to advance a
+      // card never has to infer "which column is Doing" from prose.
+      const seeds: Array<[string, ColumnKind]> = [['Todo', 'todo'], ['Doing', 'doing'], ['Done', 'done']]
       for (let i = 0; i < seeds.length; i++) {
         await client.query(
-          `INSERT INTO board_columns (id, board_id, title, position) VALUES ($1, $2, $3, $4)`,
-          [`col-${randomUUID().slice(0, 12)}`, id, seeds[i], (i + 1) * 1000],
+          `INSERT INTO board_columns (id, board_id, title, position, kind) VALUES ($1, $2, $3, $4, $5)`,
+          [`col-${randomUUID().slice(0, 12)}`, id, seeds[i][0], (i + 1) * 1000, seeds[i][1]],
         )
       }
-      await client.query('COMMIT')
-    } catch (e) {
-      await client.query('ROLLBACK').catch(() => { /* swallow */ })
-      throw e
-    } finally {
-      client.release()
-    }
-    await publishBoardCli({ companyId, kind: 'board.created', boardId: id, actorId: me })
+      await enqueueBoardCli(client, { companyId, kind: 'board.created', boardId: id, actorId: me })
+    })
     return ok(`created board ${id}: ${title}`, [{
       event: 'kanban.board_created',
       command: 'kanban create',
@@ -4785,14 +5246,19 @@ async function cmdBoard(parsed: ParsedArgs): Promise<CliResult> {
     }
     if (sets.length === 0) return err('nothing to update — pass --title or --description')
     params.push(boardId, companyId)
-    const { rows } = await pool.query<{ title: string; description: string | null }>(
-      `UPDATE boards SET ${sets.join(', ')}, updated_at = NOW()
-        WHERE id = $${params.length - 1} AND company_id = $${params.length}
-        RETURNING title, description`,
-      params,
-    )
+    const rows = await withOutboxTransaction(async (client) => {
+      const updated = await client.query<{ title: string; description: string | null }>(
+        `UPDATE boards SET ${sets.join(', ')}, updated_at = NOW()
+          WHERE id = $${params.length - 1} AND company_id = $${params.length}
+          RETURNING title, description`,
+        params,
+      )
+      if (updated.rows[0]) {
+        await enqueueBoardCli(client, { companyId, kind: 'board.updated', boardId, actorId: me })
+      }
+      return updated.rows
+    })
     if (rows.length === 0) return err(`board ${boardId} not found`)
-    await publishBoardCli({ companyId, kind: 'board.updated', boardId, actorId: me })
     return ok(`updated board ${boardId}: ${rows[0].title}`, [{
       event: 'kanban.board_updated',
       command: `kanban ${op}`,
@@ -4833,11 +5299,13 @@ async function cmdBoard(parsed: ParsedArgs): Promise<CliResult> {
     )
     const position = (Number(posRows[0]?.max ?? 0)) + 1000
     const id = `col-${randomUUID().slice(0, 12)}`
-    await pool.query(
-      `INSERT INTO board_columns (id, board_id, title, position) VALUES ($1, $2, $3, $4)`,
-      [id, boardId, title.slice(0, 100), position],
-    )
-    await publishBoardCli({ companyId, kind: 'column.created', boardId, columnId: id, actorId: me })
+    await withOutboxTransaction(async (client) => {
+      await client.query(
+        `INSERT INTO board_columns (id, board_id, title, position) VALUES ($1, $2, $3, $4)`,
+        [id, boardId, title.slice(0, 100), position],
+      )
+      await enqueueBoardCli(client, { companyId, kind: 'column.created', boardId, columnId: id, actorId: me })
+    })
     return ok(`added column ${id}: ${title}`, [{
       event: 'kanban.column_created',
       command: 'kanban add-column',
@@ -4877,14 +5345,19 @@ async function cmdBoard(parsed: ParsedArgs): Promise<CliResult> {
     }
     if (sets.length === 0) return err('nothing to update — pass --title or --position')
     params.push(columnId, boardId)
-    const { rows } = await pool.query<{ title: string; position: number }>(
-      `UPDATE board_columns SET ${sets.join(', ')}
-        WHERE id = $${params.length - 1} AND board_id = $${params.length}
-        RETURNING title, position`,
-      params,
-    )
+    const rows = await withOutboxTransaction(async (client) => {
+      const updated = await client.query<{ title: string; position: number }>(
+        `UPDATE board_columns SET ${sets.join(', ')}
+          WHERE id = $${params.length - 1} AND board_id = $${params.length}
+          RETURNING title, position`,
+        params,
+      )
+      if (updated.rows[0]) {
+        await enqueueBoardCli(client, { companyId, kind: 'column.updated', boardId, columnId, actorId: me })
+      }
+      return updated.rows
+    })
     if (rows.length === 0) return err(`column ${columnId} not in board ${boardId}`)
-    await publishBoardCli({ companyId, kind: 'column.updated', boardId, columnId, actorId: me })
     return ok(`updated column ${columnId}: ${rows[0].title}`, [{
       event: 'kanban.column_updated',
       command: `kanban ${op}`,
@@ -4907,12 +5380,17 @@ async function cmdBoard(parsed: ParsedArgs): Promise<CliResult> {
       [boardId],
     )
     if (b.rows.length === 0 || b.rows[0].company_id !== companyId) return err(`board ${boardId} not found`)
-    const r = await pool.query(
-      `DELETE FROM board_columns WHERE id = $1 AND board_id = $2`,
-      [columnId, boardId],
-    )
+    const r = await withOutboxTransaction(async (client) => {
+      const deleted = await client.query(
+        `DELETE FROM board_columns WHERE id = $1 AND board_id = $2`,
+        [columnId, boardId],
+      )
+      if ((deleted.rowCount ?? 0) > 0) {
+        await enqueueBoardCli(client, { companyId, kind: 'column.deleted', boardId, columnId, actorId: me })
+      }
+      return deleted
+    })
     if ((r.rowCount ?? 0) === 0) return err(`column ${columnId} not in board ${boardId}`)
-    await publishBoardCli({ companyId, kind: 'column.deleted', boardId, columnId, actorId: me })
     return ok(`deleted column ${columnId}`, [{
       event: 'kanban.column_deleted',
       command: `kanban ${op}`,
@@ -4927,12 +5405,17 @@ async function cmdBoard(parsed: ParsedArgs): Promise<CliResult> {
   if (op === 'delete' || op === 'rm') {
     const boardId = parsed.positional[1]
     if (!boardId) return err('usage: kanban delete <board_id>')
-    const r = await pool.query(
-      `DELETE FROM boards WHERE id = $1 AND company_id = $2`,
-      [boardId, companyId],
-    )
+    const r = await withOutboxTransaction(async (client) => {
+      const deleted = await client.query(
+        `DELETE FROM boards WHERE id = $1 AND company_id = $2`,
+        [boardId, companyId],
+      )
+      if ((deleted.rowCount ?? 0) > 0) {
+        await enqueueBoardCli(client, { companyId, kind: 'board.deleted', boardId, actorId: me })
+      }
+      return deleted
+    })
     if ((r.rowCount ?? 0) === 0) return err(`board ${boardId} not found`)
-    await publishBoardCli({ companyId, kind: 'board.deleted', boardId, actorId: me })
     return ok(`deleted board ${boardId}`, [{
       event: 'kanban.board_deleted',
       command: 'kanban delete',
@@ -5069,15 +5552,15 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
 
   /** Look up the boardId behind a cardId AND verify it's in our tenant.
    *  Returns null if the card doesn't exist or is cross-tenant. */
-  async function resolveCardBoard(cardId: string): Promise<{ boardId: string; columnId: string } | null> {
-    const r = await pool.query<{ board_id: string; column_id: string; company_id: string }>(
-      `SELECT c.board_id, c.column_id, b.company_id
+  async function resolveCardBoard(cardId: string): Promise<{ boardId: string; columnId: string; title: string } | null> {
+    const r = await pool.query<{ board_id: string; column_id: string; title: string; company_id: string }>(
+      `SELECT c.board_id, c.column_id, c.title, b.company_id
          FROM board_cards c JOIN boards b ON b.id = c.board_id
         WHERE c.id = $1 LIMIT 1`,
       [cardId],
     )
     if (r.rows.length === 0 || r.rows[0].company_id !== companyId) return null
-    return { boardId: r.rows[0].board_id, columnId: r.rows[0].column_id }
+    return { boardId: r.rows[0].board_id, columnId: r.rows[0].column_id, title: r.rows[0].title }
   }
 
   if (op === 'ls' || op === 'list') {
@@ -5176,19 +5659,33 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
     const position = (Number(posRows[0]?.max ?? 0)) + 1000
     const mentions = await cliParseMentions(companyId, `${title}\n${description ?? ''}`)
     const id = `card-${randomUUID().slice(0, 12)}`
-    await pool.query(
-      `INSERT INTO board_cards
-         (id, board_id, column_id, title, description, position, assignee_id, mentions, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)`,
-      [id, boardId, columnId, title.slice(0, 200), description, position, assignee, JSON.stringify(mentions), me],
-    )
-    await pool.query(`UPDATE boards SET updated_at = NOW() WHERE id = $1`, [boardId])
-    await publishBoardCli({
-      companyId, kind: 'card.created', boardId, cardId: id, columnId, mentions, actorId: me,
+    await withOutboxTransaction(async (client) => {
+      await client.query(
+        `INSERT INTO board_cards
+           (id, board_id, column_id, title, description, position, assignee_id, mentions, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)`,
+        [id, boardId, columnId, title.slice(0, 200), description, position, assignee, JSON.stringify(mentions), me],
+      )
+      await client.query(`UPDATE boards SET updated_at = NOW() WHERE id = $1`, [boardId])
+      await enqueueBoardCli(client, {
+        companyId, kind: 'card.created', boardId, cardId: id, columnId, mentions, actorId: me,
+      })
     })
-    void wakeMentionedAgentsCli({ companyId, mentions, actorId: me })
+    void wakeKanbanAgents({
+      companyId, mentions, actorId: me,
+      card: {
+        boardId, cardId: id, columnId, title,
+        what: 'You were mentioned on a new board card',
+      },
+    })
     if (assignee && assignee !== me) {
-      void wakeMentionedAgentsCli({ companyId, mentions: [assignee], actorId: me })
+      void wakeKanbanAgents({
+        companyId, mentions: [assignee], actorId: me,
+        card: {
+          boardId, cardId: id, columnId, title,
+          what: 'A board card was assigned to you',
+        },
+      })
     }
     return ok(`added card ${id}: ${title}${mentions.length > 0 ? `  · mentions: ${mentions.map((m) => '@' + m).join(' ')}` : ''}`, [{
       event: 'kanban.card_created',
@@ -5220,13 +5717,15 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
       `SELECT MAX(position) AS max FROM board_cards WHERE column_id = $1`, [toCol],
     )
     const position = (Number(posRows[0]?.max ?? 0)) + 1000
-    await pool.query(
-      `UPDATE board_cards SET column_id = $1, position = $2, updated_at = NOW() WHERE id = $3`,
-      [toCol, position, cardId],
-    )
-    await pool.query(`UPDATE boards SET updated_at = NOW() WHERE id = $1`, [home.boardId])
-    await publishBoardCli({
-      companyId, kind: 'card.moved', boardId: home.boardId, cardId, columnId: toCol, actorId: me,
+    await withOutboxTransaction(async (client) => {
+      await client.query(
+        `UPDATE board_cards SET column_id = $1, position = $2, updated_at = NOW() WHERE id = $3`,
+        [toCol, position, cardId],
+      )
+      await client.query(`UPDATE boards SET updated_at = NOW() WHERE id = $1`, [home.boardId])
+      await enqueueBoardCli(client, {
+        companyId, kind: 'card.moved', boardId: home.boardId, cardId, columnId: toCol, actorId: me,
+      })
     })
     return ok(`moved card ${cardId} → ${toCol}`, [{
       event: 'kanban.card_moved',
@@ -5248,15 +5747,23 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
     const home = await resolveCardBoard(cardId)
     if (!home) return err(`card ${cardId} not found`)
     const assignee = (!who || who.toLowerCase() === 'null' || who === '-') ? null : who.trim()
-    await pool.query(
-      `UPDATE board_cards SET assignee_id = $1, updated_at = NOW() WHERE id = $2`,
-      [assignee, cardId],
-    )
-    await publishBoardCli({
-      companyId, kind: 'card.updated', boardId: home.boardId, cardId, actorId: me,
+    await withOutboxTransaction(async (client) => {
+      await client.query(
+        `UPDATE board_cards SET assignee_id = $1, updated_at = NOW() WHERE id = $2`,
+        [assignee, cardId],
+      )
+      await enqueueBoardCli(client, {
+        companyId, kind: 'card.updated', boardId: home.boardId, cardId, actorId: me,
+      })
     })
     if (assignee && assignee !== me) {
-      void wakeMentionedAgentsCli({ companyId, mentions: [assignee], actorId: me })
+      void wakeKanbanAgents({
+        companyId, mentions: [assignee], actorId: me,
+        card: {
+          boardId: home.boardId, cardId, columnId: home.columnId, title: home.title,
+          what: 'A board card was assigned to you',
+        },
+      })
     }
     return ok(assignee ? `assigned card ${cardId} → @${assignee}` : `unassigned card ${cardId}`, [{
       event: 'kanban.card_assigned',
@@ -5281,23 +5788,49 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
     if (!cardId) return err('usage: card claim <card_id>')
     const home = await resolveCardBoard(cardId)
     if (!home) return err(`card ${cardId} not found`)
-    const claimed = await pool.query<{ id: string }>(
-      `UPDATE board_cards SET assignee_id = $1, updated_at = NOW()
-         WHERE id = $2
-           AND (assignee_id IS NULL OR assignee_id = $1
-                OR updated_at < NOW() - INTERVAL '20 minutes')
-       RETURNING id`,
-      [me, cardId],
-    )
-    if ((claimed.rowCount ?? 0) === 0) {
+    const claim = await withOutboxTransaction(async (client) => {
+      const claimed = await client.query<{ id: string }>(
+        `UPDATE board_cards SET assignee_id = $1, updated_at = NOW()
+           WHERE id = $2
+             AND (assignee_id IS NULL OR assignee_id = $1
+                  OR updated_at < NOW() - INTERVAL '20 minutes')
+         RETURNING id`,
+        [me, cardId],
+      )
+      if ((claimed.rowCount ?? 0) === 0) return { claimed: false, advanceTo: null as string | null }
+      const cols = await client.query<{ id: string; position: number; kind: string | null }>(
+        `SELECT id, position, kind FROM board_columns WHERE board_id = $1`, [home.boardId],
+      )
+      const advanceTo = claimTargetColumn({ columns: cols.rows, currentColumnId: home.columnId })
+      if (advanceTo) {
+        await client.query(
+          `UPDATE board_cards SET column_id = $1, updated_at = NOW() WHERE id = $2`,
+          [advanceTo, cardId],
+        )
+      }
+      await enqueueBoardCli(client, {
+        companyId,
+        kind: advanceTo ? 'card.moved' : 'card.updated',
+        boardId: home.boardId,
+        cardId,
+        actorId: me,
+      })
+      return { claimed: true, advanceTo }
+    })
+    if (!claim.claimed) {
       const cur = await pool.query<{ assignee_id: string | null }>(
         `SELECT assignee_id FROM board_cards WHERE id = $1 LIMIT 1`, [cardId],
       )
       const holder = cur.rows[0]?.assignee_id
       return err(`claim failed: card ${cardId} is already being worked by @${holder ?? '?'} — move on to another task`)
     }
-    await publishBoardCli({ companyId, kind: 'card.updated', boardId: home.boardId, cardId, actorId: me })
-    return ok(`claimed card ${cardId} — it's yours. Do the work, post progress with \`card comment\`, move it with \`card move\`, and release with \`card assign ${cardId} null\` (or move to a done column) when finished.`, [{
+    // Claiming IS the moment work starts, so reflect it on the board instead of
+    // relying on the agent to remember a second command — that gap is why a
+    // board could read Todo 2 / Doing 1 / Done 0 while the work was finished and
+    // delivered in chat (#69). Only ever forward, and only on a board whose
+    // columns declare what they mean; see claimTargetColumn.
+    const advanceTo = claim.advanceTo
+    return ok(`claimed card ${cardId} — it's yours${advanceTo ? ' and moved to Doing' : ''}. Do the work, post progress with \`card comment\`, move it with \`card move\`, and release with \`card assign ${cardId} null\` (or move to a done column) when finished.`, [{
       event: 'kanban.card_claimed',
       command: 'card claim',
       boardId: home.boardId,
@@ -5333,14 +5866,22 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
     const mentions = await cliParseMentions(companyId, `${nextTitle}\n${nextDesc ?? ''}`)
     params.push(JSON.stringify(mentions)); sets.push(`mentions = $${params.length}::jsonb`)
     params.push(cardId)
-    await pool.query(
-      `UPDATE board_cards SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $${params.length}`,
-      params,
-    )
-    await publishBoardCli({
-      companyId, kind: 'card.updated', boardId: home.boardId, cardId, mentions, actorId: me,
+    await withOutboxTransaction(async (client) => {
+      await client.query(
+        `UPDATE board_cards SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $${params.length}`,
+        params,
+      )
+      await enqueueBoardCli(client, {
+        companyId, kind: 'card.updated', boardId: home.boardId, cardId, mentions, actorId: me,
+      })
     })
-    void wakeMentionedAgentsCli({ companyId, mentions, actorId: me })
+    void wakeKanbanAgents({
+      companyId, mentions, actorId: me,
+      card: {
+        boardId: home.boardId, cardId, columnId: home.columnId, title: nextTitle,
+        what: 'You were mentioned on a board card',
+      },
+    })
     return ok(`updated card ${cardId}${mentions.length > 0 ? `  · mentions: ${mentions.map((m) => '@' + m).join(' ')}` : ''}`, [{
       event: 'kanban.card_updated',
       command: op === 'rename' ? 'card rename' : 'card edit',
@@ -5363,17 +5904,25 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
     if (!home) return err(`card ${cardId} not found`)
     const mentions = await cliParseMentions(companyId, body)
     const id = `cmt-${randomUUID().slice(0, 12)}`
-    await pool.query(
-      `INSERT INTO board_card_comments (id, card_id, author_id, body, mentions)
-       VALUES ($1, $2, $3, $4, $5::jsonb)`,
-      [id, cardId, me, body.slice(0, 8000), JSON.stringify(mentions)],
-    )
-    await pool.query(`UPDATE board_cards SET updated_at = NOW() WHERE id = $1`, [cardId])
-    await pool.query(`UPDATE boards SET updated_at = NOW() WHERE id = $1`, [home.boardId])
-    await publishBoardCli({
-      companyId, kind: 'comment.created', boardId: home.boardId, cardId, commentId: id, mentions, actorId: me,
+    await withOutboxTransaction(async (client) => {
+      await client.query(
+        `INSERT INTO board_card_comments (id, card_id, author_id, body, mentions)
+         VALUES ($1, $2, $3, $4, $5::jsonb)`,
+        [id, cardId, me, body.slice(0, 8000), JSON.stringify(mentions)],
+      )
+      await client.query(`UPDATE board_cards SET updated_at = NOW() WHERE id = $1`, [cardId])
+      await client.query(`UPDATE boards SET updated_at = NOW() WHERE id = $1`, [home.boardId])
+      await enqueueBoardCli(client, {
+        companyId, kind: 'comment.created', boardId: home.boardId, cardId, commentId: id, mentions, actorId: me,
+      })
     })
-    void wakeMentionedAgentsCli({ companyId, mentions, actorId: me })
+    void wakeKanbanAgents({
+      companyId, mentions, actorId: me,
+      card: {
+        boardId: home.boardId, cardId, columnId: home.columnId, title: home.title,
+        what: 'You were mentioned in a board card comment',
+      },
+    })
     return ok(`commented on ${cardId}${mentions.length > 0 ? `  · mentions: ${mentions.map((m) => '@' + m).join(' ')}` : ''}`, [{
       event: 'kanban.comment_created',
       command: 'card comment',
@@ -5393,15 +5942,20 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
     if (!cardId || !commentId) return err(`usage: card ${op} <card_id> <comment_id>`)
     const home = await resolveCardBoard(cardId)
     if (!home) return err(`card ${cardId} not found`)
-    const r = await pool.query(
-      `DELETE FROM board_card_comments
-        WHERE id = $1 AND card_id = $2 AND author_id = $3`,
-      [commentId, cardId, me],
-    )
-    if ((r.rowCount ?? 0) === 0) return err(`comment ${commentId} not found or not authored by ${me}`)
-    await publishBoardCli({
-      companyId, kind: 'comment.deleted', boardId: home.boardId, cardId, commentId, actorId: me,
+    const r = await withOutboxTransaction(async (client) => {
+      const deleted = await client.query(
+        `DELETE FROM board_card_comments
+          WHERE id = $1 AND card_id = $2 AND author_id = $3`,
+        [commentId, cardId, me],
+      )
+      if ((deleted.rowCount ?? 0) > 0) {
+        await enqueueBoardCli(client, {
+          companyId, kind: 'comment.deleted', boardId: home.boardId, cardId, commentId, actorId: me,
+        })
+      }
+      return deleted
     })
+    if ((r.rowCount ?? 0) === 0) return err(`comment ${commentId} not found or not authored by ${me}`)
     return ok(`deleted comment ${commentId}`, [{
       event: 'kanban.comment_deleted',
       command: `card ${op}`,
@@ -5419,9 +5973,11 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
     if (!cardId) return err('usage: card delete <card_id>')
     const home = await resolveCardBoard(cardId)
     if (!home) return err(`card ${cardId} not found`)
-    await pool.query(`DELETE FROM board_cards WHERE id = $1`, [cardId])
-    await publishBoardCli({
-      companyId, kind: 'card.deleted', boardId: home.boardId, cardId, actorId: me,
+    await withOutboxTransaction(async (client) => {
+      await client.query(`DELETE FROM board_cards WHERE id = $1`, [cardId])
+      await enqueueBoardCli(client, {
+        companyId, kind: 'card.deleted', boardId: home.boardId, cardId, actorId: me,
+      })
     })
     return ok(`deleted card ${cardId}`, [{
       event: 'kanban.card_deleted',
@@ -5489,14 +6045,14 @@ function buildToolArgs(toolName: string, parsed: ParsedArgs): { argsJson: string
  * happens automatically — the human's editor sees the agent's cursor
  * + insertion live, as if a remote teammate just typed it.
  */
-async function publishDocChanged(
+async function enqueueDocChanged(
+  db: PoolClient,
   companyId: string,
   documentId: string,
   kind: 'document.created' | 'document.updated' | 'document.deleted',
   actorId: string,
 ): Promise<void> {
-  const { CH_DOCS, publish } = await import('../redis.js')
-  await publish(CH_DOCS, {
+  await enqueueBroadcast(db, CH_DOCS, {
     type: 'doc.changed',
     kind,
     companyId,
@@ -5510,9 +6066,48 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
   const me = resolveAs(parsed)
   const companyId = await agentCompany(me)
   if (!companyId) return err(`unknown agent ${me} (no company)`)
+  const finalizers: Array<() => Promise<void>> = []
+  let locked: CliResult | null
+  try {
+    locked = await withActiveParticipantLock({
+      participantId: me,
+      companyId,
+      kind: 'agent',
+      run: async (client) => cmdDocAsActiveAgent(
+        parsed,
+        op,
+        me,
+        companyId,
+        client,
+        (kind, documentId) => enqueueDocChanged(client, companyId, documentId, kind, me),
+        (finalizer) => finalizers.push(finalizer),
+      ),
+    })
+  } finally {
+    for (const finalize of finalizers) {
+      await finalize().catch((error) => {
+        console.warn('[doc] post-transaction cleanup failed', error)
+      })
+    }
+  }
+  if (!locked) return err(`agent ${me} is no longer active in ${companyId}`)
+  return locked
+}
 
+async function cmdDocAsActiveAgent(
+  parsed: ParsedArgs,
+  op: string,
+  me: string,
+  companyId: string,
+  dbClient: PoolClient,
+  onChanged: (
+    kind: 'document.created' | 'document.updated' | 'document.deleted',
+    documentId: string,
+  ) => Promise<void>,
+  onFinally: (finalizer: () => Promise<void>) => void,
+): Promise<CliResult> {
   if (op === 'ls' || op === 'list') {
-    const { rows } = await pool.query<{
+    const { rows } = await dbClient.query<{
       id: string; title: string; created_by: string; updated_at: Date
     }>(
       `SELECT id, title, created_by, updated_at FROM documents
@@ -5539,8 +6134,9 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
     // still collide thanks to subject normalization.
     const blocked = await tryClaimTenantWork(companyId, me, 'doc-create', title)
     if (blocked) return blocked
+    onFinally(() => releaseTenantWork(companyId, me, 'doc-create', title))
 
-    try {
+    {
       // The claim above only guards work IN FLIGHT — it's released the
       // moment the first creator finishes, so it cannot stop a SEQUENTIAL
       // duplicate (2026-06-12: nova created+released 《第七天的猫》 at
@@ -5555,7 +6151,7 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
       const docHoldScope = `doc-create:${normTitle}`
       const forceArmed = Boolean(parsed.flags.force) && (await consumeHold(me, docHoldScope)).armed
       if (!forceArmed) {
-        const { rows: recentDups } = await pool.query<{
+        const { rows: recentDups } = await dbClient.query<{
           id: string; title: string; created_by: string; created_at: Date
         }>(
           `SELECT id, title, created_by, created_at FROM documents
@@ -5579,7 +6175,7 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
         }
       }
       const id = `doc_${randomUUID().replace(/-/g, '').slice(0, 16)}`
-      await pool.query(
+      await dbClient.query(
         `INSERT INTO documents (id, company_id, title, created_by) VALUES ($1, $2, $3, $4)`,
         [id, companyId, title.slice(0, 200), me],
       )
@@ -5589,9 +6185,9 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
       const body = typeof parsed.flags.body === 'string' ? unescapeChat(parsed.flags.body) : ''
       if (body) {
         const { applyAgentEdit } = await import('../documents/rooms.js')
-        await applyAgentEdit(id, companyId, me, [{ kind: 'append', text: body }])
+        await applyAgentEdit(id, companyId, me, [{ kind: 'append', text: body }], dbClient)
       }
-      await publishDocChanged(companyId, id, 'document.created', me)
+      await onChanged('document.created', id)
       return ok(`created document ${id}: ${title}`, [{
         event: 'document.created',
         command: 'doc create',
@@ -5602,20 +6198,18 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
         bodyLength: body.length,
         visibleToUser: true,
       }])
-    } finally {
-      await releaseTenantWork(companyId, me, 'doc-create', title)
     }
   }
 
   if (op === 'read' || op === 'show') {
     const docId = parsed.positional[1]
     if (!docId) return err('usage: doc read <document_id>')
-    const { rows } = await pool.query<{ company_id: string; title: string }>(
+    const { rows } = await dbClient.query<{ company_id: string; title: string }>(
       `SELECT company_id, title FROM documents WHERE id = $1 LIMIT 1`, [docId],
     )
     if (rows.length === 0 || rows[0].company_id !== companyId) return err(`document ${docId} not found`)
     const { readDocumentText } = await import('../documents/rooms.js')
-    const body = await readDocumentText(docId, companyId)
+    const body = await readDocumentText(docId, companyId, dbClient)
     if (parsed.flags.json) return ok(JSON.stringify({ id: docId, title: rows[0].title, body }, null, 2))
     return ok([
       `# ${rows[0].title}  (${docId})`,
@@ -5629,13 +6223,13 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
     const text = parsed.positional.slice(2).join(' ').trim()
       || (typeof parsed.flags.text === 'string' ? unescapeChat(parsed.flags.text) : '')
     if (!docId || !text) return err('usage: doc append <document_id> "<text>"')
-    const { rows } = await pool.query<{ company_id: string }>(
+    const { rows } = await dbClient.query<{ company_id: string }>(
       `SELECT company_id FROM documents WHERE id = $1 LIMIT 1`, [docId],
     )
     if (rows.length === 0 || rows[0].company_id !== companyId) return err(`document ${docId} not found`)
     const { applyAgentEdit } = await import('../documents/rooms.js')
-    await applyAgentEdit(docId, companyId, me, [{ kind: 'append', text }])
-    await publishDocChanged(companyId, docId, 'document.updated', me)
+    await applyAgentEdit(docId, companyId, me, [{ kind: 'append', text }], dbClient)
+    await onChanged('document.updated', docId)
     return ok(`appended ${text.length} chars to ${docId}`, [{
       event: 'document.updated',
       command: 'doc append',
@@ -5653,13 +6247,13 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
     const text = parsed.positional.slice(2).join(' ').trim()
       || (typeof parsed.flags.text === 'string' ? unescapeChat(parsed.flags.text) : '')
     if (!docId || !text) return err('usage: doc prepend <document_id> "<text>"')
-    const { rows } = await pool.query<{ company_id: string }>(
+    const { rows } = await dbClient.query<{ company_id: string }>(
       `SELECT company_id FROM documents WHERE id = $1 LIMIT 1`, [docId],
     )
     if (rows.length === 0 || rows[0].company_id !== companyId) return err(`document ${docId} not found`)
     const { applyAgentEdit } = await import('../documents/rooms.js')
-    await applyAgentEdit(docId, companyId, me, [{ kind: 'insertParagraph', at: 'start', text }])
-    await publishDocChanged(companyId, docId, 'document.updated', me)
+    await applyAgentEdit(docId, companyId, me, [{ kind: 'insertParagraph', at: 'start', text }], dbClient)
+    await onChanged('document.updated', docId)
     return ok(`prepended ${text.length} chars to ${docId}`, [{
       event: 'document.updated',
       command: 'doc prepend',
@@ -5716,12 +6310,12 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
       placement = { mode: atRaw === 'start' ? 'start' : 'end' }
     }
 
-    const { rows } = await pool.query<{ company_id: string }>(
+    const { rows } = await dbClient.query<{ company_id: string }>(
       `SELECT company_id FROM documents WHERE id = $1 LIMIT 1`, [docId],
     )
     if (rows.length === 0 || rows[0].company_id !== companyId) return err(`document ${docId} not found`)
     const { applyAgentEdit, isAnchoredImagePlacement } = await import('../documents/rooms.js')
-    const result = await applyAgentEdit(docId, companyId, me, [{ kind: 'image', src, alt: alt || null, placement }])
+    const result = await applyAgentEdit(docId, companyId, me, [{ kind: 'image', src, alt: alt || null, placement }], dbClient)
 
     // Anchor miss is a HARD error now — falling back to end-of-doc on a
     // missed snippet is how the doc collected duplicate inert images
@@ -5732,7 +6326,7 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
       const snippet = placement.anchorText.slice(0, 60)
       return err(`anchor not found in ${docId}: "${snippet}". Re-read the doc and pick a snippet that uniquely identifies the target block — no image was inserted.`)
     }
-    await publishDocChanged(companyId, docId, 'document.updated', me)
+    await onChanged('document.updated', docId)
 
     let where: string
     if (isAnchoredImagePlacement(placement)) {
@@ -5767,7 +6361,7 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
     if (provided.length > 1) {
       return err('pass only one of --src / --src-contains / --alt')
     }
-    const { rows } = await pool.query<{ company_id: string }>(
+    const { rows } = await dbClient.query<{ company_id: string }>(
       `SELECT company_id FROM documents WHERE id = $1 LIMIT 1`, [docId],
     )
     if (rows.length === 0 || rows[0].company_id !== companyId) return err(`document ${docId} not found`)
@@ -5776,11 +6370,19 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
         : srcContains ? { by: 'src-contains', substring: srcContains }
           : { by: 'alt', alt: altMatch }
     const { applyAgentEdit } = await import('../documents/rooms.js')
-    const result = await applyAgentEdit(docId, companyId, me, [{ kind: 'imageDelete', match }])
+    const result = await applyAgentEdit(docId, companyId, me, [{ kind: 'imageDelete', match }], dbClient)
     if (result.imagesDeleted === 0) {
       return err(`no images in ${docId} matched the criterion`)
     }
-    await publishDocChanged(companyId, docId, 'document.updated', me)
+    if (result.deletedStorageKeys && result.deletedStorageKeys.length > 0) {
+      const { enqueueWorkspaceCleanup, nudgeWorkspaceCleanupWorker } = await import('../workspace-cleanup.js')
+      await enqueueWorkspaceCleanup(dbClient, { companyId, agentIds: [], storageKeys: result.deletedStorageKeys })
+      onFinally(() => {
+        nudgeWorkspaceCleanupWorker()
+        return Promise.resolve()
+      })
+    }
+    await onChanged('document.updated', docId)
     return ok(`deleted ${result.imagesDeleted} image${result.imagesDeleted === 1 ? '' : 's'} from ${docId}`, [{
       event: 'document.updated',
       command: 'doc image-delete',
@@ -5798,14 +6400,14 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
     const find = typeof parsed.flags.find === 'string' ? unescapeChat(parsed.flags.find) : ''
     const replace = typeof parsed.flags.replace === 'string' ? unescapeChat(parsed.flags.replace) : ''
     if (!docId || !find) return err('usage: doc replace <document_id> --find "..." --replace "..."')
-    const { rows } = await pool.query<{ company_id: string }>(
+    const { rows } = await dbClient.query<{ company_id: string }>(
       `SELECT company_id FROM documents WHERE id = $1 LIMIT 1`, [docId],
     )
     if (rows.length === 0 || rows[0].company_id !== companyId) return err(`document ${docId} not found`)
     const { applyAgentEdit } = await import('../documents/rooms.js')
-    const r = await applyAgentEdit(docId, companyId, me, [{ kind: 'replace', find, replace }])
+    const r = await applyAgentEdit(docId, companyId, me, [{ kind: 'replace', find, replace }], dbClient)
     if (r.replaced === 0) return err(`text not found in ${docId}: ${JSON.stringify(find).slice(0, 80)}`)
-    await publishDocChanged(companyId, docId, 'document.updated', me)
+    await onChanged('document.updated', docId)
     return ok(`replaced ${r.replaced} occurrence in ${docId}`, [{
       event: 'document.updated',
       command: 'doc replace',
@@ -5824,14 +6426,14 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
     const text = parsed.positional.slice(2).join(' ').trim()
       || (typeof parsed.flags.text === 'string' ? unescapeChat(parsed.flags.text) : '')
     if (!docId || !anchor || !text) return err('usage: doc replace-block <document_id> --anchor "<snippet in the block>" "<replacement markdown>"')
-    const { rows } = await pool.query<{ company_id: string }>(
+    const { rows } = await dbClient.query<{ company_id: string }>(
       `SELECT company_id FROM documents WHERE id = $1 LIMIT 1`, [docId],
     )
     if (rows.length === 0 || rows[0].company_id !== companyId) return err(`document ${docId} not found`)
     const { applyAgentEdit } = await import('../documents/rooms.js')
-    const r = await applyAgentEdit(docId, companyId, me, [{ kind: 'replaceBlock', anchorText: anchor, text }])
+    const r = await applyAgentEdit(docId, companyId, me, [{ kind: 'replaceBlock', anchorText: anchor, text }], dbClient)
     if (r.blocksReplaced === 0) return err(`no block containing ${JSON.stringify(anchor).slice(0, 80)} in ${docId}`)
-    await publishDocChanged(companyId, docId, 'document.updated', me)
+    await onChanged('document.updated', docId)
     return ok(`replaced 1 block in ${docId}`, [{
       event: 'document.updated',
       command: 'doc replace-block',
@@ -5848,13 +6450,13 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
     const title = parsed.positional.slice(2).join(' ').trim()
       || (typeof parsed.flags.title === 'string' ? parsed.flags.title : '')
     if (!docId || !title) return err('usage: doc rename <document_id> "<title>"')
-    const r = await pool.query(
+    const r = await dbClient.query(
       `UPDATE documents SET title = $1, updated_at = NOW()
         WHERE id = $2 AND company_id = $3`,
       [title.slice(0, 200), docId, companyId],
     )
     if (!r.rowCount) return err(`document ${docId} not found`)
-    await publishDocChanged(companyId, docId, 'document.updated', me)
+    await onChanged('document.updated', docId)
     return ok(`renamed ${docId} to "${title}"`, [{
       event: 'document.updated',
       command: 'doc rename',
@@ -5870,14 +6472,25 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
   if (op === 'delete' || op === 'rm') {
     const docId = parsed.positional[1]
     if (!docId) return err('usage: doc delete <document_id>')
-    const { rows } = await pool.query<{ created_by: string }>(
+    const { rows } = await dbClient.query<{ created_by: string }>(
       `SELECT created_by FROM documents WHERE id = $1 AND company_id = $2 LIMIT 1`,
       [docId, companyId],
     )
     if (rows.length === 0) return err(`document ${docId} not found`)
     if (rows[0].created_by !== me) return err(`only the creator can delete document ${docId}`)
-    await pool.query(`DELETE FROM documents WHERE id = $1`, [docId])
-    await publishDocChanged(companyId, docId, 'document.deleted', me)
+    const { collectDocumentStorageKeys, evictDocumentRoom } = await import('../documents/rooms.js')
+    const storageKeys = await collectDocumentStorageKeys(docId, dbClient)
+    await dbClient.query(`DELETE FROM documents WHERE id = $1`, [docId])
+    if (storageKeys.length > 0) {
+      const { enqueueWorkspaceCleanup, nudgeWorkspaceCleanupWorker } = await import('../workspace-cleanup.js')
+      await enqueueWorkspaceCleanup(dbClient, { companyId, agentIds: [], storageKeys })
+      onFinally(() => {
+        nudgeWorkspaceCleanupWorker()
+        return Promise.resolve()
+      })
+    }
+    evictDocumentRoom(docId)
+    await onChanged('document.deleted', docId)
     return ok(`deleted document ${docId}`, [{
       event: 'document.deleted',
       command: 'doc delete',
@@ -6049,7 +6662,11 @@ export async function runCli(argv: string[]): Promise<CliResult> {
         return err(`unknown subcommand: ${sub}\nrun "cumora help" for usage`)
     }
   } catch (e) {
-    return err(`error: ${e instanceof Error ? e.message : String(e)}`, 2)
+    // 1, not 2. Exit 2 means HELD — "your write was deliberately declined,
+    // re-decide and retry" — and five call sites use it that way. An
+    // unexpected exception is not that, and turn.ts now reads the code to tell
+    // a stand-down apart from a crash.
+    return err(`error: ${e instanceof Error ? e.message : String(e)}`, 1)
   }
 }
 

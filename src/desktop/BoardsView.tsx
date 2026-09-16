@@ -86,6 +86,7 @@ function BoardsSidebar({ onResizeStart }: { onResizeStart: (e: React.MouseEvent)
       <div className="px-4 py-4 flex items-center justify-between">
         <h2 className="text-lg font-semibold text-ink-900">{t('boards.title')}</h2>
         <button
+          type="button"
           onClick={() => setCreating(true)}
           className="w-7 h-7 rounded-md grid place-items-center text-ink-500 hover:bg-ink-50 hover:text-skype-deep"
           title={t('boards.newBoard')}
@@ -106,7 +107,7 @@ function BoardsSidebar({ onResizeStart }: { onResizeStart: (e: React.MouseEvent)
             }}
             onBlur={() => void submit()}
             placeholder={t('boards.boardTitlePlaceholder')}
-            className="w-full px-2.5 py-1.5 text-sm rounded-md border border-ink-200 bg-white focus:outline-none focus:border-skype"
+            className="w-full px-2.5 py-1.5 text-sm rounded-md border border-ink-200 bg-cloud text-ink-900 placeholder:text-ink-300 focus:outline-none focus:border-skype"
           />
         </div>
       )}
@@ -116,6 +117,7 @@ function BoardsSidebar({ onResizeStart }: { onResizeStart: (e: React.MouseEvent)
           return (
             <li key={b.id}>
               <button
+                type="button"
                 onClick={() => selectBoard(b.id)}
                 className={cn(
                   'w-full text-left px-4 py-2.5 flex items-center gap-2.5 transition-colors',
@@ -229,6 +231,7 @@ function BoardCanvas({ boardId }: { boardId: string }) {
             />
           ) : (
             <button
+              type="button"
               onClick={() => { setTitleDraft(snap.title); setEditingTitle(true) }}
               className="text-2xl font-semibold text-ink-900 hover:text-skype-deep text-left truncate"
             >
@@ -242,6 +245,7 @@ function BoardCanvas({ boardId }: { boardId: string }) {
           )}
         </div>
         <button
+          type="button"
           onClick={async () => {
             if (!confirm(t('boards.deleteBoardConfirm', { title: snap.title }))) return
             try { await deleteBoard(boardId) } catch (e) { console.warn('[boards] delete failed', e) }
@@ -266,7 +270,7 @@ function BoardCanvas({ boardId }: { boardId: string }) {
             />
           ))}
           {addingCol ? (
-            <div className="w-72 flex-shrink-0 p-3 rounded-lg bg-cloud/60">
+            <div className="w-72 flex-shrink-0 p-3 rounded-lg bg-[var(--board-column)]">
               <input
                 autoFocus
                 value={colDraft}
@@ -277,11 +281,12 @@ function BoardCanvas({ boardId }: { boardId: string }) {
                 }}
                 onBlur={() => void submitNewColumn()}
                 placeholder={t('boards.columnTitlePlaceholder')}
-                className="w-full px-2.5 py-1.5 text-sm rounded-md border border-ink-200 bg-white focus:outline-none focus:border-skype"
+                className="w-full px-2.5 py-1.5 text-sm rounded-md border border-ink-200 bg-cloud focus:outline-none focus:border-skype"
               />
             </div>
           ) : (
             <button
+              type="button"
               onClick={() => setAddingCol(true)}
               className="w-72 flex-shrink-0 px-3 py-2.5 rounded-lg text-sm text-ink-500 border border-dashed border-ink-200 hover:bg-cloud/40 hover:text-ink-700 transition-colors text-left"
             >
@@ -340,7 +345,7 @@ function ColumnView({ boardId, column, cards, onOpenCard }: {
   return (
     <div
       className={cn(
-        'w-72 flex-shrink-0 h-full flex flex-col rounded-lg bg-cloud/60 transition-colors',
+        'w-72 flex-shrink-0 h-full flex flex-col rounded-lg bg-[var(--board-column)] transition-colors',
         dragOver && 'ring-2 ring-skype/40 bg-skype/5',
       )}
       onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
@@ -367,10 +372,11 @@ function ColumnView({ boardId, column, cards, onOpenCard }: {
               if (e.key === 'Escape') setEditingTitle(false)
             }}
             onBlur={() => void submitTitle()}
-            className="flex-1 px-1.5 py-0.5 text-sm font-medium rounded-md border border-skype/50 bg-white focus:outline-none"
+            className="flex-1 px-1.5 py-0.5 text-sm font-medium rounded-md border border-skype/50 bg-cloud focus:outline-none"
           />
         ) : (
           <button
+            type="button"
             onClick={() => { setTitleDraft(column.title); setEditingTitle(true) }}
             className="text-sm font-medium text-ink-700 hover:text-skype-deep flex-1 text-left truncate"
           >
@@ -379,6 +385,7 @@ function ColumnView({ boardId, column, cards, onOpenCard }: {
         )}
         <span className="text-xs text-ink-400">{cards.length}</span>
         <button
+          type="button"
           onClick={async () => {
             if (cards.length > 0 && !confirm(t('boards.deleteColumnConfirm', { title: column.title, count: cards.length }))) return
             try { await deleteColumn(boardId, column.id) } catch (e) { console.warn('[boards] delete col failed', e) }
@@ -406,12 +413,13 @@ function ColumnView({ boardId, column, cards, onOpenCard }: {
             multiline
             submitOnEnter
             rows={2}
-            className="w-full px-2.5 py-2 text-sm rounded-md border border-ink-200 bg-white focus:outline-none focus:border-skype resize-none"
+            className="w-full px-2.5 py-2 text-sm rounded-md border border-ink-200 bg-cloud focus:outline-none focus:border-skype resize-none"
           />
         ) : (
           <button
+            type="button"
             onClick={() => setAdding(true)}
-            className="w-full text-left text-xs text-ink-400 px-2.5 py-1.5 rounded-md hover:bg-white hover:text-ink-600 transition-colors"
+            className="w-full text-left text-xs text-ink-400 px-2.5 py-1.5 rounded-md hover:bg-cloud hover:text-ink-600 transition-colors"
           >
             {t('boards.addCard')}
           </button>
@@ -427,7 +435,7 @@ function CardTile({ card, onOpen }: { card: BoardCard; onOpen: () => void }) {
   const byId = useParticipants((s) => s.byId)
   const assignee = card.assigneeId ? byId[card.assigneeId] : null
   return (
-    <article
+    <div
       role="button"
       tabIndex={0}
       draggable
@@ -437,7 +445,7 @@ function CardTile({ card, onOpen }: { card: BoardCard; onOpen: () => void }) {
       }}
       onClick={onOpen}
       onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen() } }}
-      className="px-3 py-2.5 rounded-md bg-white border border-ink-100 shadow-soft text-left cursor-pointer hover:border-skype/40 transition-colors"
+      className="cursor-pointer rounded-md border border-[var(--board-card-border)] bg-[var(--board-card)] px-3 py-2.5 text-left shadow-[var(--board-card-shadow)] transition-colors hover:border-skype/40"
     >
       <div className="text-sm text-ink-800 leading-snug">
         <MentionedText text={card.title} byId={byId} />
@@ -461,7 +469,7 @@ function CardTile({ card, onOpen }: { card: BoardCard; onOpen: () => void }) {
           )}
         </div>
       )}
-    </article>
+    </div>
   )
 }
 
@@ -743,7 +751,7 @@ function MentionInput(props: {
           onKeyDown={onKeyDown}
           onBlur={props.onBlur}
           className={cn(
-            'w-full px-3 py-2 text-sm rounded-md border border-ink-200 bg-white focus:outline-none focus:border-skype resize-y',
+            'w-full px-3 py-2 text-sm rounded-md border border-ink-200 bg-cloud focus:outline-none focus:border-skype resize-y',
             props.className,
           )}
         />
@@ -757,13 +765,13 @@ function MentionInput(props: {
           onKeyDown={onKeyDown}
           onBlur={props.onBlur}
           className={cn(
-            'w-full px-3 py-2 text-sm rounded-md border border-ink-200 bg-white focus:outline-none focus:border-skype',
+            'w-full px-3 py-2 text-sm rounded-md border border-ink-200 bg-cloud focus:outline-none focus:border-skype',
             props.className,
           )}
         />
       )}
       {open && matches.length > 0 && (
-        <div className="absolute left-0 right-0 top-full mt-1 max-h-56 overflow-y-auto rounded-md border border-ink-200 bg-white shadow-lg z-20">
+        <div className="absolute left-0 right-0 top-full mt-1 max-h-56 overflow-y-auto rounded-md border border-ink-200 bg-cloud shadow-lg z-20">
           {matches.map((p, i) => (
             <button
               key={p.id}
@@ -854,7 +862,7 @@ function CardDetailModal({ boardId, card, columns, onClose }: {
   }
 
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-ink-900/40 p-6" onClick={onClose}>
+    <div className="fixed inset-0 z-50 grid place-items-center bg-[var(--modal-scrim)] p-6" onClick={onClose}>
       <div
         onClick={(e) => e.stopPropagation()}
         className="bg-cloud w-full max-w-2xl max-h-[85vh] rounded-xl shadow-xl flex flex-col"
@@ -866,7 +874,7 @@ function CardDetailModal({ boardId, card, columns, onClose }: {
               onChange={setTitle}
               onSubmit={() => void saveTitle()}
               placeholder={t('boards.cardTitleEditPlaceholder')}
-              className="-ml-2 w-full border-transparent bg-transparent px-2 py-1.5 text-[19px] font-semibold leading-7 text-ink-900 placeholder:text-ink-300 focus:border-skype/30 focus:bg-white focus:ring-2 focus:ring-skype/15"
+              className="-ml-2 w-full border-transparent bg-transparent px-2 py-1.5 text-[19px] font-semibold leading-7 text-ink-900 placeholder:text-ink-300 focus:border-skype/30 focus:bg-cloud focus:ring-2 focus:ring-skype/15"
             />
           </div>
           <button
@@ -914,6 +922,7 @@ function CardDetailModal({ boardId, card, columns, onClose }: {
             )}
             <div className="mt-1 flex justify-end">
               <button
+                type="button"
                 onClick={() => void saveDescription()}
                 className="text-xs text-ink-500 hover:text-skype-deep px-2 py-1"
               >{t('boards.saveDescription')}</button>
@@ -957,6 +966,7 @@ function CardDetailModal({ boardId, card, columns, onClose }: {
               />
               <div className="mt-1 flex justify-end gap-2">
                 <button
+                  type="button"
                   onClick={() => void postComment()}
                   disabled={!draftComment.trim() || posting}
                   className="px-3 py-1.5 text-sm rounded-md bg-skype text-white hover:bg-skype-deep disabled:opacity-40 disabled:hover:bg-skype"
@@ -971,6 +981,7 @@ function CardDetailModal({ boardId, card, columns, onClose }: {
             {t('boards.createdByAt', { time: formatTime(card.createdAt), author: byId[card.createdBy]?.name ?? card.createdBy })}
           </div>
           <button
+            type="button"
             onClick={async () => {
               if (!confirm(t('boards.deleteCardConfirm'))) return
               try { await deleteCard(boardId, card.id); onClose() } catch (e) { console.warn(e) }
@@ -1064,12 +1075,12 @@ function AssigneePicker({ value, onChange, meId }: {
       <div
         className={cn(
           'group relative flex h-11 w-full items-center rounded-[14px] border border-ink-100 bg-cloud text-left text-[13px] font-semibold text-ink-900 outline-none transition',
-          'shadow-[0_1px_0_rgba(255,255,255,0.92)_inset,0_10px_24px_-24px_rgba(26,78,120,0.55)]',
+          'shadow-[var(--select-shadow)]',
           'hover:border-sky2-200 hover:bg-sky2-50/60',
-          open && 'border-sky2-300 bg-white ring-4 ring-sky2-100',
+          open && 'border-sky2-300 bg-cloud ring-4 ring-sky2-100',
         )}
         style={{
-          backgroundImage: 'linear-gradient(180deg, rgba(255,255,255,0.98), rgba(246,250,253,0.94))',
+          backgroundImage: 'var(--select-face)',
         }}
       >
         {!open && (
@@ -1146,7 +1157,7 @@ function AssigneePicker({ value, onChange, meId }: {
           onClick={() => openMenu()}
           className={cn(
             'absolute right-2 grid h-7 w-7 place-items-center rounded-[9px] border border-sky2-100 bg-sky2-50 text-skype-deep transition',
-            'group-hover:bg-white group-focus-within:bg-sky2-50',
+            'group-hover:bg-cloud group-focus-within:bg-sky2-50',
             open && 'border-sky2-200 bg-sky2-50',
           )}
         >
@@ -1159,7 +1170,7 @@ function AssigneePicker({ value, onChange, meId }: {
         <div
           id={`${id}-listbox`}
           role="listbox"
-          className="absolute left-0 right-0 top-full z-[70] mt-2 max-h-72 overflow-auto rounded-[16px] border border-sky2-100 bg-cloud p-2.5 shadow-[0_22px_55px_-24px_rgba(10,30,60,0.38),0_8px_18px_-12px_rgba(10,30,60,0.2),0_0_0_1px_rgba(255,255,255,0.72)_inset] animate-rise"
+          className="absolute left-0 right-0 top-full z-[70] mt-2 max-h-72 overflow-auto rounded-[16px] border border-[var(--select-menu-border)] bg-cloud p-2.5 shadow-[var(--select-menu-shadow)] animate-rise"
         >
           {filtered.map((option, idx) => {
             const active = idx === activeIndex

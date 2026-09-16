@@ -26,6 +26,7 @@ import { IPlus, ICalendar, IClock, IRepeat, ITrash } from '@/components/icons'
 import { EventEditor, type EventEditorPrefill } from '@/components/EventEditor'
 import { useT } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
+import { nextOccurrenceOnOrAfter } from '@/lib/recurrence'
 import type { CalendarEvent, RecurrenceRule } from '@/types'
 
 interface AgendaItem {
@@ -77,47 +78,9 @@ function addDays(d: Date, n: number): Date { const out = new Date(d); out.setDat
 
 /* ─────────────────────────── recurrence (client mirror) ─────────────────────────── */
 
-function stepRule(from: Date, rule: RecurrenceRule): Date {
-  const interval = Math.max(1, Math.floor(rule.interval || 1))
-  switch (rule.freq) {
-    case 'daily':
-      return new Date(from.getTime() + interval * DAY_MS)
-    case 'weekly': {
-      const days = rule.byweekday && rule.byweekday.length ? [...rule.byweekday].sort((a, b) => a - b) : null
-      if (!days) return new Date(from.getTime() + interval * 7 * DAY_MS)
-      let cand = new Date(from.getTime() + ((interval - 1) * 7 + 1) * DAY_MS)
-      for (let i = 0; i < 14; i++) {
-        if (days.includes(cand.getDay())) return cand
-        cand = new Date(cand.getTime() + DAY_MS)
-      }
-      return cand
-    }
-    case 'monthly': {
-      const out = new Date(from); out.setMonth(out.getMonth() + interval); return out
-    }
-    case 'yearly': {
-      const out = new Date(from); out.setFullYear(out.getFullYear() + interval); return out
-    }
-  }
-}
-
 function nextOccurrence(event: CalendarEvent, from: Date): Date | null {
-  const startAt = new Date(event.startAt)
   if (event.status !== 'active') return null
-  if (!event.recurrence) return startAt.getTime() >= from.getTime() ? startAt : null
-  const rule = event.recurrence
-  const untilTs = rule.until ? new Date(rule.until).getTime() : Infinity
-  const maxCount = rule.count ?? Infinity
-  let current = new Date(startAt)
-  let fired = 1
-  for (let i = 0; i < 5000; i++) {
-    if (current.getTime() > untilTs) return null
-    if (fired > maxCount) return null
-    if (current.getTime() >= from.getTime()) return current
-    current = stepRule(current, rule)
-    fired += 1
-  }
-  return null
+  return nextOccurrenceOnOrAfter(new Date(event.startAt), event.recurrence ?? null, from)
 }
 
 function describeRecurrence(r: RecurrenceRule | null, t: ReturnType<typeof useT>): string {
@@ -203,6 +166,7 @@ function ContextMenu({ x, y, items, onClose }: {
     >
       {items.map((it, i) => (
         <button
+          type="button"
           key={i}
           onClick={() => { it.onClick(); onClose() }}
           className={cn(
@@ -334,6 +298,7 @@ function MonthGrid({ cursor, events, onEdit, onNew }: GridProps) {
                 <div className="flex flex-col gap-0.5 overflow-hidden">
                   {items.slice(0, 3).map((it, i) => (
                     <button
+                      type="button"
                       key={`${it.event.id}-${i}`}
                       onMouseDown={(e) => e.stopPropagation()}
                       onClick={(e) => { e.stopPropagation(); onEdit(it.event) }}
@@ -574,6 +539,7 @@ function TimeGrid({ cursor, events, onEdit, onNew, dayCount }: GridProps & { day
                 const height = (durMin / 60) * HOUR_HEIGHT
                 return (
                   <button
+                    type="button"
                     key={`${occ.event.id}-${i}`}
                     onMouseDown={(e) => e.stopPropagation()}
                     onClick={() => onEdit(occ.event)}
@@ -701,12 +667,12 @@ export function CalendarView() {
           <h1 className="text-lg font-semibold text-ink-900">{t('cal.title')}</h1>
 
           <div className="flex items-center gap-1 ml-3">
-            <button onClick={goPrev}
+            <button type="button" onClick={goPrev}
               className="w-7 h-7 rounded-md grid place-items-center text-ink-500 hover:bg-ink-100"
               aria-label={t('cal.previous')}>‹</button>
-            <button onClick={goToday}
+            <button type="button" onClick={goToday}
               className="px-2 h-7 rounded-md text-xs font-medium text-ink-700 hover:bg-ink-100">{t('cal.today')}</button>
-            <button onClick={goNext}
+            <button type="button" onClick={goNext}
               className="w-7 h-7 rounded-md grid place-items-center text-ink-500 hover:bg-ink-100"
               aria-label={t('cal.next')}>›</button>
             <span className="ml-2 text-sm text-ink-700 font-medium">{headerLabel}</span>
@@ -716,10 +682,11 @@ export function CalendarView() {
 
           {/* View switcher — segmented control (cloud pill) */}
           <div
-            className="inline-flex items-center gap-0.5 rounded-full border border-ink-100 bg-cloud p-0.5 shadow-[0_1px_0_rgba(255,255,255,0.95)_inset,0_8px_20px_-18px_rgba(26,78,120,0.4)]"
+            className="inline-flex items-center gap-0.5 rounded-full border border-ink-100 bg-cloud p-0.5 shadow-[var(--select-shadow)]"
           >
             {(['day', 'week', 'month'] as const).map((m) => (
               <button
+                type="button"
                 key={m}
                 onClick={() => setMode(m)}
                 className={cn(
@@ -733,6 +700,7 @@ export function CalendarView() {
           </div>
 
           <button
+            type="button"
             onClick={() => openNew()}
             className="inline-flex items-center gap-1.5 px-3.5 h-8 rounded-full text-[12.5px] font-semibold text-white transition active:scale-[0.985]"
             style={{
@@ -766,6 +734,7 @@ export function CalendarView() {
             <div className="px-1 py-6 text-center">
               <div className="text-sm text-ink-500 mb-2">{t('cal.empty30')}</div>
               <button
+                type="button"
                 onClick={() => openNew()}
                 className="text-xs text-skype font-medium hover:underline"
               >{t('cal.scheduleCta')}</button>
@@ -804,6 +773,7 @@ export function CalendarView() {
                       )}
                     </div>
                     <button
+                      type="button"
                       onClick={() => openEdit(it.event)}
                       className="text-left text-sm font-medium text-ink-900 hover:text-skype-deep block w-full truncate"
                     >{it.event.title}</button>
@@ -822,6 +792,7 @@ export function CalendarView() {
                   <div className="flex flex-col gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
                     {it.event.kind === 'agent_task' && (
                       <button
+                        type="button"
                         title={t('cal.runNow')}
                         onClick={async () => {
                           try { await runNow(it.event.id) } catch (err) { console.warn('[calendar] run-now failed', err) }
@@ -831,6 +802,7 @@ export function CalendarView() {
                     )}
                     {(it.event.createdBy === meId) && (
                       <button
+                        type="button"
                         title={t('cal.deleteEvent')}
                         onClick={async () => {
                           if (!confirm(t('cal.deleteEventConfirm', { title: it.event.title }))) return
