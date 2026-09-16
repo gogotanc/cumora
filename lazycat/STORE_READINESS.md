@@ -53,7 +53,8 @@ would never reach them and would break upstream compatibility.
 
 ## Verified candidate
 
-- In progress: `0.1.6`, re-basing the port onto upstream `v0.18.4`.
+- In progress: `0.18.4`, re-basing the port onto upstream `v0.18.4`. This fork
+  tracks upstream version numbers in `lazycat/package.yml`.
 - Released: `0.1.5` (`cloud.lazycat.app.cumora-v0.1.5.lpk`), the previous store
   version.
 - Historical: a clean `0.1.0` installation was upgraded through `0.1.1` to
@@ -71,7 +72,7 @@ would never reach them and would break upstream compatibility.
   build. Verification so far is x86_64 only.
 - Keep the previous LPK and a PostgreSQL backup for rollback; schema migrations
   are not automatically reversible.
-- Refresh store screenshots for the `0.1.6` UI if the layout changed.
+- Refresh store screenshots for the `0.18.4` UI if the layout changed.
 
 Chinese UI coverage is no longer a submission risk: the package ships upstream's
 complete `zh-CN` locale (1772/1772 keys).

@@ -52,10 +52,25 @@ work on Lazycat, not to improve it:
 2. `git merge <upstream tag>`; resolve in favor of the port scope above.
 3. Run `npm run typecheck`, `npm run server:typecheck`, `npm run lint`, the test
    suite, then `lzc-cli project lint .`.
-4. Bump `lazycat/package.yml` and deploy to the dev package
-   (`lzc-cli project deploy --dev`) for acceptance on the box.
-5. After acceptance, tag `v<fork version>` (Gitea carries the release tags) and
-   submit to the Lazycat app store.
+4. Set `lazycat/package.yml` `version:` to the upstream release being ported —
+   this fork tracks upstream version numbers (`package.json` has always tracked
+   upstream on its own; the `0.1.x` tags predate that rule). Build, then deploy to
+   the dev package for acceptance on the box:
+   `lzc-cli project build -f lzc-build.dev.yml` (the dev config builds on the
+   box), then `lzc-cli project deploy --dev` — `deploy` only installs a
+   pre-built LPK and exits when `lazycat/dist` is missing.
+5. After acceptance, tag `v<same upstream version>` (Gitea carries the release
+   tags) and submit to the Lazycat app store.
+
+### Build mirrors
+
+The Dockerfiles pin npm to `registry.npmmirror.com`, apt to
+`mirrors.tuna.tsinghua.edu.cn` and the kubectl download to
+`files.m.daocloud.io`. Upstream builds assume `registry.npmjs.org`,
+`deb.debian.org` and `dl.k8s.io`, none of which are routable from the box or
+from this workspace; without the pins a build only succeeds while the on-box
+builder cache is warm, and fails later with `npm error Exit handler never
+called!` followed by `npm run build` exiting 127.
 
 ## GitHub Actions
 

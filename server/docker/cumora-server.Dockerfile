@@ -1,4 +1,9 @@
 # cumora-server — the API + scheduler + orchestrator process.
+# Lazycat port: this image is built on developer machines AND by the on-box
+# builder inside mainland-China networks, where deb.debian.org,
+# registry.npmjs.org and dl.k8s.io are not routable. Package sources are pinned
+# to reachable mirrors (npmmirror / TUNA / DaoCloud files mirror) rather than
+# relying on a warm builder cache that silently expires.
 #
 # Serves THREE surfaces from the same Node process:
 #   /api/*        — JSON API (Express router)
@@ -33,7 +38,8 @@ COPY package.json package-lock.json ./
 # whose postinstall fails on linux/arm64), etc. Server runtime only
 # needs the actual runtime deps + tsx (moved out of devDeps for
 # exactly this reason).
-RUN npm ci --omit=dev --no-audit --no-fund --prefer-offline
+RUN npm ci --omit=dev --no-audit --no-fund --prefer-offline \
+      --registry=https://registry.npmmirror.com
 
 # ─── stage 2: build the web SPA bundle ──────────────────────────────
 # Separate stage with FULL devDeps installed so vite + tsc + tailwind +
@@ -61,7 +67,8 @@ COPY package.json package-lock.json ./
 # need any postinstall (esbuild's platform native lands via
 # optionalDependencies, not a script), so skipping all postinstall
 # scripts is safe in this stage AND faster than apt-get'ing bzip2.
-RUN npm ci --no-audit --no-fund --prefer-offline --ignore-scripts
+RUN npm ci --no-audit --no-fund --prefer-offline --ignore-scripts \
+      --registry=https://registry.npmmirror.com
 COPY src ./src
 COPY public ./public
 COPY index.html ./
@@ -77,16 +84,18 @@ RUN npm run build
 
 # ─── stage 3: kubectl ──────────────────────────────────────────────
 FROM debian:bookworm-slim AS kubectl-build
-RUN apt-get update \
+RUN for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources; do if [ -f "$f" ]; then sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' "$f"; fi; done; \
+    apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates curl \
   && curl -fsSL -o /out-kubectl \
-       "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/$(dpkg --print-architecture)/kubectl" \
+       "https://files.m.daocloud.io/dl.k8s.io/release/$(curl -fsSL https://files.m.daocloud.io/dl.k8s.io/release/stable.txt)/bin/linux/$(dpkg --print-architecture)/kubectl" \
   && chmod +x /out-kubectl
 
 # ─── stage 4: runtime ───────────────────────────────────────────────
 FROM node:20-bookworm-slim
 
-RUN apt-get update \
+RUN for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources; do if [ -f "$f" ]; then sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' "$f"; fi; done; \
+    apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
        tini \
        ca-certificates \
