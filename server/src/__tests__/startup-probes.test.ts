@@ -20,6 +20,10 @@ const { pool } = await import('../db/pool.js')
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
 const readRepo = (path: string): Promise<string> => readFile(resolve(repoRoot, path), 'utf8')
 
+// The Lazycat fork permanently deletes `.github/workflows/deploy.yml` (see
+// lazycat/UPSTREAM_SYNC.md), so the assertions that read it are conditional.
+const DEPLOY_WORKFLOW = '.github/workflows/deploy.yml'
+
 interface Probe {
   httpGet?: { path?: string; port?: string | number }
   periodSeconds?: number
@@ -82,12 +86,17 @@ test('both server manifests keep startup, liveness, and readiness probes on the 
 })
 
 test('the recovery helper reapplies the same probe contract and workflow calls it', async () => {
-  const workflowText = await readRepo('.github/workflows/deploy.yml')
-  assert.match(workflowText, /scripts\/deploy-release\.mjs run/)
-  assert.match(workflowText, /CANDIDATE_SERVER_IMAGE/)
-  assert.match(workflowText, /ROLLOUT_TIMEOUT_SECONDS/)
-  assert.match(workflowText, /VERIFIER_POLL_ATTEMPTS:\s*'75'/)
-  assert.doesNotMatch(workflowText, /kubectl rollout undo/)
+  // Lazycat fork: the deploy workflow is permanently deleted (see
+  // lazycat/UPSTREAM_SYNC.md), so only the helper half of this contract can be
+  // asserted here. The rest of the test runs either way.
+  const workflowText = await readFile(resolve(repoRoot, DEPLOY_WORKFLOW), 'utf8').catch(() => null)
+  if (workflowText !== null) {
+    assert.match(workflowText, /scripts\/deploy-release\.mjs run/)
+    assert.match(workflowText, /CANDIDATE_SERVER_IMAGE/)
+    assert.match(workflowText, /ROLLOUT_TIMEOUT_SECONDS/)
+    assert.match(workflowText, /VERIFIER_POLL_ATTEMPTS:\s*'75'/)
+    assert.doesNotMatch(workflowText, /kubectl rollout undo/)
+  }
 
   const baseline = extractDeploymentSnapshot({
     apiVersion: 'apps/v1',

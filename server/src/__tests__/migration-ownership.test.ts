@@ -7,6 +7,14 @@ import { dirname, resolve } from 'node:path'
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
 const readRepo = (path: string): Promise<string> => readFile(resolve(repoRoot, path), 'utf8')
 
+// The Lazycat fork permanently deletes `.github/workflows/deploy.yml` (see
+// lazycat/UPSTREAM_SYNC.md), so the assertions that read it are conditional.
+const DEPLOY_WORKFLOW = '.github/workflows/deploy.yml'
+const hasDeployWorkflow = await readFile(resolve(repoRoot, DEPLOY_WORKFLOW), 'utf8').then(
+  () => true,
+  () => false,
+)
+
 test('application startup verifies schema compatibility and imports no migrator', async () => {
   const source = await readRepo('server/src/index.ts')
   assert.match(source, /verifySchemaWithBootRetry/)
@@ -25,8 +33,13 @@ test('application Pod manifests contain no per-replica migration container', asy
   }
 })
 
-test('production deploy delegates one guarded transaction to the recovery runner', async () => {
-  const workflow = await readRepo('.github/workflows/deploy.yml')
+test('production deploy delegates one guarded transaction to the recovery runner', {
+  // Lazycat fork: the deploy workflow is permanently deleted (see
+  // lazycat/UPSTREAM_SYNC.md), so its half of the deploy contract is not part
+  // of this branch. Upstream's `main` still carries the workflow and this test.
+  skip: !hasDeployWorkflow ? 'deploy.yml is not part of the Lazycat fork' : false,
+}, async () => {
+  const workflow = await readRepo(DEPLOY_WORKFLOW)
   assert.match(workflow, /scripts\/deploy-release\.mjs run/)
   assert.match(workflow, /CANDIDATE_SERVER_IMAGE/)
   assert.match(workflow, /MIGRATION_REPAIR/)
