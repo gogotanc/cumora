@@ -59,8 +59,13 @@ work on Lazycat, not to improve it:
    `lzc-cli project build -f lzc-build.dev.yml` (the dev config builds on the
    box), then `lzc-cli project deploy --dev` — `deploy` only installs a
    pre-built LPK and exits when `lazycat/dist` is missing.
-5. After acceptance, tag `v<same upstream version>` (Gitea carries the release
-   tags) and submit to the Lazycat app store.
+5. After acceptance, tag `lzc-v<same upstream version>` and push that tag to
+   Gitea **only**, then submit to the Lazycat app store. The `lzc-` prefix is
+   required: upstream already owns the bare `v<version>` tag in this clone
+   (tags come down with the upstream remotes), and `origin` is a fork of
+   `yetone/cumora` that inherits upstream's tags, so a bare `v<version>`
+   pushed there collides with the upstream release. Gitea is the single remote
+   that carries this fork's release tags.
 
 ### Build mirrors
 
