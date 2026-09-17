@@ -11,6 +11,32 @@ lzc-cli project lint .
 lzc-cli project release .
 ```
 
+## Migrations
+
+The server never runs DDL at boot — since upstream v0.14.0 it only runs a
+read-only `schema_migrations` gate and exits when the ledger is missing
+(`MigrationHistoryError: schema_uninitialized`). Upstream supplies the DDL with
+a pre-deploy Kubernetes Job; Lazycat has no equivalent primitive, so this
+package runs `npm run migrate` as the first half of the container `CMD` (see
+`server/docker/cumora-server.Dockerfile` and its `.dev` variant) and only then
+starts the server; a bounded retry absorbs Lazycat's parallel postgres/redis
+start. Never remove that step: a fresh install would crashloop on an empty
+database.
+
+The migrator adopts an existing database through the frozen
+`0001_legacy_baseline` (all statements idempotent) and then applies the
+versioned suffix, so both a green-field install and an instance upgrading from
+an older LPK converge on the same schema. Reruns read the ledger and exit in
+~20ms (measured 28ms).
+
+Verified on LightOS (2026-09-17): a green-field install applies versions 1-9 in
+11.1s and the app is healthy 22s after start; migrating a copy of a live 0.1.5
+database (60 tables, 31 conversations, 35 838 messages, no ledger) yields 65
+tables, 9 ledger rows and 86 normalized conversation members with every row
+intact. Keep the chain in the image `CMD`, not in the manifest: Lazycat's
+`command` field accepts a *string* only, and `lzc-cli project lint` does not
+catch a list.
+
 The manifest uses Lazycat's deployment-time `stable_secret` function. Each
 installation receives distinct, stable PostgreSQL and agent-runtime secrets;
 no publisher or developer credentials are embedded in the LPK.

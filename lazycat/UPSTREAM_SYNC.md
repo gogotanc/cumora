@@ -72,6 +72,31 @@ from this workspace; without the pins a build only succeeds while the on-box
 builder cache is warm, and fails later with `npm error Exit handler never
 called!` followed by `npm run build` exiting 127.
 
+## Migrations and schema ownership
+
+Upstream v0.14.0 removed all DDL from the server boot path: a replica now runs
+a read-only `schema_migrations` gate (`MigrationHistoryError:
+schema_uninitialized`) and the DDL is applied by the pre-deploy Job in
+`deploy.yml` — a workflow this fork deliberately deletes, and Lazycat has no Job
+primitive at all. The port therefore keeps that responsibility in the image
+`CMD`: migrate first, then `exec npm run server:start`, under a bounded retry (a
+portainer-style one-shot job cannot be scheduled on LightOS).
+
+Rules when touching the packaging layer:
+
+- Keep the `CMD` chain in both `server/docker/cumora-server*.Dockerfile`. Leave
+  the manifest upstream-shaped: its `command` field is a *string*, not a list,
+  and `lzc-cli project lint` does not catch the mistake.
+- Never rehearse the boot path by dropping `schema_migrations` from an
+  already-migrated database. That state cannot occur in production, and the
+  versioned migrations are not idempotent against it — 0002 issues a plain
+  `CREATE TABLE conversation_members`, so the migrator fails forever on a
+  database that is already at version 9.
+- To rehearse a real upgrade, copy the live database into a scratch database and
+  point the migrator at it from inside the running container:
+  `pg_dump <live> | psql <scratch>`, then `DATABASE_URL=<scratch> npm run
+  migrate`. Confirmed this way on 2026-09-17 against a live 0.1.5 database.
+
 ## GitHub Actions
 
 The upstream production, publishing, benchmark, and website workflows are

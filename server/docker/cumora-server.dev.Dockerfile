@@ -66,4 +66,11 @@ COPY --from=spa-build /app/dist ./dist
 ENV NODE_ENV=production
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["npm", "run", "server:start"]
+# Migrations: upstream v0.14.0 moved all DDL out of the server boot path into a
+# pre-deploy migration Job. A replica now only runs the read-only schema_migrations
+# gate and refuses to start when the ledger is missing, which broke both green-field
+# installs and every upgrade from an older LPK (their databases predate the ledger).
+# Lazycat has no Job primitive, so the container migrates first - the migrator adopts
+# an existing database through the idempotent 0001_legacy_baseline - and then starts
+# the server. The bounded retry absorbs Lazycat's parallel postgres/redis start.
+CMD ["sh", "-c", "for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do npm run migrate && exec npm run server:start; sleep 3; done; echo '[lazycat] migrate kept failing; exiting' >&2; exit 1"]

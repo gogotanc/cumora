@@ -76,3 +76,4 @@ lazycat/.local/
 lazycat/dist/
 lazycat/.lzc-cli-cache/
 lzc-build-image-context.tar
+lazycat/.lzc-cli-build*/
